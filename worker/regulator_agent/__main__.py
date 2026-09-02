@@ -39,7 +39,7 @@ from pathlib import Path
 from typing import List, Optional
 
 from .config import Config, ConfigError, load_config
-from .engines import get_engine
+from .engines import BrowserUnavailable, get_engine
 from .hec import HecEmitter
 from .params import ParameterResolver
 from .report import render, target_report
@@ -242,21 +242,26 @@ async def _run(config: Config, args: argparse.Namespace) -> int:
     if not _report_lint(lint(scenario), strict, "offline lint"):
         return EXIT_LINT
 
-    # Phase 0 ships the api engine only. Catch a browser step here rather than
-    # letting it reach an engine that cannot run it: a scenario that half runs
-    # produces a report that looks complete and is not.
-    browser_steps = [s.id for s in scenario.steps if s.engine != "api"]
-    if browser_steps:
+    # A scenario mixing both engines needs the fleet to run each cohort with the
+    # right resource profile, so for now it is one engine per run. Catching it
+    # here beats letting half the steps reach an engine that cannot run them:
+    # a scenario that half runs produces a report that looks complete and is not.
+    engines_used = {s.engine for s in scenario.steps}
+    if len(engines_used) > 1:
         log.error(
-            "scenario %s contains %d step(s) needing the browser engine (%s), which "
-            "arrives in Phase 2. Run an api-only scenario, or drop those steps",
+            "scenario %s mixes the %s engines in one run, which needs the worker fleet. "
+            "Split it into an api scenario and a browser scenario",
             scenario.name,
-            len(browser_steps),
-            ", ".join(browser_steps[:5]),
+            " and ".join(sorted(engines_used)),
         )
         return EXIT_LINT
 
-    engine = get_engine("api", config)
+    engine_name = next(iter(engines_used)) if engines_used else "api"
+    try:
+        engine = get_engine(engine_name, config)
+    except (ValueError, BrowserUnavailable) as exc:
+        log.error("%s", exc)
+        return EXIT_FAILED
     stats = RunStats(run_id=config.run_id, slot=config.slot)
     emitters: List[object] = []
     hec: Optional[HecEmitter] = None

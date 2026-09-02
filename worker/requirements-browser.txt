@@ -1,0 +1,13 @@
+# Browser-engine dependencies, deliberately separate from requirements.txt.
+#
+# Playwright's browser binaries are a few hundred megabytes, which would
+# quadruple the base worker image for a capability most runs do not use. So the
+# browser engine ships as its own image (worker/Dockerfile.browser) and the base
+# image raises a BrowserUnavailable with instructions rather than an ImportError
+# if a scenario asks for it.
+#
+# Install alongside requirements.txt, then fetch the browser itself:
+#   pip install -r worker/requirements.txt -r worker/requirements-browser.txt
+#   playwright install chromium
+
+playwright>=1.44,<2

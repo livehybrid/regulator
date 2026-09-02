@@ -1,0 +1,36 @@
+# syntax=docker/dockerfile:1
+# The browser-engine worker. Build from the repo root:
+#   docker buildx build -f worker/Dockerfile.browser -t regulator-worker:browser .
+#
+# Separate from worker/Dockerfile because Playwright's Chromium is a few hundred
+# megabytes. Most runs are API-only, and making every node pull that to run a
+# search would be a poor trade: a node still fetching an image is a node not
+# generating load.
+#
+# Based on Playwright's own image, which carries the exact browser build the
+# Python package expects along with the system libraries Chromium needs. Pinning
+# our own base and installing those by hand is a well-known way to spend an
+# afternoon on missing shared objects.
+FROM mcr.microsoft.com/playwright/python:v1.55.0-noble
+
+ENV PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1
+
+WORKDIR /app
+
+COPY worker/requirements.txt /app/requirements.txt
+COPY worker/requirements-browser.txt /app/requirements-browser.txt
+RUN pip install --no-cache-dir -r /app/requirements.txt -r /app/requirements-browser.txt
+
+COPY worker/regulator_agent /app/regulator_agent
+COPY scenarios /app/scenarios
+
+ENV PYTHONPATH=/app \
+    REG_BUILTIN_SCENARIOS_DIR=/app/scenarios
+
+# The base image ships a pwuser. Chromium refuses to run as root without
+# --no-sandbox, and running a browser that renders untrusted markup as root is
+# a bad habit even when the markup is your own dashboard.
+USER pwuser
+
+ENTRYPOINT ["python", "-m", "regulator_agent"]

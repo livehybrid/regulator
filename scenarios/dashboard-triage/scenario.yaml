@@ -1,0 +1,115 @@
+# What the analyst actually experiences, as opposed to what the search tier did.
+#
+# The API scenarios measure the cluster. This measures the product: how long
+# from opening a dashboard to seeing data, including the JavaScript bundle, the
+# panel layout and the browser's own rendering. Those are invisible to REST and
+# they are what a user would complain about.
+#
+# COST. A Chromium context is roughly 150 to 300 MB, so a browser cohort is
+# measured in tens rather than hundreds. The realistic shape of a large test is
+# this scenario at 20 virtual users running alongside search-classes at 400, so
+# the dashboards are being opened while the cluster is genuinely busy. Run this
+# alone and you measure an idle cluster's dashboards, which is a much easier
+# question than the one worth asking.
+#
+# DASHBOARDS. These names are the ones in the `regulator_sut` app that ships
+# with Regulator, so a browser run is comparable between a homelab and a
+# customer cluster. Point them at your own dashboards by editing `app` and
+# `dashboard`, and accept that the numbers are then only comparable with
+# themselves.
+#
+# CREDENTIALS. Splunk Web needs a native account: a bearer token authenticates
+# the REST API but not a web session, and SAML cannot be driven headlessly at
+# all because the password never reaches Splunk in an assertion. Set
+# REG_TARGET_USERNAME and REG_TARGET_PASSWORD.
+
+name: dashboard-triage
+engine: browser
+seed: 8080
+description: "Analysts opening dashboards in a browser: measures time to first painted panel, the full page load, LCP and the JavaScript bundle, with every search the page fires joined back to its own server-side job statistics"
+tags: browser, dashboard, experience, playwright
+
+corpus:
+  requires_packs:
+    - aws-cloudtrail
+    - splunk-tutorial-secure
+    - apigw
+  index: main
+
+parameters:
+  # Kept even though the dashboards take no parameters yet: a dashboard with a
+  # token input is the normal case in the field, and the URL builder already
+  # substitutes these.
+  region:
+    type: choice
+    values: [eu-west-1, eu-west-2, us-east-1]
+
+time_policy:
+  mode: rolling
+  window: 24h
+  jitter: 30m
+  align: 1m
+
+personas:
+  # Most of a SOC watches the same overview all day. Long think time, cheap
+  # dashboard, and the dominant share of page loads by volume.
+  - name: watcher
+    weight: 70
+    think_time:
+      dist: lognormal
+      median_s: 90
+      sigma: 0.4
+      min_s: 20
+      max_s: 600
+    steps:
+      - id: triage-overview
+        type: dashboard
+        engine: browser
+        class: accelerated
+        app: regulator_sut
+        dashboard: triage_overview
+        # What the user perceives: when did anything appear. A dashboard can
+        # paint one panel instantly and take a minute to finish, and this is
+        # the number they would quote at you.
+        wait_for: first_result
+
+  # The heavy dashboard, opened rarely. This is the one that falls over first
+  # when the search head is under concurrency pressure.
+  - name: investigator
+    weight: 30
+    think_time:
+      dist: lognormal
+      median_s: 180
+      sigma: 0.6
+      min_s: 45
+      max_s: 900
+    steps:
+      - id: ops-overview
+        type: dashboard
+        engine: browser
+        class: dense
+        app: regulator_sut
+        dashboard: ops_overview
+        # Everything settled, rather than the first thing to appear. A slow
+        # tail here with a fast first_result means the dashboard feels quick
+        # and is not, which is worth knowing separately.
+        wait_for: all_panels
+
+load:
+  model: closed
+  virtual_users: 10
+  ramp:
+    - to: 4
+      over_s: 60
+    - to: 10
+      over_s: 180
+    - hold_s: 600
+  duration: 840s
+
+abort_if:
+  error_rate_pct: 25
+  # Generous on purpose. A dashboard is many searches plus a render, so it is
+  # legitimately slower than a single API dispatch, and a tight ceiling here
+  # would abort runs that are telling you something true.
+  p95_ms: 120000
+  generator_drift_ms: 5000

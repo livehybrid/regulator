@@ -26,12 +26,15 @@ from typing import TYPE_CHECKING
 
 from .api import ApiEngine
 from .base import Engine, StepContext, TargetCapabilities
+from .browser import BrowserEngine, BrowserUnavailable
 
 if TYPE_CHECKING:  # pragma: no cover - import cycle avoidance only
     from ..config import Config
 
 __all__ = [
     "ApiEngine",
+    "BrowserEngine",
+    "BrowserUnavailable",
     "Engine",
     "StepContext",
     "TargetCapabilities",
@@ -54,10 +57,7 @@ def get_engine(name: str, config: "Config") -> Engine:
     if key == "api":
         return ApiEngine(config)
     if key == "browser":
-        raise ValueError(
-            "the browser engine arrives in Phase 2. Until then, declare "
-            "engine: api on the scenario and its steps"
-        )
+        return BrowserEngine(config)
     raise ValueError(
         f"unknown engine {name!r}, expected one of: {', '.join(ENGINE_NAMES)}"
     )

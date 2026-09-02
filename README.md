@@ -9,9 +9,9 @@ Stoker fills a Splunk cluster with realistic data. Regulator drives realistic
 demand against it. On a steam locomotive the stoker shovels coal into the
 firebox and the driver opens the regulator to demand work from the boiler.
 
-> **Phases 0 and 1.** The API engine, the scenario format, the standalone worker,
-> the control plane and the web UI are here and tested. The headless-browser
-> engine and the worker fleet are on the roadmap below.
+> **Phases 0, 1 and 2.** The API engine, the scenario format, the standalone
+> worker, the control plane, the web UI and the headless-browser engine are here
+> and tested. The worker fleet and the CI regression gate are on the roadmap below.
 
 ---
 
@@ -290,6 +290,48 @@ That 98% is a finding in its own right. A cache at its ceiling evicts buckets
 other searches are using, so the run measures churn as much as search, and the
 report says so.
 
+### The browser engine
+
+The API engine answers the search-tier question. The browser engine answers a
+different one that REST cannot: when an analyst opens a dashboard, how long
+until they see data. That includes the JavaScript bundle, the panel layout and
+the browser's own rendering, and it is the number a user would quote at you.
+
+```bash
+docker run --rm \
+  -e REG_STANDALONE=1 \
+  -e REG_SCENARIO=dashboard-triage \
+  -e REG_TARGET_URL=https://splunk.example:8089 \
+  -e REG_TARGET_WEB_URL=https://splunk.example:8000 \
+  -e REG_TARGET_USERNAME=loadtest -e REG_TARGET_PASSWORD="$PW" \
+  -e REG_VUS=10 -e REG_DURATION_S=600 \
+  ghcr.io/livehybrid/regulator-worker:browser
+```
+
+Four things it does deliberately:
+
+- **One persistent browser context per virtual user**, reused across
+  iterations. A fresh context re-downloads the whole Splunk Web bundle every
+  time, which inflates page timings against any real returning user. The first
+  iteration is still recorded as `first_visit`, because a cold bundle load is a
+  real event, just not the common one.
+- **Login once per context.** A real user logs in once a day, not once a
+  dashboard.
+- **Every search the page fires is captured with its sid**, so a browser step
+  joins back to exactly the same server-side job statistics the API engine
+  reads. Without that the two channels produce unrelated numbers.
+- **The time range is pinned** to the step's window, so the browser asks the
+  same question of the same data as the API engine rather than whatever the
+  dashboard was saved with.
+
+Two constraints worth knowing before planning a big test. A Chromium context is
+roughly 150 to 300 MB, so a browser cohort is measured in tens while an API
+cohort is measured in hundreds; the realistic shape is both at once, so the
+dashboards are opened while the cluster is genuinely busy. And **Splunk Web
+needs a native account**: a bearer token authenticates the REST API but not a
+web session, and SAML cannot be driven headlessly at all, because the password
+never reaches Splunk in an assertion.
+
 ### Concurrency and queueing
 
 Queueing is a **measurement, not a failure**. When load crosses the target's
@@ -495,7 +537,7 @@ needs `test`, a cancelled test means the stale build never starts at all.
 | **0** | **API engine, scenario format, standalone worker, fake splunkd, CI** (done, and validated against a real Splunk 10.4.0) |
 | **1** | **Control plane and web interface** (done): targets, the report, cache inspection and eviction, scenario launch, and a live run detail with an inline latency chart. Scenarios execute in the control plane's own process |
 | 1b | Worker fleet over Docker Swarm, Postgres, merged histograms across the fleet, which lifts the in-process virtual-user ceiling |
-| 2 | Browser engine: Playwright, persistent contexts per virtual user, Navigation Timing and LCP, XHR-to-sid correlation so a browser step joins its own server-side job stats |
+| **2** | **Browser engine** (done): Playwright, a persistent context per virtual user, Navigation Timing and LCP, and every search the page fires captured from the wire and joined back to its own server-side job statistics |
 | 3 | CI/CD: baselines, run comparison, regression gates, a GitHub Action |
 | 4 | Kubernetes and Splunk Operator: Indexed Jobs, dedicated node groups so the generator never shares a node with the system under test, and correlation against `_audit`, `_introspection` and the scheduler's skipped-search counts |
 
