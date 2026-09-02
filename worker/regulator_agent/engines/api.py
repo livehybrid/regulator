@@ -34,7 +34,7 @@ import time
 from typing import Any, Dict, List, Optional, Tuple
 
 from ..config import Config
-from ..params import ParameterResolver
+from ..params import DrawContext, ParameterResolver
 from ..results import (
     ERROR_AUTH,
     ERROR_CLIENT,
@@ -227,11 +227,40 @@ class ApiEngine:
         # once.
         parsed: Dict[str, Tuple[bool, str]] = {}
 
+        # Placeholders must be filled with values of the right *type*, not a
+        # sentinel string. Substituting a word into `| makeresults count={{n}}`
+        # produces SPL that Splunk rightly rejects, so the lint would report a
+        # syntax error in a search that is perfectly valid at run time. Drawing
+        # from the real generators means what gets parsed is what will actually
+        # be dispatched.
+        #
+        # Dynamic parameters are the exception: their values come from a search
+        # against the target that has not run yet, so they are bound to one
+        # representative string purely so the SPL is complete. That is honest,
+        # because a choice_from_search value is always a field value and always
+        # arrives as a string.
+        probe_resolver = ParameterResolver(scenario)
+        for name in probe_resolver.dynamic_parameters:
+            probe_resolver.bind(name, [LINT_PLACEHOLDER])
+
         for persona in scenario.personas:
             for step in persona.steps:
                 if step.type != "search" or not step.spl:
                     continue
-                probe_spl = PLACEHOLDER_RE.sub(LINT_PLACEHOLDER, step.spl)
+                draw = DrawContext(
+                    scenario_seed=scenario.seed,
+                    vu_id=0,
+                    iteration=0,
+                    step_id=step.id,
+                )
+                try:
+                    probe_spl, _ = probe_resolver.render(step.spl, draw)
+                except Exception as exc:  # noqa: BLE001 - reported, not raised
+                    problems.append(
+                        f"persona {persona.name} step {step.id}: could not resolve its "
+                        f"parameters: {exc}"
+                    )
+                    continue
                 if probe_spl not in parsed:
                     try:
                         parsed[probe_spl] = await self._client.parse_spl(probe_spl)

@@ -325,7 +325,7 @@ needs `test`, a cancelled test means the stale build never starts at all.
 
 | Phase | Deliverable |
 |---|---|
-| **0** | **API engine, scenario format, standalone worker, fake splunkd, CI** (done) |
+| **0** | **API engine, scenario format, standalone worker, fake splunkd, CI** (done, and validated against a real Splunk 10.4.0) |
 | 1 | Control plane: FastAPI, Postgres, React UI with live charts, worker fleet over Docker Swarm, merged histograms across the fleet |
 | 2 | Browser engine: Playwright, persistent contexts per virtual user, Navigation Timing and LCP, XHR-to-sid correlation so a browser step joins its own server-side job stats |
 | 3 | CI/CD: baselines, run comparison, regression gates, a GitHub Action |

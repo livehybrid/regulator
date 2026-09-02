@@ -278,6 +278,71 @@ def test_online_validation_catches_broken_spl(env):
     assert any("one" in p for p in problems), problems
 
 
+def test_validation_substitutes_values_of_the_right_type(splunkd, env):
+    """Found by pointing this at a real Splunk 10.4, not by a mock.
+
+    Linting used to replace every placeholder with a fixed word, so
+    ``| makeresults count={{n}}`` was parsed as ``count=regulator_placeholder``
+    and splunkd rightly rejected it: "Expecting a non-negative integer for
+    option 'count'". The scenario was fine, the lint was wrong, and it blocked
+    a perfectly good run.
+
+    Drawing from the real generators means what gets parsed is what will
+    actually be dispatched.
+    """
+    seen: list[str] = []
+
+    class RecordingClient:
+        auth_method = "bearer"
+
+        async def start(self):
+            return None
+
+        async def close(self):
+            return None
+
+        async def parse_spl(self, spl):
+            seen.append(spl)
+            return True, ""
+
+        async def index_exists(self, name):
+            return True
+
+        async def oneshot(self, spl, window, count=100):
+            return [], 0
+
+    doc = tiny_scenario_dict()
+    doc["parameters"] = {
+        "n": {"type": "int_range", "min": 10, "max": 99},
+        "ip": {"type": "choice_from_search", "spl": "search x", "field": "src"},
+    }
+    doc["personas"][0]["steps"] = [
+        {
+            "id": "typed",
+            "type": "search",
+            "engine": "api",
+            "class": "accelerated",
+            "spl": '| makeresults count={{n}} | eval addr="{{ip}}"',
+        }
+    ]
+
+    async def scenario():
+        engine = ApiEngine(make_config(splunkd, env), client=RecordingClient())
+        return await engine.validate(parse_scenario(doc))
+
+    problems = run_async(scenario())
+
+    assert problems == [], problems
+    assert seen, "the parser was never called"
+    probe = seen[0]
+    assert "regulator_placeholder" not in probe.split("count=")[1].split()[0]
+    count_value = probe.split("count=")[1].split()[0]
+    assert count_value.isdigit() and 10 <= int(count_value) <= 99
+    # A choice_from_search value cannot be known before the run, so it stays a
+    # representative string. That is honest: those are always field values.
+    assert "regulator_placeholder" in probe
+
+
 def test_dynamic_parameters_are_resolved_from_the_target(splunkd, env):
     async def scenario():
         engine = ApiEngine(make_config(splunkd, env))
