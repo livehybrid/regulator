@@ -9,9 +9,9 @@ Stoker fills a Splunk cluster with realistic data. Regulator drives realistic
 demand against it. On a steam locomotive the stoker shovels coal into the
 firebox and the driver opens the regulator to demand work from the boiler.
 
-> **Phase 0.** The API engine, the scenario format and the standalone worker are
-> here and tested. The control plane, the web UI and the headless-browser engine
-> are on the roadmap below.
+> **Phases 0 and 1.** The API engine, the scenario format, the standalone worker,
+> the control plane and the web UI are here and tested. The headless-browser
+> engine and the worker fleet are on the roadmap below.
 
 ---
 
@@ -40,6 +40,55 @@ The last two matter most. "The cluster is too slow" and "the load box was too
 small" need opposite responses, so they never share an outcome or an exit code.
 
 ---
+
+## The web interface
+
+```bash
+pip install -r worker/requirements.txt -r server/requirements.txt
+REG_ADMIN_PASSWORD=choose-one PYTHONPATH=worker:server \
+  python -m uvicorn regulator_server.app:app --port 8080
+```
+
+Or from the image, with a volume so targets and runs survive a replacement:
+
+```bash
+docker run --rm -p 8080:8080 -v regulator-data:/data \
+  -e REG_ADMIN_PASSWORD=choose-one \
+  -e REG_MASTER_KEY="$(python -c 'from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())')" \
+  ghcr.io/livehybrid/regulator:latest
+```
+
+Add a target, and the buttons do the rest: **Test** probes it, **Report**
+describes the whole cluster, **Cache** shows what SmartStore holds locally,
+**Evict** drops it, and **Run** launches a scenario with live latency,
+throughput and queueing while it goes.
+
+The run detail is the view that earns its place. Three things decide whether a
+result means anything, and each gets a banner that cannot be missed: a run
+marked **invalid** because the generator could not keep its own schedule, a run
+where **queueing** was observed (amber, and worded as the finding it is rather
+than an error), and the **cache provenance** when part of what was measured was
+object storage rather than the search tier.
+
+The control plane runs scenarios **in its own process**. That is the same idea
+as Stoker's in-process driver: the tool works with no container orchestration at
+all, and it is honest about the limit, because past a few hundred virtual users
+the server becomes the constraint. There is a configurable ceiling that refuses
+the run and explains why, and the generator-drift guard catches anything that
+slips past it.
+
+| Variable | Default | Notes |
+|---|---|---|
+| `REG_ADMIN_PASSWORD` | unset | Unset means **no authentication at all**, and the server says so on every start and in `/api/auth/status`. This thing can evict a production cache |
+| `REG_MASTER_KEY` / `REG_MASTER_KEY_FILE` | generated | Encrypts target credentials at rest. Unset means a throwaway key, so everything stored becomes unreadable at the next restart |
+| `REG_DATABASE_URL` | `sqlite:///./regulator.db` | |
+| `REG_MAX_VIRTUAL_USERS` | `500` | The in-process ceiling described above |
+| `REG_MAX_CONCURRENT_RUNS` | `2` | More at once would mean measuring contention between your own tests |
+
+**The UI is one self-contained HTML file with no build step.** No npm, no
+node_modules in the image, no build stage in CI, nothing to go stale, and an
+operator can read its source. The control-plane image has no Node in it at all.
+If the UI ever needs real charting libraries, that is the point to reconsider.
 
 ## Quick start
 
@@ -444,7 +493,8 @@ needs `test`, a cancelled test means the stale build never starts at all.
 | Phase | Deliverable |
 |---|---|
 | **0** | **API engine, scenario format, standalone worker, fake splunkd, CI** (done, and validated against a real Splunk 10.4.0) |
-| 1 | Control plane: FastAPI, Postgres, React UI with live charts, worker fleet over Docker Swarm, merged histograms across the fleet |
+| **1** | **Control plane and web interface** (done): targets, the report, cache inspection and eviction, scenario launch, and a live run detail with an inline latency chart. Scenarios execute in the control plane's own process |
+| 1b | Worker fleet over Docker Swarm, Postgres, merged histograms across the fleet, which lifts the in-process virtual-user ceiling |
 | 2 | Browser engine: Playwright, persistent contexts per virtual user, Navigation Timing and LCP, XHR-to-sid correlation so a browser step joins its own server-side job stats |
 | 3 | CI/CD: baselines, run comparison, regression gates, a GitHub Action |
 | 4 | Kubernetes and Splunk Operator: Indexed Jobs, dedicated node groups so the generator never shares a node with the system under test, and correlation against `_audit`, `_introspection` and the scheduler's skipped-search counts |
