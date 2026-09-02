@@ -42,6 +42,7 @@ from .config import Config, ConfigError, load_config
 from .engines import get_engine
 from .hec import HecEmitter
 from .params import ParameterResolver
+from .report import render, target_report
 from .results import NdjsonEmitter, RunStats, RunSummary
 from .scenario import ScenarioError, is_advice, lint, load_scenario
 from .scheduler import Scheduler
@@ -133,7 +134,30 @@ async def _progress(stats: RunStats, stop: asyncio.Event) -> None:
         )
 
 
+async def _describe_target(config: Config) -> int:
+    """Report on the target and exit. Needs no scenario.
+
+    Deliberately ahead of everything else in _run: the whole point is to point
+    this at a cluster nobody has benchmarked, and demanding a scenario that
+    already matches it would beg the question it exists to answer.
+    """
+    engine = get_engine("api", config)
+    try:
+        await engine.start()
+        report = await target_report(engine.client)
+    finally:
+        with contextlib.suppress(Exception):
+            await engine.close()
+
+    sys.stderr.write(render(report) + "\n")
+    print(json.dumps(report, indent=2, default=str))
+    return EXIT_OK if report.get("can_dispatch") else EXIT_FAILED
+
+
 async def _run(config: Config, args: argparse.Namespace) -> int:
+    if args.target_report:
+        return await _describe_target(config)
+
     scenario_path = _resolve_scenario_path(config)
     scenario = load_scenario(scenario_path)
     log.info("scenario %s from %s", scenario.name, scenario_path)
@@ -184,6 +208,7 @@ async def _run(config: Config, args: argparse.Namespace) -> int:
             print(json.dumps(capabilities.to_dict(), indent=2))
             return EXIT_OK
 
+
         online = await engine.validate(scenario)
         if not _report_lint(online, strict, "online lint"):
             return EXIT_LINT
@@ -232,7 +257,7 @@ async def _run(config: Config, args: argparse.Namespace) -> int:
         summary = await scheduler.run()
         stop_progress.set()
 
-        _report_summary(summary, hec, config)
+        await _report_summary(summary, hec, config)
         return _exit_code(summary)
 
     except ConfigError as exc:
@@ -258,10 +283,18 @@ async def _run(config: Config, args: argparse.Namespace) -> int:
             await engine.close()
 
 
-def _report_summary(summary: RunSummary, hec: Optional[HecEmitter], config: Config) -> None:
+async def _report_summary(
+    summary: RunSummary, hec: Optional[HecEmitter], config: Config
+) -> None:
     payload = summary.to_dict()
     if hec is not None:
+        # Flush before reading the counters, otherwise they report whatever the
+        # background loop happened to have shipped at this instant and the
+        # telemetry block undercounts every run.
+        await hec.flush()
         payload["telemetry"] = hec.stats()
+        # The summary event itself is emitted after the counters are read, so
+        # it is deliberately not included in its own totals.
         hec.emit_summary(payload)
 
     # The summary goes to stdout as a single JSON object on its own line, after
@@ -323,14 +356,29 @@ def main(argv: Optional[List[str]] = None) -> int:
         help="validate the scenario offline and against the target, then exit",
     )
     parser.add_argument(
+        "--target-report",
+        action="store_true",
+        help=(
+            "describe the target in full (version, roles, search peers, concurrency "
+            "ceiling, indexes and their event counts, SmartStore, whether this account "
+            "can dispatch) as JSON on stdout and a summary on stderr, then exit"
+        ),
+    )
+    parser.add_argument(
         "--probe-only",
         action="store_true",
         help="report what the target is and what its search-concurrency ceiling is, then exit",
     )
     args = parser.parse_args(argv)
 
+    env = dict(os.environ)
+    if (args.target_report or args.probe_only) and not env.get("REG_SCENARIO"):
+        # Both modes exit before a scenario is used, so requiring one would be
+        # a pointless obstacle when pointing this at an unfamiliar cluster.
+        env["REG_SCENARIO"] = "smoke"
+
     try:
-        config = load_config()
+        config = load_config(env)
     except ConfigError as exc:
         _setup_logging("INFO")
         log.error("configuration: %s", exc)

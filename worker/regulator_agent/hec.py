@@ -47,9 +47,19 @@ class HecEmitter:
     the telemetry round trip to the very latency the tool exists to measure.
     """
 
-    def __init__(self, config: HecConfig, run_id: str = "local") -> None:
+    def __init__(
+        self,
+        config: HecConfig,
+        run_id: str = "local",
+        transport: Optional[httpx.AsyncBaseTransport] = None,
+    ) -> None:
         self.config = config
         self.run_id = run_id
+        # Injectable purely for tests. Everything in this module is best effort
+        # and swallows its own failures by design, which makes it exactly the
+        # kind of code that can be quietly broken for months, so it needs to be
+        # testable without a Splunk.
+        self._transport = transport
         self._pending: List[Dict[str, Any]] = []
         self._pending_bytes = 0
         self._client: Optional[httpx.AsyncClient] = None
@@ -69,11 +79,20 @@ class HecEmitter:
     # ------------------------------------------------------------------
 
     async def start(self) -> None:
-        self._client = httpx.AsyncClient(
-            verify=self.config.verify_tls,
-            timeout=httpx.Timeout(connect=5.0, read=30.0, write=30.0, pool=5.0),
-            headers={"Authorization": f"Splunk {self.config.token}"},
-        )
+        kwargs: Dict[str, Any] = {
+            # A Splunk HEC endpoint on a self-signed certificate is the normal
+            # case, not the exception: an on-premises indexer, a SmartStore
+            # test rig or an in-cluster service name all present a certificate
+            # nothing trusts. REG_HEC_VERIFY_TLS exists so telemetry does not
+            # silently vanish into TLS failures the run never reports, because
+            # this module swallows its own errors by design.
+            "verify": self.config.verify_tls,
+            "timeout": httpx.Timeout(connect=5.0, read=30.0, write=30.0, pool=5.0),
+            "headers": {"Authorization": f"Splunk {self.config.token}"},
+        }
+        if self._transport is not None:
+            kwargs["transport"] = self._transport
+        self._client = httpx.AsyncClient(**kwargs)
         self._task = asyncio.create_task(self._flush_loop(), name="hec-flush")
 
     async def close(self) -> None:
@@ -95,6 +114,17 @@ class HecEmitter:
             self._client = None
 
     # ------------------------------------------------------------------
+
+    async def flush(self) -> None:
+        """Send everything queued, now.
+
+        Called before the run summary reads the counters. Without it the
+        summary reports whatever the background loop happened to have shipped
+        at that instant, which undercounts by however many records were still
+        in the queue and makes the telemetry block look like it lost events it
+        had not tried to send yet.
+        """
+        await self._flush(force=True)
 
     def emit(self, record: StepRecord) -> None:
         """Queue one step record. Never blocks, never raises."""

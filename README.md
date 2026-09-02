@@ -80,9 +80,43 @@ docker run --rm \
 Useful before committing to a long run:
 
 ```bash
-python -m regulator_agent --probe-only   # what is this target, and what is its ceiling
-python -m regulator_agent --lint-only    # would this scenario actually run
+python -m regulator_agent --target-report  # describe a cluster you have never tested
+python -m regulator_agent --probe-only     # just the version, roles and ceiling
+python -m regulator_agent --lint-only      # would this scenario actually run
 ```
+
+### Pointing it at an unfamiliar cluster
+
+`--target-report` needs only a URL and a credential, no scenario, and answers
+the questions that decide whether a benchmark is worth running and how to read
+it afterwards. JSON on stdout, a human summary on stderr:
+
+```
+target        https://splunk.example:8089 (session)
+instance      Splunk 10.4.0 on Linux, 8 cores, 15896 MB
+roles         indexer, license_master, deployment_server, kv_store
+search peers  0
+concurrency   max_hist_searches=14 (base 6 + 1/cpu x 8)
+smartstore    6 index(es)
+can dispatch  True
+recommended   search-classes, but read it as a harness check rather than a sizing
+              exercise: a single instance has no distributed search to measure
+
+indexes with data:
+  main                        819,494,531 events     80764 MB  event  smartstore
+  cultivar_web                104,283,980 events     11429 MB  event
+
+notes:
+  - no distributed search peers: this is a single instance, so a run here exercises
+    nothing of bundle replication, the map phase across peers, or the search-head
+    concurrency split
+  - 6 index(es) use SmartStore: a rare search over a wide window may be measuring a
+    cache miss and an object-storage fetch rather than the search tier
+```
+
+Every probe it makes is optional. A permission the account lacks, or an
+endpoint the node does not have, becomes a note rather than a failure, so the
+report is useful with whatever access you were given and honest about the rest.
 
 ### Exit codes
 
@@ -130,8 +164,13 @@ deployment disposable and a CI job a single `docker run`.
 
 | Variable | Default | Notes |
 |---|---|---|
-| `REG_HEC_URL` / `REG_HEC_TOKEN` | off | Ship results to Splunk. Both or neither |
-| `REG_HEC_INDEX` | token default | |
+| `REG_HEC_URL` / `REG_HEC_TOKEN` | off | Ship results to Splunk. Both or neither, and setting only one is a hard boot error rather than silently shipping nothing |
+| `REG_HEC_VERIFY_TLS` | `1` | Set `0` for a self-signed collector, which is the normal case for an on-premises indexer or an in-cluster service name. **Worth knowing:** this module swallows its own errors by design, so without this flag telemetry against a self-signed endpoint disappears into TLS failures the run never mentions |
+| `REG_HEC_INDEX` | the token's default | Omitted from the envelope when unset, because sending an explicit null is a 400 |
+| `REG_HEC_SOURCE` | `regulator` | |
+| `REG_HEC_SOURCETYPE_STEP` / `_RUN` | `regulator:step` / `regulator:run` | |
+| `REG_HEC_GZIP` | `1` | |
+| `REG_HEC_BATCH_BYTES` / `REG_HEC_BATCH_MS` | `524288` / `200` | Flush thresholds. Batching keeps the telemetry round trip off the hot path entirely, so it never lands in the latency being measured |
 | `REG_OUTPUT` | stdout | NDJSON step records |
 | `REG_SUMMARY_PATH` | | Where to write the run summary as JSON |
 

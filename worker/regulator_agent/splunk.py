@@ -488,6 +488,37 @@ class SplunkClient:
         payload, _ = await self._json("GET", _SERVER_INFO_PATH, context="server info")
         return _first_content(payload)
 
+    async def entries(self, path: str, context: str, params: Optional[Dict[str, Any]] = None) -> List[Dict[str, Any]]:
+        """Every ``entry`` from a collection endpoint, as name plus content.
+
+        Used by the target report to describe a cluster nobody has benchmarked
+        before. Everything it asks for is optional, so an absent endpoint or a
+        capability this account lacks comes back as an empty list rather than
+        an exception: a load-test account with no admin rights should still be
+        able to say what it can see.
+
+        503 is in the tolerated set, which looks wrong and is not. Splunk
+        answers 503 for an endpoint that is *not enabled on this node*, for
+        example ``/services/shcluster/member/info`` on an instance that is not
+        in a search head cluster. That is a statement about configuration, not
+        about load, and it is the normal answer for most of what this method
+        asks about.
+        """
+        try:
+            payload, _ = await self._json(
+                "GET", path, params={"count": "0", **(params or {})}, context=context
+            )
+        except SplunkHttpError as exc:
+            if exc.status in (401, 403, 404, 503):
+                return []
+            raise
+        entries = (payload or {}).get("entry") or []
+        return [
+            {"name": entry.get("name"), **(entry.get("content") or {})}
+            for entry in entries
+            if isinstance(entry, dict)
+        ]
+
     async def search_limits(self) -> Dict[str, Any]:
         """``limits.conf [search]`` as splunkd sees it, or ``{}`` if it is not readable.
 
