@@ -259,6 +259,12 @@ class RunStats:
         self.in_flight = 0
         self.peak_in_flight = 0
         self.iterations_completed = 0
+        # Queueing is a measurement, not a failure. When load crosses the
+        # target's concurrent-search ceiling, splunkd starts holding searches in
+        # QUEUED before running them: that is the exact moment a capacity test
+        # is looking for, so it is counted rather than treated as an error.
+        self.queued_executions = 0
+        self.queued = LatencyHistogram()
 
     def record(self, record: StepRecord) -> None:
         stats = self.steps.get(record.step_id)
@@ -272,6 +278,9 @@ class RunStats:
         if record.late_by_ms:
             self.drift.record_ms(record.late_by_ms)
             self.max_drift_ms = max(self.max_drift_ms, record.late_by_ms)
+        if record.queued_ms:
+            self.queued_executions += 1
+            self.queued.record_ms(record.queued_ms)
         if not record.ok:
             self.errors += 1
             cls = record.error_class or ERROR_CLIENT
@@ -308,6 +317,15 @@ class RunStats:
                 round(self.executions / self.elapsed_s, 2) if self.elapsed_s > 0 else 0.0
             ),
             "latency": self.overall_latency.summary(),
+            "queueing": {
+                "searches_queued": self.queued_executions,
+                "queued_pct": (
+                    round(100.0 * self.queued_executions / self.executions, 2)
+                    if self.executions
+                    else 0.0
+                ),
+                "queued_ms": self.queued.summary(),
+            },
             "generator": {
                 "max_drift_ms": round(self.max_drift_ms, 1),
                 "drift_p95_ms": round(self.drift.percentile_ms(95), 1),
@@ -342,6 +360,9 @@ class RunSummary:
     load_model: str
     peak_virtual_users: int
     stats: Dict[str, Any]
+    # SmartStore provenance. Without it, a fast run and a slow run of the same
+    # scenario are not comparable and nobody can tell why.
+    cache: Optional[Dict[str, Any]] = None
     abort_reason: Optional[str] = None
     scenario_seed: int = 0
     agent_version: str = ""

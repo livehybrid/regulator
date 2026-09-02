@@ -519,6 +519,16 @@ class SplunkClient:
             if isinstance(entry, dict)
         ]
 
+    async def post_action(self, path: str, context: str = "") -> Dict[str, Any]:
+        """POST to an EAI action endpoint that takes no body.
+
+        Splunk's admin endpoints expose custom actions this way, and they are
+        POST-only: a GET answers "All custom actions of this endpoint require
+        POST". Used for SmartStore cache eviction.
+        """
+        payload, _ = await self._json("POST", path, data={}, context=context or path)
+        return payload or {}
+
     async def search_limits(self) -> Dict[str, Any]:
         """``limits.conf [search]`` as splunkd sees it, or ``{}`` if it is not readable.
 

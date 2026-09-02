@@ -210,6 +210,12 @@ class Config:
     # Configurable only so a test can prove the difference it makes.
     cache_bust: bool
 
+    # SmartStore. Eviction is opt-in and never a default: throwing away a warm
+    # cache makes the next run pay to re-download everything it touches, which
+    # on a cloud object store costs real money and real time.
+    evict_cache: bool
+    evict_cache_indexes: tuple[str, ...]
+
     # Output.
     output_path: Optional[str]
     log_level: str
@@ -337,6 +343,12 @@ def load_config(env: Optional[Mapping[str, str]] = None) -> Config:
         poll_initial_ms=poll_initial,
         poll_max_ms=poll_max,
         cache_bust=_boolean(env, "REG_CACHE_BUST", True),
+        evict_cache=_boolean(env, "REG_EVICT_CACHE", False),
+        evict_cache_indexes=tuple(
+            part.strip()
+            for part in (_get(env, "REG_EVICT_CACHE_INDEXES", "") or "").split(",")
+            if part.strip()
+        ),
         output_path=_get(env, "REG_OUTPUT"),
         log_level=log_level,
         metrics_port=_integer(env, "REG_METRICS_PORT", 0, minimum=0),

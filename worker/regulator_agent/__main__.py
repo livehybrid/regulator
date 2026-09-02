@@ -43,6 +43,8 @@ from .engines import get_engine
 from .hec import HecEmitter
 from .params import ParameterResolver
 from .report import render, target_report
+from .smartstore import CacheState, cache_state, delta as cache_delta, evict_all
+from .smartstore import render as render_cache
 from .results import NdjsonEmitter, RunStats, RunSummary
 from .scenario import ScenarioError, is_advice, lint, load_scenario
 from .scheduler import Scheduler
@@ -253,9 +255,38 @@ async def _run(config: Config, args: argparse.Namespace) -> int:
                     sig, lambda s=sig: scheduler.request_stop(f"signal {s.name}")
                 )
 
+        # SmartStore provenance. Without knowing what was already on local disk,
+        # a fast run and a slow run of the same scenario are not comparable:
+        # one may have read local disk while the other paid for an
+        # object-storage fetch before it could filter anything.
+        indexes_in_play = config.evict_cache_indexes or (
+            (scenario.corpus.index,) if scenario.corpus.index else ()
+        )
+        if config.evict_cache:
+            log.warning(
+                "REG_EVICT_CACHE is set: dropping the local SmartStore cache for %s "
+                "before this run, so it measures the cold path",
+                ", ".join(indexes_in_play) or "every index",
+            )
+            eviction = await evict_all(engine.client, indexes=indexes_in_play or None)
+            log.warning(
+                "evicted %d/%d bucket(s), %.1f GB",
+                eviction.evicted,
+                eviction.attempted,
+                eviction.bytes_evicted / 1e9,
+            )
+        else:
+            eviction = None
+
+        cache_before = await cache_state(engine.client)
+        if cache_before.available:
+            log.info(render_cache(cache_before).splitlines()[0])
+
         progress_task = asyncio.create_task(_progress(stats, stop_progress), name="progress")
         summary = await scheduler.run()
         stop_progress.set()
+
+        summary.cache = await _cache_provenance(engine.client, cache_before, eviction)
 
         await _report_summary(summary, hec, config)
         return _exit_code(summary)
@@ -281,6 +312,41 @@ async def _run(config: Config, args: argparse.Namespace) -> int:
                     close()
         with contextlib.suppress(Exception):
             await engine.close()
+
+
+async def _cache_provenance(client, before: CacheState, eviction) -> Optional[dict]:
+    """What the run did to the SmartStore cache, and therefore what it measured.
+
+    Reported on every run rather than only when eviction was asked for. The
+    question "was this served from cache?" has to be answerable for a result to
+    mean anything, and it is not answerable after the fact.
+    """
+    if not before.available:
+        return {"available": False, "reason": before.reason}
+    after = await cache_state(client)
+    change = cache_delta(before, after)
+    payload = {
+        "before": before.to_dict(),
+        "after": after.to_dict(),
+        "delta": change.to_dict(),
+    }
+    if eviction is not None:
+        payload["eviction"] = eviction.to_dict()
+
+    if change.provenance == "warm":
+        log.info(
+            "cache: warm. Nothing was downloaded during this run, so the numbers "
+            "describe the search tier reading local disk"
+        )
+    else:
+        log.warning(
+            "cache: %s. %d bucket(s) (%.1f GB) were downloaded during this run, so part "
+            "of what was measured is object storage and the network, not the search tier",
+            change.provenance,
+            change.buckets_downloaded,
+            change.bytes_downloaded / 1e9,
+        )
+    return payload
 
 
 async def _report_summary(
@@ -320,6 +386,18 @@ async def _report_summary(
         latency["p99_ms"],
         stats["error_rate_pct"],
     )
+    queueing = stats.get("queueing", {})
+    if queueing.get("searches_queued"):
+        log.warning(
+            "QUEUEING OBSERVED: %d of %d searches (%.1f%%) waited in QUEUED before "
+            "running, p95 %.0fms. The target was at its concurrent-search ceiling, "
+            "which is the point a capacity test is looking for",
+            queueing["searches_queued"],
+            stats["executions"],
+            queueing["queued_pct"],
+            queueing["queued_ms"]["p95_ms"],
+        )
+
     if not summary.co_corrected:
         log.warning(
             "this run was not coordinated-omission corrected (closed model with no pacing): "

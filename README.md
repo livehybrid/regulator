@@ -179,6 +179,51 @@ results into the cluster you are measuring adds load to it. When the telemetry
 host matches the target host, the run record carries `self_instrumented: true`
 so nobody later compares it against a clean run without noticing.
 
+### SmartStore
+
+On a SmartStore indexer the local disk is a cache in front of object storage,
+which means the same search over the same data is two different pieces of work
+depending on what is already local. Warm, it reads local disk and you are
+measuring the search tier. Cold, it downloads buckets first and you are largely
+measuring object storage and the network.
+
+Both are worth having. Not knowing which one you got is not. **Every run
+records the cache state before and after**, so the summary carries a
+`provenance` of `warm`, `cold`, `mixed` or `unknown`, along with how many
+buckets and bytes the run pulled down.
+
+| Variable | Default | Notes |
+|---|---|---|
+| `REG_EVICT_CACHE` | `0` | Evict the local cache before the run, so it measures the cold path. Opt-in and never a default: throwing away a warm cache means paying to re-download everything the next run touches |
+| `REG_EVICT_CACHE_INDEXES` | the scenario's corpus index | Comma-separated. Restricting eviction to the indexes the scenario actually searches is strongly preferred: on a shared cluster the rest of the cache belongs to other people's dashboards |
+
+The target report also gives you the picture before you start:
+
+```
+cache   720/1386 buckets local (52%), 78.8 GB of 80.5 GB, 98% full, policy lru
+```
+
+That 98% is a finding in its own right. A cache at its ceiling evicts buckets
+other searches are using, so the run measures churn as much as search, and the
+report says so.
+
+### Concurrency and queueing
+
+Queueing is a **measurement, not a failure**. When load crosses the target's
+concurrent-search ceiling, splunkd holds searches in `QUEUED` before running
+them, and that moment is exactly what a capacity test is looking for. Regulator
+records `queued_ms` per search, counts how many queued, and reports it
+prominently at the end of the run:
+
+```
+QUEUEING OBSERVED: 340 of 1200 searches (28.3%) waited in QUEUED before running,
+p95 4100ms. The target was at its concurrent-search ceiling.
+```
+
+The run carries on. If you want a run to stop when latency degrades, that is
+what `abort_if.p95_ms` is for, and for a deliberate saturation test you should
+set it high or leave it out.
+
 ### Client
 
 | Variable | Default | Notes |

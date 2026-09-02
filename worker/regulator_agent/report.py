@@ -33,6 +33,7 @@ from __future__ import annotations
 import time
 from typing import Any, Dict, List, Optional
 
+from .smartstore import cache_state
 from .splunk import SplunkClient, SplunkError
 from .timepolicy import TimeWindow
 
@@ -48,6 +49,50 @@ def _int(value: Any) -> Optional[int]:
         return int(str(value).strip())
     except (TypeError, ValueError):
         return None
+
+
+
+# How far back the sourcetype census looks. Long enough to see anything with a
+# regular heartbeat, short enough that tstats stays quick on a large estate.
+SOURCETYPE_WINDOW_S = 7 * 86400
+SOURCETYPE_LIMIT = 40
+
+
+async def _sourcetypes(client: SplunkClient, notes: List[str]) -> List[Dict[str, Any]]:
+    """What is actually in the indexes, by volume.
+
+    Runs against the TSIDX metadata rather than the raw events, so it costs
+    almost nothing and does not itself become a load test.
+    """
+    now = time.time()
+    window = TimeWindow(earliest=now - SOURCETYPE_WINDOW_S, latest=now)
+    spl = "| tstats count where index=* by index, sourcetype | sort - count"
+    try:
+        rows, _ = await client.oneshot(spl, window, count=SOURCETYPE_LIMIT)
+    except SplunkError as exc:
+        notes.append(
+            f"the sourcetype census failed ({exc}), so this report cannot say whether a "
+            "scenario's searches match anything in this cluster"
+        )
+        return []
+
+    census = []
+    for row in rows:
+        count = _int(row.get("count")) or 0
+        census.append(
+            {
+                "index": row.get("index"),
+                "sourcetype": row.get("sourcetype"),
+                "events_7d": count,
+            }
+        )
+    if not census:
+        notes.append(
+            f"no events at all in the last {SOURCETYPE_WINDOW_S // 86400} days. The "
+            "cluster may hold only older data, in which case scenarios using a rolling "
+            "time window will search empty ranges and return instantly"
+        )
+    return census
 
 
 async def target_report(client: SplunkClient) -> Dict[str, Any]:
@@ -183,6 +228,35 @@ async def target_report(client: SplunkClient) -> Dict[str, Any]:
                 "search tier. Size the local cache before drawing conclusions"
             )
 
+    # --------------------------------------------------------- sourcetypes
+    # Knowing an index holds 800 million events does not tell you what is in
+    # it, and a scenario written against sourcetypes this cluster does not have
+    # searches nothing while looking perfectly healthy. One tstats over the
+    # accelerated metadata answers it in seconds even on a large estate.
+    report["sourcetypes"] = await _sourcetypes(client, notes)
+
+    # -------------------------------------------------- smartstore cache
+    # On SmartStore the local disk is a cache in front of object storage, so
+    # the same search is a different piece of work depending on what is already
+    # local. How full that cache is decides whether a wide search evicts
+    # somebody else's buckets while it runs.
+    cache = await cache_state(client)
+    report["smartstore_cache"] = cache.to_dict()
+    if cache.available:
+        fill = cache.fill_pct
+        if fill is not None and fill > 90:
+            notes.append(
+                f"the SmartStore cache is {fill:.0f}% full: a wide search will evict "
+                "buckets other searches are using, so a benchmark here measures cache "
+                "churn as much as the search tier"
+            )
+        if cache.local_pct < 50:
+            notes.append(
+                f"only {cache.local_pct:.0f}% of buckets are local: searches over older "
+                "data will pay an object-storage fetch before they can filter anything. "
+                "Expect a cold first run and a much faster second one"
+            )
+
     # ------------------------------------------------------- can we work?
     now = time.time()
     try:
@@ -253,6 +327,26 @@ def render(report: Dict[str, Any]) -> str:
             )
     else:
         lines.append("  (none)")
+
+    census = report.get("sourcetypes") or []
+    if census:
+        lines += ["", "sourcetypes with data (last 7 days):"]
+        for row in census[:12]:
+            lines.append(
+                f"  {str(row['index'])[:20]:<20} {str(row['sourcetype'])[:30]:<30} "
+                f"{row['events_7d']:>12,}"
+            )
+
+    cache = report.get("smartstore_cache") or {}
+    if cache.get("available"):
+        lines += [
+            "",
+            f"cache         {cache['local_buckets']}/{cache['total_buckets']} buckets local "
+            f"({cache['local_pct']:.0f}%), {cache['local_bytes'] / 1e9:.1f} GB of "
+            f"{((cache.get('max_cache_size_mb') or 0) * 1024 * 1024) / 1e9:.1f} GB"
+            + (f", {cache['fill_pct']:.0f}% full" if cache.get("fill_pct") is not None else "")
+            + f", policy {cache.get('eviction_policy') or 'unknown'}",
+        ]
 
     if report.get("notes"):
         lines += ["", "notes:"]

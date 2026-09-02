@@ -98,6 +98,12 @@ class FakeSplunkConfig:
     scan_count_base: int = 100000
     fail_rate: float = 0.0
     log_requests: bool = False
+    # SmartStore simulation. 0 buckets means the cache manager reports nothing,
+    # which is how a non-SmartStore instance behaves and is the default.
+    smartstore_buckets: int = 0
+    smartstore_local_pct: int = 50
+    smartstore_bucket_bytes: int = 750 * 1024 * 1024
+    smartstore_max_cache_size_mb: int = 76800
     # Indexes that /services/data/indexes/<name> reports as existing. Anything
     # else 404s, so a scenario naming an index that is not there is caught by
     # the online lint exactly as it would be against a real cluster.
@@ -122,6 +128,7 @@ class _Stats:
     auth_failures: int = 0
     v1_dispatches: int = 0
     oneshots: int = 0
+    buckets_evicted: int = 0
     requests_by_path: Dict[str, int] = field(default_factory=dict)
     searches: List[str] = field(default_factory=list)
 
@@ -173,6 +180,9 @@ class FakeSplunk:
         self._lock = threading.RLock()
         self._rng = random.Random(self.config.seed)
         self._jobs: Dict[str, _Job] = {}
+        # bucket id -> "local" | "remote"
+        self._buckets: Dict[str, str] = {}
+        self._build_buckets()
         self._active: List[_Job] = []
         self._pending: List[_Job] = []
         self.stats = _Stats()
@@ -557,6 +567,23 @@ class FakeSplunk:
             return 200, _conf_limits()
         if path.startswith("/services/data/indexes") and method == "GET":
             return self._index(path)
+        if path == "/services/configs/conf-server/cachemanager" and method == "GET":
+            return self._cacheman_config()
+        if path == "/services/admin/cacheman" and method == "GET":
+            return self._cacheman_list()
+        if path.startswith("/services/admin/cacheman/"):
+            tail = path[len("/services/admin/cacheman/"):]
+            if tail.endswith("/evict"):
+                if method != "POST":
+                    return 400, {
+                        "messages": [
+                            {
+                                "type": "ERROR",
+                                "text": "All custom actions of this endpoint require POST",
+                            }
+                        ]
+                    }
+                return self._cacheman_evict(unquote(tail[: -len("/evict")]))
         if path in _PARSER_PATHS and method in ("POST", "GET"):
             source = form if form else query
             return self._parse(_first(source, "q", ""))
@@ -574,6 +601,70 @@ class FakeSplunk:
             return self._job_endpoint(method, sid, tail, query, form)
 
         return 404, {"messages": [{"type": "ERROR", "text": f"Not found: {path}"}]}
+
+    def _build_buckets(self) -> None:
+        """Lay out a fake SmartStore cache, deterministically.
+
+        Buckets alternate local and remote by index position so a test can
+        predict exactly how many of each there are without depending on the RNG.
+        """
+        total = max(0, int(self.config.smartstore_buckets))
+        if not total:
+            return
+        indexes = [i for i in self.config.indexes if not i.startswith("_")] or ["main"]
+        local_share = max(0, min(100, int(self.config.smartstore_local_pct)))
+        for n in range(total):
+            index = indexes[n % len(indexes)]
+            bid = f"bid|{index}~{n}~26563E6C-B883-490C-B3D1-3F65A8911B59|"
+            self._buckets[bid] = "local" if (n * 100) // total < local_share else "remote"
+
+    def _cacheman_list(self) -> Tuple[int, Any]:
+        entries = []
+        for bid, status in sorted(self._buckets.items()):
+            entries.append(
+                {
+                    "name": bid,
+                    "content": {
+                        "cm:bucket": {
+                            "status": status,
+                            "estimated_size": self.config.smartstore_bucket_bytes,
+                            "journal_size": self.config.smartstore_bucket_bytes,
+                            "cache_priority": 0,
+                            "ref_count": 0,
+                            "stable": True,
+                            "download_status": "idle",
+                            "upload_status": "idle",
+                            "earliest_time": 1600000000,
+                            "latest_time": 1700000000,
+                        },
+                        "disabled": False,
+                    },
+                }
+            )
+        return 200, {"entry": entries}
+
+    def _cacheman_config(self) -> Tuple[int, Any]:
+        return 200, {
+            "entry": [
+                {
+                    "name": "cachemanager",
+                    "content": {
+                        "max_cache_size": str(self.config.smartstore_max_cache_size_mb),
+                        "eviction_policy": "lru",
+                        "hotlist_recency_secs": "86400",
+                        "eviction_padding": "5120",
+                    },
+                }
+            ]
+        }
+
+    def _cacheman_evict(self, bid: str) -> Tuple[int, Any]:
+        with self._lock:
+            if bid not in self._buckets:
+                return 404, {"messages": [{"type": "ERROR", "text": "Unknown bucket"}]}
+            self._buckets[bid] = "remote"
+            self.stats.buckets_evicted += 1
+        return 200, {"messages": []}
 
     def _index(self, path: str) -> Tuple[int, Any]:
         """Answer an index existence check.
