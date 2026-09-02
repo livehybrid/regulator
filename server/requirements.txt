@@ -1,0 +1,14 @@
+# Control-plane runtime dependencies (py3.12).
+#
+# The control plane imports the worker package directly rather than shelling
+# out to it, so worker/requirements.txt is installed alongside this file. That
+# is what keeps the web UI and the command line running identical code.
+
+fastapi>=0.115,<1
+uvicorn[standard]>=0.30,<1
+SQLAlchemy>=2.0,<3
+pydantic>=2.7,<3
+
+# Credentials at rest (Fernet) and the signed session cookie.
+cryptography>=42,<47
+itsdangerous>=2.1,<3

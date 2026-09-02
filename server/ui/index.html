@@ -1,0 +1,966 @@
+<!doctype html>
+<html lang="en-GB">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Regulator</title>
+<style>
+/* Dark by default. The light theme is a deliberate override, not the base. */
+:root{
+  --bg:#0d1117; --panel:#141b23; --panel2:#1a2430; --line:#26313d;
+  --fg:#d8e2ec; --muted:#8ba0b4; --accent:#54b9ff; --accent-dim:#1d3b52;
+  --ok:#4ade80; --warn:#f5b544; --bad:#f2555a; --shadow:rgba(0,0,0,.55);
+  --mono:ui-monospace,SFMono-Regular,Menlo,Consolas,"Liberation Mono",monospace;
+}
+@media (prefers-color-scheme: light){
+  :root{
+    --bg:#f4f6f8; --panel:#ffffff; --panel2:#eef2f6; --line:#d3dbe3;
+    --fg:#16212c; --muted:#5c6f80; --accent:#0a6bbd; --accent-dim:#d3e7f8;
+    --ok:#177a3d; --warn:#8a5a00; --bad:#b32026; --shadow:rgba(0,0,0,.14);
+  }
+}
+*{box-sizing:border-box}
+html,body{height:100%}
+body{margin:0;background:var(--bg);color:var(--fg);
+  font:13px/1.45 system-ui,-apple-system,"Segoe UI",Roboto,sans-serif}
+h1{font-size:17px;margin:0}
+h2{font-size:14px;margin:0 0 8px}
+h3{font-size:12px;margin:14px 0 6px;text-transform:uppercase;letter-spacing:.07em;color:var(--muted)}
+a{color:var(--accent)}
+code,.mono,td.num,th.num{font-family:var(--mono)}
+.hidden{display:none !important}
+.muted{color:var(--muted)}
+.small{font-size:12px}
+.right{text-align:right}
+
+/* Shell */
+#app{display:grid;grid-template-columns:196px 1fr;min-height:100vh}
+nav{background:var(--panel);border-right:1px solid var(--line);padding:14px 10px;
+  display:flex;flex-direction:column;gap:4px}
+.brand{font-weight:700;letter-spacing:.12em;text-transform:uppercase;font-size:13px;
+  padding:4px 8px 12px;color:var(--accent)}
+.brand span{display:block;font-size:10px;letter-spacing:.04em;text-transform:none;
+  color:var(--muted);font-weight:400;margin-top:3px}
+nav a.navlink{display:block;padding:7px 9px;border-radius:4px;color:var(--fg);
+  text-decoration:none;font-size:13px}
+nav a.navlink:hover{background:var(--panel2)}
+nav a.navlink.active{background:var(--accent-dim);color:var(--accent)}
+nav .spacer{flex:1}
+main{padding:16px 18px 60px;min-width:0}
+.head{display:flex;align-items:center;justify-content:space-between;gap:12px;margin-bottom:12px}
+.panel{background:var(--panel);border:1px solid var(--line);border-radius:5px;padding:12px;margin-bottom:14px}
+
+/* Buttons */
+.btn{font:inherit;background:var(--panel2);color:var(--fg);border:1px solid var(--line);
+  border-radius:4px;padding:4px 10px;cursor:pointer}
+.btn:hover:not(:disabled){border-color:var(--accent);color:var(--accent)}
+.btn:disabled{opacity:.5;cursor:not-allowed}
+.btn.primary{background:var(--accent);border-color:var(--accent);color:#04121d;font-weight:600}
+.btn.primary:hover:not(:disabled){filter:brightness(1.1);color:#04121d}
+@media (prefers-color-scheme: light){
+  .btn.primary,.btn.primary:hover:not(:disabled){color:#fff}
+}
+.btn.danger{border-color:var(--bad);color:var(--bad)}
+.btn.danger:hover:not(:disabled){background:var(--bad);color:#fff}
+.btn.ghost{background:transparent}
+.btn.busy{position:relative;color:transparent !important}
+.btn.busy::after{content:"";position:absolute;inset:0;margin:auto;width:11px;height:11px;
+  border:2px solid var(--muted);border-top-color:transparent;border-radius:50%;
+  animation:spin .7s linear infinite}
+@keyframes spin{to{transform:rotate(360deg)}}
+.btns{display:flex;gap:5px;flex-wrap:wrap}
+
+/* Tables */
+table{width:100%;border-collapse:collapse;font-size:12.5px}
+th{text-align:left;font-weight:600;color:var(--muted);font-size:11px;text-transform:uppercase;
+  letter-spacing:.05em;padding:5px 8px;border-bottom:1px solid var(--line);white-space:nowrap}
+td{padding:4px 8px;border-bottom:1px solid var(--line);vertical-align:top}
+tbody tr:hover{background:var(--panel2)}
+td.num,th.num{text-align:right;font-variant-numeric:tabular-nums;white-space:nowrap}
+tr.clickable{cursor:pointer}
+tr.inline td{border-bottom:1px solid var(--line);background:var(--panel2);font-size:12px}
+
+/* Forms */
+label.f{display:block;margin:0 0 8px}
+label.f > span{display:block;font-size:11px;color:var(--muted);margin-bottom:2px}
+input[type=text],input[type=password],input[type=number],select,textarea{
+  width:100%;font:inherit;font-family:var(--mono);background:var(--bg);color:var(--fg);
+  border:1px solid var(--line);border-radius:4px;padding:5px 7px}
+input:focus,select:focus{outline:1px solid var(--accent);border-color:var(--accent)}
+.grid2{display:grid;grid-template-columns:repeat(auto-fit,minmax(210px,1fr));gap:0 14px}
+.chk{display:flex;align-items:center;gap:6px;margin:0 0 8px;font-size:12.5px}
+.chk input{width:auto}
+
+/* Status pills */
+.pill{display:inline-block;padding:1px 7px;border-radius:9px;font-size:11px;font-weight:600;
+  border:1px solid var(--line);white-space:nowrap}
+.pill.ok{color:var(--ok);border-color:var(--ok)}
+.pill.bad{color:var(--bad);border-color:var(--bad)}
+.pill.warn{color:var(--warn);border-color:var(--warn)}
+.pill.info{color:var(--accent);border-color:var(--accent)}
+.pill.idle{color:var(--muted)}
+.dot{display:inline-block;width:7px;height:7px;border-radius:50%;background:var(--muted);margin-right:5px}
+.dot.run{background:var(--accent);animation:pulse 1.4s ease-in-out infinite}
+@keyframes pulse{50%{opacity:.25}}
+
+/* Banners */
+.banner{border-radius:5px;padding:10px 12px;margin-bottom:10px;border:1px solid var(--line);
+  background:var(--panel);border-left-width:4px}
+.banner b{display:block;margin-bottom:3px}
+.banner.bad{border-left-color:var(--bad)} .banner.bad b{color:var(--bad)}
+.banner.warn{border-left-color:var(--warn)} .banner.warn b{color:var(--warn)}
+.banner.info{border-left-color:var(--accent)} .banner.info b{color:var(--accent)}
+.note{color:var(--muted);font-size:12px;border-left:2px solid var(--line);padding:2px 0 2px 9px;margin:5px 0}
+
+/* Tiles */
+.tiles{display:grid;grid-template-columns:repeat(auto-fit,minmax(126px,1fr));gap:8px;margin-bottom:14px}
+.tile{background:var(--panel);border:1px solid var(--line);border-radius:5px;padding:8px 10px}
+.tile .k{font-size:10.5px;text-transform:uppercase;letter-spacing:.06em;color:var(--muted)}
+.tile .v{font-family:var(--mono);font-size:19px;margin-top:3px;font-variant-numeric:tabular-nums}
+.tile .sub{font-size:11px;color:var(--muted);font-family:var(--mono)}
+.tile.bad .v{color:var(--bad)} .tile.warn .v{color:var(--warn)} .tile.ok .v{color:var(--ok)}
+
+/* Cards (scenarios) */
+.cards{display:grid;grid-template-columns:repeat(auto-fill,minmax(285px,1fr));gap:10px}
+.card{background:var(--panel);border:1px solid var(--line);border-radius:5px;padding:11px;
+  display:flex;flex-direction:column;gap:7px}
+.card .t{font-weight:600;font-family:var(--mono)}
+.tag{display:inline-block;background:var(--panel2);border:1px solid var(--line);border-radius:3px;
+  padding:0 5px;font-size:11px;font-family:var(--mono);color:var(--muted);margin:0 3px 3px 0}
+.kv{display:grid;grid-template-columns:auto 1fr;gap:2px 10px;font-size:12px}
+.kv dt{color:var(--muted)} .kv dd{margin:0;font-family:var(--mono)}
+
+/* Fill bar */
+.bar{height:9px;background:var(--panel2);border:1px solid var(--line);border-radius:5px;overflow:hidden}
+.bar > i{display:block;height:100%;background:var(--accent)}
+.bar > i.warn{background:var(--warn)} .bar > i.bad{background:var(--bad)}
+
+/* Dialog */
+dialog{background:var(--panel);color:var(--fg);border:1px solid var(--line);border-radius:6px;
+  padding:0;width:min(760px,94vw);box-shadow:0 18px 48px var(--shadow)}
+dialog.wide{width:min(1080px,96vw)}
+dialog::backdrop{background:rgba(0,0,0,.6)}
+.dlg-h{padding:11px 14px;border-bottom:1px solid var(--line);font-weight:600}
+.dlg-b{padding:14px;max-height:min(70vh,720px);overflow:auto}
+.dlg-f{padding:10px 14px;border-top:1px solid var(--line);display:flex;gap:6px;justify-content:flex-end}
+
+/* Login */
+#login{display:flex;align-items:center;justify-content:center;min-height:100vh;padding:20px}
+#login .panel{width:320px}
+
+/* Toasts */
+#toasts{position:fixed;right:14px;bottom:14px;display:flex;flex-direction:column;gap:7px;z-index:50;
+  max-width:min(430px,90vw)}
+.toast{background:var(--panel);border:1px solid var(--line);border-left:4px solid var(--bad);
+  border-radius:5px;padding:9px 11px;cursor:pointer;box-shadow:0 8px 22px var(--shadow);font-size:12.5px}
+.toast.info{border-left-color:var(--accent)}
+.toast.ok{border-left-color:var(--ok)}
+.chart{background:var(--panel);border:1px solid var(--line);border-radius:5px;padding:10px;margin-bottom:14px}
+.chart svg{max-width:100%;height:auto;display:block}
+.scroll{overflow-x:auto}
+.url{font-family:var(--mono);font-size:12px;word-break:break-all}
+</style>
+</head>
+<body>
+
+<div id="login" class="hidden">
+  <form class="panel" id="loginForm">
+    <div class="brand">Regulator<span>Search load generation for Splunk</span></div>
+    <p id="loginNote" class="muted small hidden"></p>
+    <label class="f"><span>Password</span><input type="password" id="loginPw" autocomplete="current-password" required></label>
+    <button class="btn primary" id="loginBtn" type="submit" style="width:100%">Sign in</button>
+  </form>
+</div>
+
+<div id="app" class="hidden">
+  <nav>
+    <div class="brand">Regulator<span>Search load for Splunk</span></div>
+    <a class="navlink" href="#targets" data-route="targets">Targets</a>
+    <a class="navlink" href="#scenarios" data-route="scenarios">Scenarios</a>
+    <a class="navlink" href="#runs" data-route="runs">Runs</a>
+    <div style="height:8px"></div>
+    <button class="btn primary" data-act="launch">Launch a run</button>
+    <div class="spacer"></div>
+    <button class="btn ghost" id="logoutBtn" data-act="logout">Sign out</button>
+  </nav>
+  <main>
+    <div id="openBanner"></div>
+    <div id="view"></div>
+  </main>
+</div>
+
+<dialog id="dlg">
+  <div class="dlg-h" id="dlgTitle"></div>
+  <div class="dlg-b" id="dlgBody"></div>
+  <div class="dlg-f" id="dlgFoot"></div>
+</dialog>
+
+<div id="toasts"></div>
+
+<script>
+"use strict";
+const $ = (s, r) => (r || document).querySelector(s);
+const state = { targets: [], scenarios: [], lastJson: null, currentRun: null, setupNeeded: false };
+let pollTimer = null;      // run-detail poll handle
+let samples = [];          // client-side latency history for the live chart
+let samplesRunId = null;
+
+/* ---------- formatting ---------- */
+const esc = s => String(s === null || s === undefined ? "" : s)
+  .replace(/[&<>"']/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+const num = v => (v === null || v === undefined || Number.isNaN(v));
+function fmtInt(v){ return num(v) ? "\u2013" : Math.round(v).toLocaleString("en-GB"); }
+function fmtNum(v, dp){ return num(v) ? "\u2013" : Number(v).toFixed(dp === undefined ? 2 : dp); }
+function fmtPct(v, dp){ return num(v) ? "\u2013" : Number(v).toFixed(dp === undefined ? 1 : dp) + "%"; }
+function fmtMs(v){
+  if (num(v)) return "\u2013";
+  if (v >= 10000) return (v / 1000).toFixed(1) + " s";
+  if (v >= 1000) return (v / 1000).toFixed(2) + " s";
+  if (v >= 10) return Math.round(v).toLocaleString("en-GB") + " ms";
+  return Number(v).toFixed(1) + " ms";
+}
+function fmtBytes(b){
+  if (num(b)) return "\u2013";
+  const u = ["B", "KB", "MB", "GB", "TB", "PB"]; let i = 0, n = Number(b);
+  while (n >= 1024 && i < u.length - 1) { n /= 1024; i++; }
+  return (i === 0 ? n.toFixed(0) : n.toFixed(1)) + " " + u[i];
+}
+function fmtDur(s){
+  if (num(s)) return "\u2013";
+  if (s < 90) return Number(s).toFixed(s < 10 ? 1 : 0) + " s";
+  const m = Math.floor(s / 60), r = Math.round(s % 60);
+  if (m < 60) return m + "m " + r + "s";
+  return Math.floor(m / 60) + "h " + (m % 60) + "m";
+}
+function toDate(v){
+  if (v === null || v === undefined || v === "") return null;
+  const d = typeof v === "number" ? new Date(v * (v > 1e11 ? 1 : 1000)) : new Date(v);
+  return isNaN(d.getTime()) ? null : d;
+}
+function fmtWhen(v){
+  const d = toDate(v); if (!d) return "\u2013";
+  const diff = (Date.now() - d.getTime()) / 1000;
+  const rel = diff < 60 ? Math.max(0, Math.round(diff)) + "s ago"
+    : diff < 3600 ? Math.round(diff / 60) + "m ago"
+    : diff < 86400 ? Math.round(diff / 3600) + "h ago"
+    : Math.round(diff / 86400) + "d ago";
+  return '<span title="' + esc(d.toLocaleString("en-GB")) + '">' + esc(rel) + "</span>";
+}
+
+/* ---------- api ---------- */
+class ApiError extends Error { constructor(msg, status){ super(msg); this.status = status; } }
+async function api(path, opts){
+  opts = opts || {};
+  const init = { method: opts.method || "GET", credentials: "same-origin", headers: {} };
+  if (opts.body !== undefined) { init.headers["Content-Type"] = "application/json"; init.body = JSON.stringify(opts.body); }
+  let res;
+  try { res = await fetch("/api" + path, init); }
+  catch (e) { throw new ApiError("Cannot reach the Regulator server: " + e.message, 0); }
+  if (res.status === 401) { showLogin(); throw new ApiError("Session expired, please sign in again", 401); }
+  if (res.status === 204) return null;
+  const text = await res.text();
+  let data = null;
+  if (text) { try { data = JSON.parse(text); } catch (e) { data = text; } }
+  if (!res.ok) {
+    let d = data && typeof data === "object" ? (data.detail || data.error || data.message) : data;
+    if (d && typeof d === "object") d = JSON.stringify(d);
+    throw new ApiError(String(d || res.statusText || ("HTTP " + res.status)), res.status);
+  }
+  return data;
+}
+function toast(msg, kind){
+  const t = document.createElement("div");
+  t.className = "toast " + (kind || "");
+  t.textContent = String(msg);
+  t.addEventListener("click", () => t.remove());
+  $("#toasts").appendChild(t);
+  setTimeout(() => t.remove(), kind === "ok" || kind === "info" ? 6000 : 12000);
+}
+// Wraps a click handler so the button shows a spinner while its call is in flight
+// (the target report can take the best part of a minute).
+async function busy(btn, fn){
+  if (!btn || btn.disabled) return;
+  btn.disabled = true; btn.classList.add("busy");
+  try { await fn(); }
+  catch (e) { if (!(e instanceof ApiError) || e.status !== 401) toast(e.message); }
+  finally { btn.disabled = false; btn.classList.remove("busy"); }
+}
+
+/* ---------- dialog ---------- */
+function dialog(opts){
+  const dlg = $("#dlg");
+  dlg.className = opts.wide ? "wide" : "";
+  $("#dlgTitle").textContent = opts.title;
+  $("#dlgBody").innerHTML = opts.html;
+  const foot = $("#dlgFoot"); foot.innerHTML = "";
+  (opts.actions || []).forEach(a => {
+    const b = document.createElement("button");
+    b.className = "btn " + (a.kind || ""); b.textContent = a.label;
+    if (a.id) b.id = a.id;
+    if (a.disabled) b.disabled = true;
+    b.addEventListener("click", () => a.onClick(b));
+    foot.appendChild(b);
+  });
+  const c = document.createElement("button");
+  c.className = "btn ghost"; c.textContent = opts.closeLabel || "Close";
+  c.addEventListener("click", () => dlg.close());
+  foot.appendChild(c);
+  if (!dlg.open) dlg.showModal();
+  return dlg;
+}
+
+/* ---------- shared renderers ---------- */
+function healthPill(t){
+  const h = t.health || "unknown";
+  const cls = h === "ok" ? "ok" : h === "error" ? "bad" : "idle";
+  return '<span class="pill ' + cls + '" title="' + esc(t.health_detail || "") + '">' + esc(h) + "</span>";
+}
+function statePill(s){
+  const cls = s === "completed" ? "ok" : s === "running" ? "info" : s === "pending" ? "idle"
+    : s === "stopped" ? "warn" : "bad";
+  const dot = s === "running" ? '<span class="dot run"></span>' : "";
+  return '<span class="pill ' + cls + '">' + dot + esc(s || "unknown") + "</span>";
+}
+function fillBar(pct){
+  if (num(pct)) return "";
+  const cls = pct >= 95 ? "bad" : pct >= 80 ? "warn" : "";
+  return '<div class="bar"><i class="' + cls + '" style="width:' + Math.max(0, Math.min(100, pct)) + '%"></i></div>';
+}
+function cacheLine(c){
+  if (!c) return '<span class="muted">no cache information</span>';
+  if (c.available === false) return '<span class="muted">SmartStore cache not reported: ' + esc(c.reason || "no reason given") + "</span>";
+  return '<span class="mono">' + fmtInt(c.local_buckets) + "/" + fmtInt(c.total_buckets) +
+    " buckets local (" + fmtPct(c.local_pct, 0) + "), " + fmtBytes(c.local_bytes) + " of " +
+    (num(c.max_cache_size_mb) ? fmtBytes(c.total_bytes) : fmtBytes(c.max_cache_size_mb * 1024 * 1024)) +
+    ", " + fmtPct(c.fill_pct, 0) + " full, policy " + esc(c.eviction_policy || "unknown") + "</span>";
+}
+function cacheHtml(c){
+  if (!c) return "<p>No cache information was returned.</p>";
+  if (c.available === false)
+    return '<p class="muted">This target does not report a SmartStore cache: ' + esc(c.reason || "no reason given") +
+      ". That is normal on an indexer with local storage only.</p>";
+  const rows = Object.entries(c.per_index || {}).map(([n, v]) =>
+    "<tr><td class='mono'>" + esc(n) + "</td><td class='num'>" + fmtInt(v.local_buckets) + "</td><td class='num'>" +
+    fmtInt(v.remote_buckets) + "</td><td class='num'>" + fmtPct(v.local_pct, 0) + "</td><td class='num'>" +
+    fmtBytes(v.local_bytes) + "</td></tr>").join("");
+  return "<dl class='kv'>" +
+    "<dt>Local buckets</dt><dd>" + fmtInt(c.local_buckets) + "</dd>" +
+    "<dt>Remote buckets</dt><dd>" + fmtInt(c.remote_buckets) + "</dd>" +
+    "<dt>Total buckets</dt><dd>" + fmtInt(c.total_buckets) + " (" + fmtPct(c.local_pct, 0) + " local)</dd>" +
+    "<dt>Local bytes</dt><dd>" + fmtBytes(c.local_bytes) + " of " + fmtBytes(c.total_bytes) + "</dd>" +
+    "<dt>Cache ceiling</dt><dd>" + (num(c.max_cache_size_mb) ? "unset" : fmtBytes(c.max_cache_size_mb * 1024 * 1024)) + "</dd>" +
+    "<dt>Eviction policy</dt><dd>" + esc(c.eviction_policy || "unknown") + "</dd></dl>" +
+    "<h3>Fill against the ceiling: " + fmtPct(c.fill_pct, 0) + "</h3>" + fillBar(c.fill_pct) +
+    (c.fill_pct >= 95 ? '<p class="note">A cache at its ceiling evicts buckets other searches are using, so a run measures churn as much as search.</p>' : "") +
+    "<h3>Per index</h3>" + (rows ? "<div class='scroll'><table><thead><tr><th>Index</th><th class='num'>Local</th>" +
+      "<th class='num'>Remote</th><th class='num'>Local %</th><th class='num'>Local bytes</th></tr></thead><tbody>" +
+      rows + "</tbody></table></div>" : "<p class='muted'>No per-index breakdown was returned.</p>");
+}
+
+/* ---------- targets ---------- */
+async function viewTargets(){
+  setView(
+    '<div class="head"><h1>Targets</h1><div class="btns">' +
+    '<button class="btn" data-act="toggle-add">Add target</button>' +
+    '<button class="btn primary" data-act="launch">Launch a run</button></div></div>' +
+    '<section class="panel hidden" id="addPanel">' +
+    '<h2>Add a target</h2>' +
+    '<p class="note">A bearer token is preferred over a username and password: it can be scoped, revoked and never puts an account password in the store. Fill in either the token or both credential fields.</p>' +
+    '<form id="addForm"><div class="grid2">' +
+    '<label class="f"><span>Name</span><input type="text" name="name" required></label>' +
+    '<label class="f"><span>Management URL (splunkd, usually :8089)</span><input type="text" name="mgmt_url" placeholder="https://splunk.example:8089" required></label>' +
+    '<label class="f"><span>Web URL (optional)</span><input type="text" name="web_url" placeholder="https://splunk.example:8000"></label>' +
+    '<label class="f"><span>Bearer token (preferred)</span><input type="password" name="token" autocomplete="off"></label>' +
+    '<label class="f"><span>Username (only without a token)</span><input type="text" name="username" autocomplete="off"></label>' +
+    '<label class="f"><span>Password (only without a token)</span><input type="password" name="password" autocomplete="new-password"></label>' +
+    '<label class="f"><span>App context</span><input type="text" name="app" placeholder="search"></label>' +
+    '<label class="f"><span>Owner</span><input type="text" name="owner" placeholder="nobody"></label>' +
+    '<label class="f"><span>API version (optional)</span><input type="text" name="api_version"></label>' +
+    '</div><label class="chk"><input type="checkbox" name="verify_tls" checked> Verify TLS certificates</label>' +
+    '<div class="btns"><button class="btn primary" type="submit">Create target</button>' +
+    '<button class="btn ghost" type="button" data-act="toggle-add">Cancel</button></div></form></section>' +
+    '<div id="targetsBody" class="muted">Loading targets\u2026</div>');
+  $("#addForm").addEventListener("submit", onAddTarget);
+  await loadTargets();
+}
+async function loadTargets(){
+  const body = $("#targetsBody"); if (!body) return;
+  let list;
+  try { list = await api("/targets"); }
+  catch (e) { if (e.status !== 401) { body.innerHTML = '<p class="muted">Could not load targets: ' + esc(e.message) + "</p>"; toast(e.message); } return; }
+  state.targets = Array.isArray(list) ? list : [];
+  if (!state.targets.length) {
+    body.innerHTML = '<div class="panel"><p class="muted">No targets yet. Add the Splunk instance you want to drive load at, then use Test to check Regulator can reach it and dispatch a search.</p></div>';
+    return;
+  }
+  const rows = state.targets.map(t =>
+    '<tr data-id="' + esc(t.id) + '"><td>' + esc(t.name || "(unnamed)") + "</td>" +
+    '<td class="url">' + esc(t.mgmt_url || "") + (t.web_url ? '<br><span class="muted">' + esc(t.web_url) + "</span>" : "") + "</td>" +
+    "<td class='mono'>" + esc(t.app || "\u2013") + (t.owner ? " / " + esc(t.owner) : "") + "</td>" +
+    "<td>" + (t.verify_tls === false ? '<span class="pill warn">off</span>' : '<span class="pill ok">on</span>') + "</td>" +
+    "<td>" + healthPill(t) + "</td>" +
+    "<td>" + fmtWhen(t.created_at) + "</td>" +
+    '<td><div class="btns">' +
+    '<button class="btn" data-act="test" data-id="' + esc(t.id) + '">Test</button>' +
+    '<button class="btn" data-act="report" data-id="' + esc(t.id) + '">Report</button>' +
+    '<button class="btn" data-act="cache" data-id="' + esc(t.id) + '">Cache</button>' +
+    '<button class="btn" data-act="evict" data-id="' + esc(t.id) + '">Evict</button>' +
+    '<button class="btn danger" data-act="delete" data-id="' + esc(t.id) + '">Delete</button>' +
+    "</div></td></tr>" +
+    '<tr class="inline hidden"><td colspan="7"></td></tr>').join("");
+  body.innerHTML = '<div class="panel scroll" style="padding:0"><table><thead><tr><th>Name</th><th>Management URL</th>' +
+    "<th>App / owner</th><th>TLS</th><th>Health</th><th>Added</th><th></th></tr></thead><tbody>" + rows + "</tbody></table></div>";
+}
+function inlineFor(id){
+  const row = $('#targetsBody tr[data-id="' + cssEsc(id) + '"]');
+  return row && row.nextElementSibling && row.nextElementSibling.classList.contains("inline")
+    ? row.nextElementSibling : null;
+}
+const cssEsc = s => (window.CSS && CSS.escape) ? CSS.escape(String(s)) : String(s).replace(/["\\]/g, "\\$&");
+async function onAddTarget(ev){
+  ev.preventDefault();
+  const f = ev.target, fd = new FormData(f);
+  const body = { name: fd.get("name"), mgmt_url: fd.get("mgmt_url"), verify_tls: fd.get("verify_tls") === "on" };
+  ["web_url", "token", "username", "password", "app", "owner", "api_version"].forEach(k => {
+    const v = (fd.get(k) || "").trim(); if (v) body[k] = v;
+  });
+  const btn = f.querySelector('button[type=submit]');
+  await busy(btn, async () => {
+    await api("/targets", { method: "POST", body });
+    f.reset(); $("#addPanel").classList.add("hidden");
+    toast("Target created", "ok");
+    await loadTargets();
+  });
+}
+async function actTest(btn, id){
+  await busy(btn, async () => {
+    const r = await api("/targets/" + encodeURIComponent(id) + "/test", { method: "POST" });
+    const cell = inlineFor(id);
+    if (!cell) return;
+    cell.classList.remove("hidden");
+    const bits = [];
+    if (r.version) bits.push("version " + esc(r.version));
+    if (r.roles && r.roles.length) bits.push("roles " + esc(r.roles.join(", ")));
+    if (!num(r.cores)) bits.push(esc(r.cores) + " cores");
+    if (!num(r.max_hist_searches)) bits.push("ceiling " + esc(r.max_hist_searches) + " concurrent historical searches");
+    cell.firstElementChild.innerHTML = r.ok
+      ? '<span class="pill ok">\u2713 reachable</span> <span class="mono">' + bits.join(" \u00b7 ") + "</span>" +
+        (r.detail ? ' <span class="muted">' + esc(r.detail) + "</span>" : "")
+      : '<span class="pill bad">\u2717 failed</span> <span class="mono">' + esc(r.detail || "no detail given") + "</span>";
+    await loadTargetsHealthOnly(id, r.ok);
+  });
+}
+// Repaint just the health pill, so a Test does not wipe the other inline results.
+async function loadTargetsHealthOnly(id, ok){
+  const row = $('#targetsBody tr[data-id="' + cssEsc(id) + '"]');
+  if (!row) return;
+  const cell = row.children[4];
+  if (cell) cell.innerHTML = '<span class="pill ' + (ok ? "ok" : "bad") + '">' + (ok ? "ok" : "error") + "</span>";
+}
+async function actReport(btn, id){
+  await busy(btn, async () => {
+    const r = await api("/targets/" + encodeURIComponent(id) + "/report", { method: "POST" });
+    state.lastJson = JSON.stringify(r, null, 2);
+    dialog({ title: "Target report", wide: true, html: reportHtml(r), actions: [
+      { label: "Copy JSON", onClick: copyLastJson }
+    ]});
+  });
+}
+function reportHtml(r){
+  const inst = r.instance || {}, conc = r.concurrency || {};
+  const peers = (r.search_peers || []).map(p => "<tr><td class='mono'>" + esc(p.name) + "</td><td>" +
+    esc(p.status || "") + "</td><td class='mono'>" + esc(p.version || "") + "</td></tr>").join("");
+  const idx = (r.indexes || []).map(i => "<tr><td class='mono'>" + esc(i.name) + "</td><td>" + esc(i.datatype || "") +
+    "</td><td class='num'>" + fmtInt(i.events) + "</td><td class='num'>" + fmtNum(i.size_mb, 0) +
+    "</td><td>" + (i.smartstore ? '<span class="pill info">s2</span>' : "") +
+    (i.internal ? ' <span class="pill idle">internal</span>' : "") + "</td></tr>").join("");
+  const st = (r.sourcetypes || []).map(s => "<tr><td class='mono'>" + esc(s.index) + "</td><td class='mono'>" +
+    esc(s.sourcetype) + "</td><td class='num'>" + fmtInt(s.events_7d) + "</td></tr>").join("");
+  const notes = (r.notes || []).map(n => "<li>" + esc(n) + "</li>").join("");
+  return (r.reachable === false ? '<div class="banner bad"><b>Unreachable</b>Regulator could not talk to this target, so everything below is whatever it managed to read.</div>' : "") +
+    "<dl class='kv'>" +
+    "<dt>Target</dt><dd>" + esc(r.target_url || "unknown") + "</dd>" +
+    "<dt>Auth</dt><dd>" + esc(r.auth_method || "unknown") + "</dd>" +
+    "<dt>Instance</dt><dd>" + esc(inst.server_name || "unknown") + ", Splunk " + esc(inst.version || "unknown") +
+      " (build " + esc(inst.build || "?") + ") on " + esc(inst.os_name || "unknown") + "</dd>" +
+    "<dt>Roles</dt><dd>" + esc((inst.roles || []).join(", ") || "unknown") + "</dd>" +
+    "<dt>Hardware</dt><dd>" + esc(inst.cores === undefined ? "?" : inst.cores) + " cores, " +
+      (num(inst.physical_memory_mb) ? "? memory" : fmtBytes(inst.physical_memory_mb * 1024 * 1024)) + "</dd>" +
+    "<dt>Concurrency</dt><dd>base " + esc(conc.base_max_searches) + " + " + esc(conc.max_searches_per_cpu) +
+      "/cpu = <b>" + esc(conc.max_hist_searches) + "</b> concurrent historical searches</dd>" +
+    "<dt>Can dispatch</dt><dd>" + (r.can_dispatch === false ? '<span class="pill bad">no</span>' : '<span class="pill ok">yes</span>') + "</dd>" +
+    "<dt>Suggested scenario</dt><dd>" + esc(r.recommended_scenario || "none suggested") + "</dd>" +
+    "</dl>" +
+    (notes ? '<h3>Notes</h3><div class="banner info"><ul style="margin:0;padding-left:18px">' + notes + "</ul></div>" : "") +
+    "<h3>SmartStore cache</h3><p>" + cacheLine(r.smartstore_cache) + "</p>" +
+    "<h3>Search peers</h3>" + (peers ? "<div class='scroll'><table><thead><tr><th>Peer</th><th>Status</th><th>Version</th></tr></thead><tbody>" +
+      peers + "</tbody></table></div>" : "<p class='muted'>None reported (this looks like a standalone instance).</p>") +
+    "<h3>Indexes with data</h3>" + (idx ? "<div class='scroll'><table><thead><tr><th>Index</th><th>Type</th><th class='num'>Events</th>" +
+      "<th class='num'>Size (MB)</th><th></th></tr></thead><tbody>" + idx + "</tbody></table></div>" : "<p class='muted'>No indexes reported.</p>") +
+    "<h3>Sourcetype census (last 7 days)</h3>" + (st ? "<div class='scroll'><table><thead><tr><th>Index</th><th>Sourcetype</th>" +
+      "<th class='num'>Events</th></tr></thead><tbody>" + st + "</tbody></table></div>" : "<p class='muted'>No sourcetypes reported.</p>");
+}
+async function copyLastJson(btn){
+  if (!state.lastJson) return;
+  try { await navigator.clipboard.writeText(state.lastJson); toast("JSON copied to the clipboard", "ok"); }
+  catch (e) { toast("Clipboard refused, the JSON is in the console instead"); console.log(state.lastJson); }
+}
+async function actCache(btn, id){
+  await busy(btn, async () => {
+    const c = await api("/targets/" + encodeURIComponent(id) + "/cache");
+    state.lastJson = JSON.stringify(c, null, 2);
+    dialog({ title: "SmartStore cache", html: cacheHtml(c), actions: [{ label: "Copy JSON", onClick: copyLastJson }] });
+  });
+}
+async function actEvict(btn, id){
+  await busy(btn, async () => {
+    let c = null;
+    try { c = await api("/targets/" + encodeURIComponent(id) + "/cache"); } catch (e) { toast(e.message); }
+    const names = Object.keys((c && c.per_index) || {});
+    const list = names.length
+      ? names.map(n => '<label class="chk"><input type="checkbox" class="evIdx" value="' + esc(n) + '"> <span class="mono">' +
+          esc(n) + '</span> <span class="muted small">' + fmtInt(c.per_index[n].local_buckets) + " local buckets, " +
+          fmtBytes(c.per_index[n].local_bytes) + "</span></label>").join("")
+      : '<p class="muted">This target reported no per-index cache breakdown, so pick "all indexes" or nothing.</p>';
+    dialog({
+      title: "Evict the SmartStore cache",
+      html: '<div class="banner warn"><b>Read this before you tick anything</b>' +
+        "Eviction does not destroy data: every bucket still exists in object storage. What it costs is time. " +
+        "The next searches over that data have to re-download it, so they will be slow, and on a shared cluster " +
+        "most of that cache belongs to other people's dashboards and scheduled searches, not to you. " +
+        "There is no undo beyond waiting for everything to re-localise.</div>" +
+        "<h3>Indexes</h3>" + list +
+        '<h3>Or everything</h3><label class="chk"><input type="checkbox" id="evAll"> ' +
+        '<b style="color:var(--bad)">All indexes</b> <span class="muted small">(drops the whole cache on this target)</span></label>' +
+        '<div id="evResult"></div>',
+      actions: [{ label: "Evict", kind: "danger", id: "evGo", disabled: true, onClick: b => doEvict(b, id) }]
+    });
+    const sync = () => {
+      const all = $("#evAll").checked;
+      const any = Array.prototype.some.call(document.querySelectorAll(".evIdx"), i => i.checked);
+      $("#evGo").disabled = !(all || any);
+    };
+    $("#evAll").addEventListener("change", sync);
+    document.querySelectorAll(".evIdx").forEach(i => i.addEventListener("change", sync));
+  });
+}
+async function doEvict(btn, id){
+  const all = $("#evAll").checked;
+  const idx = Array.prototype.filter.call(document.querySelectorAll(".evIdx"), i => i.checked).map(i => i.value);
+  await busy(btn, async () => {
+    const r = await api("/targets/" + encodeURIComponent(id) + "/evict", {
+      method: "POST", body: { indexes: idx, all_indexes: all }
+    });
+    const e = r.eviction || {}, b = r.before || {}, a = r.after || {};
+    $("#evResult").innerHTML = '<h3>Result</h3><dl class="kv">' +
+      "<dt>Attempted</dt><dd>" + fmtInt(e.attempted) + " buckets</dd>" +
+      "<dt>Evicted</dt><dd>" + fmtInt(e.evicted) + " buckets, " + fmtBytes(e.bytes_evicted) + "</dd>" +
+      "<dt>Refused</dt><dd>" + fmtInt(e.failed) + " buckets</dd>" +
+      "<dt>Local before</dt><dd>" + fmtInt(b.local_buckets) + " buckets, " + fmtBytes(b.local_bytes) + "</dd>" +
+      "<dt>Local after</dt><dd>" + fmtInt(a.local_buckets) + " buckets, " + fmtBytes(a.local_bytes) + "</dd></dl>" +
+      (e.failed ? '<p class="note">A bucket with a live reader cannot be evicted. Refusals are correct behaviour rather than a fault.</p>' : "");
+    $("#evGo").disabled = true;
+    toast("Evicted " + fmtInt(e.evicted) + " buckets", "ok");
+  });
+}
+async function actDelete(btn, id){
+  const t = state.targets.find(x => String(x.id) === String(id)) || {};
+  dialog({
+    title: "Delete target",
+    html: "<p>Delete <b>" + esc(t.name || id) + "</b>? Past runs against it stay in the run history, but you will not be able to launch new ones without adding it again.</p>",
+    actions: [{ label: "Delete", kind: "danger", onClick: async b => {
+      await busy(b, async () => {
+        await api("/targets/" + encodeURIComponent(id), { method: "DELETE" });
+        $("#dlg").close(); toast("Target deleted", "ok"); await loadTargets();
+      });
+    }}]
+  });
+}
+
+/* ---------- scenarios ---------- */
+async function viewScenarios(){
+  setView('<div class="head"><h1>Scenarios</h1><button class="btn primary" data-act="launch">Launch a run</button></div>' +
+    '<div id="scenBody" class="muted">Loading scenarios\u2026</div>');
+  let list;
+  try { list = await api("/scenarios"); }
+  catch (e) { if (e.status !== 401) { $("#scenBody").innerHTML = '<p class="muted">' + esc(e.message) + "</p>"; toast(e.message); } return; }
+  state.scenarios = Array.isArray(list) ? list : [];
+  if (!state.scenarios.length) {
+    $("#scenBody").innerHTML = '<div class="panel"><p class="muted">No scenarios are registered on this server.</p></div>';
+    return;
+  }
+  $("#scenBody").innerHTML = '<div class="cards">' + state.scenarios.map(s =>
+    '<div class="card"><div class="t">' + esc(s.name) + "</div>" +
+    '<div class="small">' + esc(s.description || "No description.") + "</div>" +
+    "<div>" + (s.tags || []).map(t => '<span class="tag">' + esc(t) + "</span>").join("") + "</div>" +
+    '<dl class="kv small">' +
+    "<dt>Engine</dt><dd>" + esc(s.engine || "?") + "</dd>" +
+    "<dt>Shape</dt><dd>" + fmtInt(s.personas) + " personas, " + fmtInt(s.steps) + " steps</dd>" +
+    "<dt>Default load</dt><dd>" + fmtInt(s.virtual_users) + " users for " +
+      (num(s.duration_s) ? "an unbounded run" : fmtDur(s.duration_s)) + "</dd>" +
+    "<dt>Corpus index</dt><dd>" + esc(s.index || "\u2013") + "</dd>" +
+    "<dt>Needs packs</dt><dd>" + ((s.requires_packs || []).length ? esc(s.requires_packs.join(", ")) : "none") + "</dd>" +
+    "</dl>" +
+    // Lint findings are the difference between a run and a wasted hour, so they
+    // sit on the card rather than behind a click.
+    ((s.lint || []).length ? '<div class="note">Lint: ' + s.lint.map(esc).join("; ") + "</div>" : "") +
+    "<div class='btns'><button class='btn primary' data-act='run-scenario' data-scenario='" + esc(s.name) + "'>Run</button></div></div>"
+  ).join("") + "</div>";
+}
+
+/* ---------- launch ---------- */
+async function openLaunch(scenarioName){
+  try {
+    if (!state.targets.length) state.targets = (await api("/targets")) || [];
+    if (!state.scenarios.length) state.scenarios = (await api("/scenarios")) || [];
+  } catch (e) { if (e.status !== 401) toast(e.message); }
+  if (!state.targets.length) { toast("Add a target before launching a run"); location.hash = "#targets"; return; }
+  if (!state.scenarios.length) { toast("This server has no scenarios registered, so there is nothing to run"); return; }
+  const tOpts = state.targets.map(t => '<option value="' + esc(t.id) + '">' + esc(t.name) + " (" + esc(t.mgmt_url) + ")</option>").join("");
+  const sOpts = state.scenarios.map(s => '<option value="' + esc(s.name) + '"' +
+    (s.name === scenarioName ? " selected" : "") + ">" + esc(s.name) + "</option>").join("");
+  // The dialog is built from strings, then wired with real listeners below: no inline handlers.
+  dialog({
+    title: "Launch a run",
+    html: '<div class="grid2">' +
+      '<label class="f"><span>Target</span><select id="lqTarget">' + tOpts + "</select></label>" +
+      '<label class="f"><span>Scenario</span><select id="lqScenario">' + sOpts + "</select></label>" +
+      '<label class="f"><span>Label (optional)</span><input type="text" id="lqLabel" placeholder="baseline before the indexer change"></label>' +
+      '<label class="f"><span>Virtual users (blank keeps the scenario default)</span><input type="number" id="lqVu" min="1"></label>' +
+      '<label class="f"><span>Duration in seconds</span><input type="number" id="lqDur" min="1"></label>' +
+      '<label class="f"><span>Pacing in seconds per iteration</span><input type="number" id="lqPace" min="0" step="0.1"></label>' +
+      '<label class="f"><span>Arrival rate per minute (open model)</span><input type="number" id="lqRate" min="0" step="1"></label>' +
+      "</div>" +
+      '<p class="note">Pacing decides what the latency numbers mean: with pacing, iterations are scheduled against the wall clock and the run reports coordinated-omission-corrected latency, without it each user waits for its own response so the figures are service times.</p>' +
+      '<label class="chk"><input type="checkbox" id="lqEvict"> Evict the SmartStore cache first (measures the cold path)</label>' +
+      '<div id="lqIdx" class="hidden"></div>',
+    actions: [{ label: "Launch", kind: "primary", onClick: submitLaunch }]
+  });
+  $("#lqEvict").addEventListener("change", onEvictToggle);
+  $("#lqTarget").addEventListener("change", () => { if ($("#lqEvict").checked) onEvictToggle(); });
+  const s = state.scenarios.find(x => x.name === scenarioName);
+  if (s) {
+    if (!num(s.virtual_users)) $("#lqVu").placeholder = String(s.virtual_users);
+    if (!num(s.duration_s)) $("#lqDur").placeholder = String(s.duration_s);
+  }
+}
+async function onEvictToggle(){
+  const box = $("#lqIdx");
+  if (!$("#lqEvict").checked) { box.classList.add("hidden"); box.innerHTML = ""; return; }
+  box.classList.remove("hidden");
+  box.innerHTML = '<p class="muted small">Reading the cache\u2026</p>';
+  let c = null;
+  try { c = await api("/targets/" + encodeURIComponent($("#lqTarget").value) + "/cache"); }
+  catch (e) { if (e.status !== 401) toast(e.message); }
+  const names = Object.keys((c && c.per_index) || {});
+  box.innerHTML = '<div class="banner warn"><b>Eviction affects everyone on this target</b>' +
+    "Nothing is destroyed, but the next searches over these indexes pay to re-download from object storage. " +
+    "Leave the list empty to let the scenario's own corpus index decide.</div>" +
+    (names.length ? names.map(n => '<label class="chk"><input type="checkbox" class="lqIdxChk" value="' + esc(n) +
+      '"> <span class="mono">' + esc(n) + "</span></label>").join("")
+      : '<p class="muted small">No per-index breakdown was returned for this target.</p>');
+}
+async function submitLaunch(btn){
+  // Target ids are integers on the wire, and a select always hands back a string.
+  const rawId = $("#lqTarget").value;
+  const body = { target_id: /^\d+$/.test(rawId) ? parseInt(rawId, 10) : rawId, scenario: $("#lqScenario").value };
+  const opt = (id, key, asFloat) => {
+    const v = ($("#" + id).value || "").trim();
+    if (v !== "") body[key] = asFloat ? parseFloat(v) : parseInt(v, 10);
+  };
+  opt("lqVu", "virtual_users"); opt("lqDur", "duration_s", true);
+  opt("lqPace", "pacing_s", true); opt("lqRate", "arrival_rate_per_min", true);
+  const label = ($("#lqLabel").value || "").trim();
+  if (label) body.label = label;
+  if ($("#lqEvict").checked) {
+    body.evict_cache = true;
+    body.evict_cache_indexes = Array.prototype.filter.call(document.querySelectorAll(".lqIdxChk"), i => i.checked).map(i => i.value);
+  }
+  await busy(btn, async () => {
+    const run = await api("/runs", { method: "POST", body });
+    $("#dlg").close();
+    location.hash = "#run/" + encodeURIComponent(run.id);
+  });
+}
+
+/* ---------- runs list ---------- */
+async function viewRuns(){
+  setView('<div class="head"><h1>Runs</h1><button class="btn primary" data-act="launch">Launch a run</button></div>' +
+    '<div id="runsBody" class="muted">Loading runs\u2026</div>');
+  let list;
+  try { list = await api("/runs"); }
+  catch (e) { if (e.status !== 401) { $("#runsBody").innerHTML = '<p class="muted">' + esc(e.message) + "</p>"; toast(e.message); } return; }
+  const runs = Array.isArray(list) ? list : [];
+  if (!runs.length) {
+    $("#runsBody").innerHTML = '<div class="panel"><p class="muted">No runs yet. Pick a scenario, pick a target and launch one.</p></div>';
+    return;
+  }
+  const rows = runs.map(r => {
+    const st = r.stats || {}, sm = r.summary || {};
+    const valid = sm.valid === false
+      ? '<span class="pill bad" title="' + esc(sm.invalid_reason || "") + '">invalid</span>'
+      : (r.state === "completed" ? '<span class="pill ok">valid</span>' : '<span class="pill idle">\u2013</span>');
+    return "<tr class='clickable' data-run='" + esc(r.id) + "'><td>" + esc(r.label || "(no label)") + "</td>" +
+      "<td class='mono'>" + esc(r.scenario || "") + "</td><td>" + esc(r.target_name || r.target_id || "") + "</td>" +
+      "<td>" + statePill(r.state) + "</td><td>" + fmtWhen(r.created_at) + "</td>" +
+      "<td class='num'>" + fmtInt(st.executions) + "</td>" +
+      "<td class='num'>" + fmtMs((st.latency || {}).p95_ms) + "</td>" +
+      "<td class='num'>" + fmtPct(st.error_rate_pct) + "</td><td>" + valid + "</td></tr>";
+  }).join("");
+  $("#runsBody").innerHTML = '<div class="panel scroll" style="padding:0"><table><thead><tr><th>Label</th><th>Scenario</th>' +
+    "<th>Target</th><th>State</th><th>Started</th><th class='num'>Executions</th><th class='num'>p95</th>" +
+    "<th class='num'>Errors</th><th>Validity</th></tr></thead><tbody>" + rows + "</tbody></table></div>";
+}
+
+/* ---------- run detail ---------- */
+function stopPolling(){ if (pollTimer) { clearTimeout(pollTimer); pollTimer = null; } }
+async function viewRun(id){
+  if (samplesRunId !== id) { samples = []; samplesRunId = id; }
+  state.currentRun = id;
+  setView('<div id="runWrap" class="muted">Loading run\u2026</div>');
+  await tickRun(id);
+}
+async function tickRun(id){
+  let run;
+  try { run = await api("/runs/" + encodeURIComponent(id)); }
+  catch (e) {
+    if (e.status !== 401) { toast(e.message); const w = $("#runWrap"); if (w) w.innerHTML = '<p class="muted">' + esc(e.message) + "</p>"; }
+    return;
+  }
+  if (state.currentRun !== id) return;   // the user navigated away mid-request
+  const live = run.state === "running" || run.state === "pending";
+  if (live) {
+    const st = run.stats || {}, lat = st.latency || {};
+    const t = num(st.elapsed_s) ? samples.length * 2 : st.elapsed_s;
+    const last = samples[samples.length - 1];
+    if (!last || t > last.t) samples.push({ t: t, p50: lat.p50_ms, p95: lat.p95_ms });
+    if (samples.length > 400) samples.shift();
+  }
+  drawRun(run);
+  if (live) pollTimer = setTimeout(() => tickRun(id), 2000);
+}
+function drawRun(r){
+  const st = r.stats || {}, sm = r.summary || {}, lat = st.latency || {}, q = st.queueing || {};
+  const tgt = st.target || {}, cache = sm.cache || {}, delta = cache.delta || {};
+  const ceiling = tgt.max_hist_searches;
+  const peak = st.peak_in_flight;
+  const atCeiling = !num(peak) && !num(ceiling) && peak >= ceiling;
+  const banners = [];
+  if (sm.valid === false)
+    banners.push('<div class="banner bad"><b>Invalid run: ' + esc(sm.invalid_reason || "reason not given") + "</b>" +
+      "These numbers describe the load generator rather than Splunk. Do not compare them with other runs, and do not draw a capacity conclusion from them.</div>");
+  if (!num(q.searches_queued) && q.searches_queued > 0)
+    banners.push('<div class="banner warn"><b>Queueing observed: ' + fmtInt(q.searches_queued) + " of " + fmtInt(st.executions) +
+      " searches (" + fmtPct(q.queued_pct) + ") waited in QUEUED before running, p95 " + fmtMs((q.queued_ms || {}).p95_ms) + "</b>" +
+      "The target was at its concurrent-search ceiling. This is a finding, not an error: it is the moment a capacity test exists to find.</div>");
+  const prov = delta.provenance;
+  if (prov && prov !== "warm")
+    banners.push('<div class="banner warn"><b>Cache provenance: ' + esc(prov) + "</b>" +
+      fmtInt(delta.buckets_downloaded) + " buckets (" + fmtBytes(delta.bytes_downloaded) +
+      ") came down from object storage during this run, so part of what was measured is object storage and the network rather than the search tier.</div>");
+  const quiet = [];
+  if (prov === "warm")
+    quiet.push('<div class="note">Cache provenance: warm. Nothing was downloaded during the run, so these numbers describe the search tier.</div>');
+  if (sm.co_corrected === false)
+    quiet.push('<div class="note">Coordinated omission was not corrected: the latency percentiles are service times, so throughput is the signal to read.</div>');
+  if (sm.self_instrumented)
+    quiet.push('<div class="note">Self-instrumented: telemetry was written to the system under test, so the run added a little load to its own target.</div>');
+  if (sm.abort_reason)
+    banners.push('<div class="banner bad"><b>Aborted</b>' + esc(sm.abort_reason) + "</div>");
+  if (r.error)
+    banners.push('<div class="banner bad"><b>Error</b><span class="mono">' + esc(r.error) + "</span></div>");
+
+  const tile = (k, v, sub, cls) => '<div class="tile ' + (cls || "") + '"><div class="k">' + k + '</div><div class="v">' + v +
+    '</div>' + (sub ? '<div class="sub">' + sub + "</div>" : "") + "</div>";
+  const errCls = num(st.error_rate_pct) ? "" : st.error_rate_pct >= 5 ? "bad" : st.error_rate_pct > 0 ? "warn" : "ok";
+  const tiles = tile("Executions", fmtInt(st.executions), fmtInt(st.errors) + " errors") +
+    tile("Throughput", fmtNum(st.throughput_per_s, 2), "searches per second") +
+    tile("p50", fmtMs(lat.p50_ms), "n=" + fmtInt(lat.count)) +
+    tile("p95", fmtMs(lat.p95_ms), "max " + fmtMs(lat.max_ms)) +
+    tile("p99", fmtMs(lat.p99_ms), "mean " + fmtMs(lat.mean_ms)) +
+    tile("Error rate", fmtPct(st.error_rate_pct), "", errCls) +
+    tile("Peak in flight", fmtInt(peak) + (num(ceiling) ? "" : " / " + fmtInt(ceiling)),
+      num(ceiling) ? "ceiling unknown" : "ceiling", atCeiling ? "bad" : "");
+
+  const steps = (st.steps || []).slice().sort((a, b) =>
+    ((b.latency || {}).p95_ms || 0) - ((a.latency || {}).p95_ms || 0));
+  const stepRows = steps.map(s => {
+    const l = s.latency || {}, d = s.dispatch || {}, f = s.ttfr || {};
+    return "<tr><td class='mono'>" + esc(s.step_id) + "</td><td><span class='tag'>" + esc(s.class || "?") + "</span></td>" +
+      "<td class='num'>" + fmtInt(s.executions) + "</td><td class='num'>" + fmtInt(s.errors) + "</td>" +
+      "<td class='num'>" + fmtPct(s.error_rate_pct) + "</td><td class='num'>" + fmtMs(l.p50_ms) + "</td>" +
+      "<td class='num'>" + fmtMs(l.p95_ms) + "</td><td class='num'>" + fmtMs(d.p95_ms) + "</td>" +
+      "<td class='num'>" + fmtMs(f.p95_ms) + "</td><td class='num'>" + fmtInt(s.scan_count_total) + "</td>" +
+      "<td class='num'>" + fmtInt(s.mean_events_per_s) + "</td></tr>";
+  }).join("");
+
+  const live = r.state === "running" || r.state === "pending";
+  const elapsed = num(st.elapsed_s) ? null : st.elapsed_s;
+  const html =
+    '<div class="head"><div><h1>' + esc(r.label || r.scenario || "Run") + " " + statePill(r.state) + "</h1>" +
+    '<div class="muted small mono">' + esc(r.scenario || "") + " against " + esc(r.target_name || r.target_id || "?") +
+    " \u00b7 id " + esc(r.id) + " \u00b7 started " + fmtWhen(r.started_at || r.created_at) +
+    (elapsed === null ? "" : " \u00b7 elapsed " + fmtDur(elapsed)) +
+    (sm.outcome ? " \u00b7 outcome " + esc(sm.outcome) : "") + "</div></div>" +
+    '<div class="btns"><a class="btn" href="#runs">All runs</a>' +
+    (live ? '<button class="btn danger" data-act="stop-run" data-id="' + esc(r.id) + '">Stop</button>' : "") + "</div></div>" +
+    banners.join("") + quiet.join("") +
+    '<div class="tiles">' + tiles + "</div>" +
+    (num(sm.peak_virtual_users) ? "" : '<div class="note">Peak virtual users: ' + fmtInt(sm.peak_virtual_users) +
+      ". Virtual users are not concurrent searches: a user idles between iterations, so the in-flight figure is the one to compare against the ceiling.</div>") +
+    '<div class="chart"><h3 style="margin-top:0">Latency over the run</h3>' + chartSvg(live) + "</div>" +
+    "<h3>Steps, worst p95 first</h3>" +
+    (stepRows ? '<div class="panel scroll" style="padding:0"><table><thead><tr><th>Step</th><th>Class</th>' +
+      "<th class='num'>Execs</th><th class='num'>Errors</th><th class='num'>Err %</th><th class='num'>p50</th>" +
+      "<th class='num'>p95</th><th class='num'>Dispatch p95</th><th class='num'>TTFR p95</th>" +
+      "<th class='num'>Scanned</th><th class='num'>Events/s</th></tr></thead><tbody>" + stepRows + "</tbody></table></div>"
+      : '<div class="panel"><p class="muted">No per-step figures yet.</p></div>');
+  const wrap = $("#runWrap");
+  if (wrap) wrap.outerHTML = '<div id="runWrap">' + html + "</div>";
+  else if ($("#view")) $("#view").innerHTML = '<div id="runWrap">' + html + "</div>";
+}
+// A deliberately small inline SVG line chart: no library, no external request.
+function chartSvg(live){
+  const pts = samples.filter(s => !num(s.p95) || !num(s.p50));
+  if (pts.length < 2)
+    return '<p class="muted small">' + (live
+      ? "The chart appears once two samples have been collected (one every two seconds)."
+      : "No live samples: this run was not open in the browser while it was running, so only the final figures above are available.") + "</p>";
+  const W = 600, H = 200, L = 56, R = 12, T = 12, B = 28;
+  const maxT = Math.max.apply(null, pts.map(s => s.t).concat([1]));
+  const rawMax = Math.max.apply(null, pts.map(s => Math.max(s.p50 || 0, s.p95 || 0)).concat([1]));
+  const maxY = niceMax(rawMax);
+  const x = t => L + (t / maxT) * (W - L - R);
+  const y = v => H - B - (Math.min(v, maxY) / maxY) * (H - T - B);
+  const poly = key => pts.filter(s => !num(s[key])).map(s => x(s.t).toFixed(1) + "," + y(s[key]).toFixed(1)).join(" ");
+  let grid = "";
+  for (let i = 0; i <= 4; i++) {
+    const v = maxY * i / 4, yy = y(v);
+    grid += '<line x1="' + L + '" y1="' + yy.toFixed(1) + '" x2="' + (W - R) + '" y2="' + yy.toFixed(1) +
+      '" stroke="currentColor" stroke-opacity=".14"/>' +
+      '<text x="' + (L - 6) + '" y="' + (yy + 3.5).toFixed(1) + '" text-anchor="end" font-size="10" fill="currentColor" opacity=".6">' +
+      Math.round(v).toLocaleString("en-GB") + "</text>";
+  }
+  for (let i = 0; i <= 5; i++) {
+    const t = maxT * i / 5, xx = x(t);
+    grid += '<text x="' + xx.toFixed(1) + '" y="' + (H - B + 15) + '" text-anchor="middle" font-size="10" fill="currentColor" opacity=".6">' +
+      Math.round(t) + "s</text>";
+  }
+  return '<svg viewBox="0 0 ' + W + " " + H + '" width="' + W + '" height="' + H + '" role="img" aria-label="Latency over the run">' +
+    grid +
+    '<line x1="' + L + '" y1="' + T + '" x2="' + L + '" y2="' + (H - B) + '" stroke="currentColor" stroke-opacity=".35"/>' +
+    '<line x1="' + L + '" y1="' + (H - B) + '" x2="' + (W - R) + '" y2="' + (H - B) + '" stroke="currentColor" stroke-opacity=".35"/>' +
+    '<polyline fill="none" stroke="var(--accent)" stroke-width="1.6" points="' + poly("p50") + '"/>' +
+    '<polyline fill="none" stroke="var(--warn)" stroke-width="1.6" points="' + poly("p95") + '"/>' +
+    '<text x="' + (L + 4) + '" y="' + (T + 10) + '" font-size="10" fill="var(--accent)">p50</text>' +
+    '<text x="' + (L + 34) + '" y="' + (T + 10) + '" font-size="10" fill="var(--warn)">p95</text>' +
+    '<text x="12" y="' + (T + 4) + '" font-size="10" fill="currentColor" opacity=".6">ms</text>' +
+    "</svg>";
+}
+function niceMax(v){
+  const mag = Math.pow(10, Math.floor(Math.log10(v)));
+  const n = v / mag;
+  const step = n <= 1 ? 1 : n <= 2 ? 2 : n <= 2.5 ? 2.5 : n <= 5 ? 5 : 10;
+  return step * mag;
+}
+async function actStop(btn, id){
+  await busy(btn, async () => {
+    const r = await api("/runs/" + encodeURIComponent(id) + "/stop", { method: "POST" });
+    toast("Stop requested", "ok");
+    drawRun(r);
+  });
+}
+
+/* ---------- routing ---------- */
+function route(){ return (location.hash || "").replace(/^#/, "") || "targets"; }
+function setView(html){ $("#view").innerHTML = html; }
+async function render(){
+  stopPolling();
+  const r = route();
+  if (r.indexOf("run/") !== 0) state.currentRun = null;
+  document.querySelectorAll("nav a.navlink").forEach(a =>
+    a.classList.toggle("active", a.dataset.route === r || (r.indexOf("run/") === 0 && a.dataset.route === "runs")));
+  try {
+    // Run ids travel through the hash encoded, so decode before using them as an id.
+    if (r.indexOf("run/") === 0) await viewRun(decodeURIComponent(r.slice(4)));
+    else if (r === "scenarios") await viewScenarios();
+    else if (r === "runs") await viewRuns();
+    else await viewTargets();
+  } catch (e) {
+    if (!(e instanceof ApiError) || e.status !== 401) { toast(e.message); console.error(e); }
+  }
+}
+
+/* ---------- auth ---------- */
+function showLogin(note){
+  stopPolling();
+  $("#app").classList.add("hidden");
+  $("#login").classList.remove("hidden");
+  const n = $("#loginNote");
+  if (note) { n.textContent = note; n.classList.remove("hidden"); } else { n.classList.add("hidden"); }
+  $("#loginPw").focus();
+}
+function showApp(){
+  $("#login").classList.add("hidden");
+  $("#app").classList.remove("hidden");
+  // setup_needed means no password is configured at all, so the server lets
+  // everyone in. Say that out loud rather than looking like a locked door.
+  $("#openBanner").innerHTML = state.setupNeeded
+    ? '<div class="banner bad"><b>This control plane has no password</b>' +
+      "Anyone who can reach it can add targets, read their reports and drive load at your cluster. " +
+      "Set an admin password in the server configuration and restart.</div>"
+    : "";
+  $("#logoutBtn").classList.toggle("hidden", !!state.setupNeeded);
+  render();
+}
+async function boot(){
+  let s = null;
+  try { s = await api("/auth/status"); }
+  catch (e) { if (e.status === 401) return; toast(e.message); }
+  state.setupNeeded = !!(s && s.setup_needed);
+  if (s && s.authenticated) showApp();
+  else showLogin(null);
+}
+
+/* ---------- wiring ---------- */
+$("#loginForm").addEventListener("submit", async ev => {
+  ev.preventDefault();
+  const btn = $("#loginBtn");
+  await busy(btn, async () => {
+    try {
+      await api("/auth/login", { method: "POST", body: { password: $("#loginPw").value } });
+    } catch (e) {
+      if (e.status === 401) { toast("That password was not accepted"); return; }
+      throw e;
+    }
+    $("#loginPw").value = "";
+    state.targets = []; state.scenarios = [];
+    showApp();
+  });
+});
+const actions = {
+  "toggle-add": () => $("#addPanel").classList.toggle("hidden"),
+  "test": (b, el) => actTest(b, el.dataset.id),
+  "report": (b, el) => actReport(b, el.dataset.id),
+  "cache": (b, el) => actCache(b, el.dataset.id),
+  "evict": (b, el) => actEvict(b, el.dataset.id),
+  "delete": (b, el) => actDelete(b, el.dataset.id),
+  "launch": () => openLaunch(null),
+  "run-scenario": (b, el) => openLaunch(el.dataset.scenario),
+  "stop-run": (b, el) => actStop(b, el.dataset.id),
+  "logout": async b => {
+    await busy(b, async () => { try { await api("/auth/logout", { method: "POST" }); } catch (e) {} showLogin(); });
+  }
+};
+// One delegated listener: no inline handlers anywhere, so a strict CSP is fine.
+document.addEventListener("click", ev => {
+  const el = ev.target.closest ? ev.target.closest("[data-act]") : null;
+  if (el && actions[el.dataset.act]) { ev.preventDefault(); actions[el.dataset.act](el, el); return; }
+  const row = ev.target.closest ? ev.target.closest("tr[data-run]") : null;
+  if (row && !ev.target.closest("button, a")) location.hash = "#run/" + encodeURIComponent(row.dataset.run);
+});
+window.addEventListener("hashchange", () => { if (!$("#app").classList.contains("hidden")) render(); });
+boot();
+</script>
+</body>
+</html>
