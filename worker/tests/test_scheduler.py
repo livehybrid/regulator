@@ -256,11 +256,19 @@ def test_a_slow_target_trips_the_latency_ceiling(env):
     assert "p95" in (summary.abort_reason or "")
 
 
-def test_generator_drift_marks_the_run_invalid_rather_than_slow(env):
-    """The distinction that matters most in the whole report.
+def test_a_slow_target_does_not_get_blamed_on_the_generator(env):
+    """The distinction that matters most in the whole report, and it was wrong.
 
     "The cluster is too slow" and "the load box was too small" need opposite
-    responses, so they must never share an outcome.
+    responses. The guard used to fire on schedule debt, but in the paced closed
+    model schedule debt is created by an iteration overrunning its pacing
+    interval, which happens because the TARGET is slow. Any target slower than
+    the pacing interval therefore invalidated the run on its second iteration
+    and blamed the load box, discarding exactly the saturation measurement the
+    tool exists to take.
+
+    Here the engine is twenty-five times slower than the pacing interval and
+    the generator is doing nothing at all. The run must stand.
     """
     doc = copy.deepcopy(tiny_scenario_dict())
     doc["personas"][0]["steps"] = [doc["personas"][0]["steps"][0]]
@@ -268,16 +276,44 @@ def test_generator_drift_marks_the_run_invalid_rather_than_slow(env):
         "model": "closed",
         "virtual_users": 1,
         "pacing_s": 0.01,
-        "duration": "3s",
+        "duration": "2s",
     }
     doc["abort_if"] = {"error_rate_pct": 90, "generator_drift_ms": 100}
     engine = FakeEngine(latency=0.25)
 
     _, summary = drive(doc, env, engine)
 
+    assert summary.valid is True, summary.invalid_reason
+    # The debt is still reported, because it is a real signal about the target.
+    assert summary.stats["generator"]["max_schedule_debt_ms"] > 100
+
+
+def test_a_starved_generator_does_invalidate_the_run(env):
+    """The guard still has to work, measured by the loop's own lateness.
+
+    Simulated by blocking the event loop, which is what CPU starvation looks
+    like from inside the process: the scheduler cannot run its own tick on
+    time. A slow target never does this, because the loop is awaiting.
+    """
+    import time as _time
+
+    doc = copy.deepcopy(tiny_scenario_dict())
+    doc["personas"][0]["steps"] = [doc["personas"][0]["steps"][0]]
+    doc["load"] = {"model": "closed", "virtual_users": 1, "duration": "2s"}
+    doc["abort_if"] = {"error_rate_pct": 90, "generator_drift_ms": 200}
+
+    class BlockingEngine(FakeEngine):
+        async def execute(self, ctx):
+            # Synchronous sleep: nothing else on the loop can run, exactly as
+            # under CPU starvation.
+            _time.sleep(0.6)
+            return await super().execute(ctx)
+
+    _, summary = drive(doc, env, BlockingEngine(latency=0.0))
+
     assert summary.valid is False
-    assert "behind its own schedule" in (summary.invalid_reason or "")
-    assert "bottleneck" in (summary.invalid_reason or "")
+    assert "scheduling loop" in (summary.invalid_reason or "")
+    assert "starved" in (summary.invalid_reason or "")
 
 
 def test_request_stop_ends_the_run_promptly(env):

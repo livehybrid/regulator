@@ -434,3 +434,67 @@ def test_with_a_password_set_the_api_is_closed(tmp_path, splunkd):
 def test_without_a_password_the_status_says_so_out_loud(client):
     """An open deployment must be visible, not merely undocumented."""
     assert client.get("/api/auth/status").json()["setup_needed"] is True
+
+
+# ----------------------------------------------------------------- security
+#
+# Each of these is a regression test for a real defect found in review, not a
+# hypothetical. The tool deliberately offers no way to dispatch arbitrary SPL
+# (scenarios are files on disk, credentials are write-only), and each of these
+# inputs defeated that.
+
+
+@pytest.mark.parametrize(
+    "label",
+    [
+        'x```|delete|search "',      # closes the SPL comment the marker sits in
+        'a" | sendemail to=x@y.z',   # closes the quoted operand in the _audit query
+        "has spaces",
+        "-leading-dash",
+        "x" * 200,
+    ],
+)
+def test_a_run_label_cannot_carry_spl(client, splunkd, label):
+    """The label is embedded in the comment appended to EVERY search a run runs."""
+    target = make_target(client, splunkd)
+    response = client.post(
+        "/api/runs",
+        json={"target_id": target["id"], "scenario": "smoke", "label": label},
+    )
+    assert response.status_code == 422, response.text
+
+
+@pytest.mark.parametrize(
+    "scenario",
+    ["../../../tmp/evil", "/tmp/evil", "..", "smoke/../../etc", "with space"],
+)
+def test_a_scenario_name_cannot_escape_the_library(client, splunkd, scenario):
+    """Otherwise anything that can drop a file on the box runs SPL on the target."""
+    target = make_target(client, splunkd)
+    response = client.post(
+        "/api/runs", json={"target_id": target["id"], "scenario": scenario}
+    )
+    assert response.status_code in (404, 422), response.text
+
+
+def test_the_library_boundary_is_enforced_below_the_schema_too(tmp_path):
+    """The run row is re-read at launch, so the check cannot live only at the edge."""
+    from regulator_server.adapters import load_named_scenario
+
+    with pytest.raises(FileNotFoundError) as excinfo:
+        load_named_scenario("../../etc")
+    assert "outside the scenario library" in str(excinfo.value)
+
+
+def test_a_credential_embedded_in_a_url_is_refused(client):
+    """The base URL is echoed into transport errors, which reach health_detail."""
+    response = client.post(
+        "/api/targets",
+        json={
+            "name": "creds-in-url",
+            "mgmt_url": "https://svc:hunter2@splunk.example:8089",
+            "token": "t",
+        },
+    )
+    assert response.status_code == 422
+    assert "username or password" in response.text

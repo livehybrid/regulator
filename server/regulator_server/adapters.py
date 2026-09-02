@@ -52,8 +52,21 @@ def list_scenarios() -> List[Scenario]:
 
 
 def load_named_scenario(name: str) -> Scenario:
-    root = scenarios_dir()
-    candidate = root / name
+    """Load a scenario from the library, and only from the library.
+
+    The containment check is not belt and braces on top of the schema
+    validator, it is the actual boundary: a scenario name reaches here from a
+    stored run row as well as from a request, and an absolute path or a
+    traversal would otherwise load and execute a scenario from anywhere on the
+    filesystem, turning anything that can drop a file on the box into arbitrary
+    SPL against the target.
+    """
+    root = scenarios_dir().resolve()
+    candidate = (root / name).resolve()
+    if root != candidate and root not in candidate.parents:
+        raise FileNotFoundError(
+            f"scenario {name!r} resolves outside the scenario library at {root}"
+        )
     if not (candidate / "scenario.yaml").is_file():
         raise FileNotFoundError(f"no scenario named {name!r} in {root}")
     return load_scenario(candidate)

@@ -98,8 +98,13 @@ def resolve_window(
         # reported span misleading.
         latest = (latest // policy.align_s) * policy.align_s
 
+    # Derived from the aligned end, and NOT aligned again. Flooring both ends
+    # independently made the span longer than the configured window whenever
+    # the window was not a whole number of alignment units: `window: 90s` with
+    # the default `align: 1m` produced a 120 second span, scanning 33% more
+    # data than asked for, silently, on every step. Worse, `window: 30m` and
+    # `window: 45m` with `align: 1h` both collapsed to the same hour and did
+    # identical work while reading as different tests.
     earliest = latest - policy.window_s
-    if policy.align_s > 0:
-        earliest = (earliest // policy.align_s) * policy.align_s
 
     return TimeWindow(earliest=earliest, latest=latest)

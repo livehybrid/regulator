@@ -49,7 +49,7 @@ import asyncio
 import logging
 import urllib.parse
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional, Sequence
+from typing import Any, Dict, List, Optional, Sequence, Set
 
 from .splunk import SplunkClient, SplunkError
 
@@ -120,6 +120,12 @@ class CacheState:
     eviction_policy: Optional[str] = None
     hotlist_recency_secs: Optional[int] = None
     per_index: Dict[str, IndexCache] = field(default_factory=dict)
+    # WHICH buckets are local, not just how many. Counting alone reports a
+    # cache that downloaded 3000 buckets and evicted 3000 to make room as
+    # "warm, nothing was downloaded", which is the exact opposite of the truth
+    # and is the normal behaviour of a cache at its ceiling.
+    local_ids: Set[str] = field(default_factory=set)
+    local_bytes_by_id: Dict[str, int] = field(default_factory=dict)
 
     @property
     def total_buckets(self) -> int:
@@ -193,7 +199,9 @@ class CacheDelta:
         if not self.available:
             return "unknown"
         if self.buckets_downloaded == 0:
-            return "warm"
+            # Evicting without downloading is somebody else's churn, not ours,
+            # but it still means the cache was under pressure during the run.
+            return "churning" if self.buckets_evicted_during else "warm"
         if self.local_before == 0:
             return "cold"
         return "mixed"
@@ -244,6 +252,8 @@ async def cache_state(client: SplunkClient) -> CacheState:
         if str(bucket.get("status", "")).lower() == STATUS_LOCAL:
             state.local_buckets += 1
             state.local_bytes += size
+            state.local_ids.add(name)
+            state.local_bytes_by_id[name] = size
             per.local_buckets += 1
             per.local_bytes += size
         else:
@@ -273,16 +283,41 @@ async def _cache_config(client: SplunkClient) -> Dict[str, Any]:
 
 
 def delta(before: CacheState, after: CacheState) -> CacheDelta:
-    """What changed between two cache readings."""
+    """What changed between two cache readings.
+
+    Compares the SETS of locally cached buckets, not the counts. Net counting
+    was a real defect: a cache at its ceiling downloads and evicts in equal
+    measure, so a run that fetched three thousand buckets from object storage
+    and evicted three thousand to make room reported "warm, nothing was
+    downloaded". That is the opposite of the truth, and a cache at its ceiling
+    is the normal case rather than an edge one, which the report itself warns
+    about elsewhere.
+
+    With sets, downloads and evictions can both be non-zero, which is what
+    actually happens.
+    """
     if not (before.available and after.available):
         return CacheDelta(available=False)
 
-    downloaded = max(0, after.local_buckets - before.local_buckets)
-    evicted = max(0, before.local_buckets - after.local_buckets)
+    # Fall back to counts only when the identities were not captured, which
+    # happens for hand-built states in tests.
+    if before.local_ids or after.local_ids:
+        downloaded_ids = after.local_ids - before.local_ids
+        evicted_ids = before.local_ids - after.local_ids
+        downloaded = len(downloaded_ids)
+        evicted = len(evicted_ids)
+        bytes_downloaded = sum(
+            after.local_bytes_by_id.get(bucket_id, 0) for bucket_id in downloaded_ids
+        )
+    else:
+        downloaded = max(0, after.local_buckets - before.local_buckets)
+        evicted = max(0, before.local_buckets - after.local_buckets)
+        bytes_downloaded = max(0, after.local_bytes - before.local_bytes)
+
     return CacheDelta(
         available=True,
         buckets_downloaded=downloaded,
-        bytes_downloaded=max(0, after.local_bytes - before.local_bytes),
+        bytes_downloaded=bytes_downloaded,
         buckets_evicted_during=evicted,
         local_before=before.local_buckets,
         local_after=after.local_buckets,

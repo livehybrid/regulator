@@ -123,7 +123,11 @@ class Ramp:
 
     def __init__(self, stages: Sequence[RampStage], final_target: float) -> None:
         self._legs: List[tuple[float, float, float]] = []  # (duration, from, to)
-        current = 0.0
+        # A ramp made only of holds has nothing to climb to, so starting from
+        # zero meant it held zero: the run created no virtual users, did no
+        # work, and still reported completed and valid. Start from the declared
+        # target when no stage names one.
+        current = 0.0 if any(stage.to is not None for stage in stages) else float(final_target)
         for stage in stages:
             if stage.to is not None:
                 self._legs.append((max(0.0, stage.over_s), current, float(stage.to)))
@@ -316,6 +320,7 @@ class Scheduler:
 
     async def _run_closed(self) -> None:
         """Maintain a population of virtual users that follows the ramp."""
+        next_tick_due = time.perf_counter() + TICK_S
         next_vu_id = self.config.slot * 1_000_000  # slot-disjoint ids, so a fleet's
         # virtual users never collide in the record even though each worker
         # numbers its own from zero.
@@ -345,11 +350,23 @@ class Scheduler:
                 self._vu_tasks.pop(vu_id, None)
                 task.cancel()
 
-            self._check_guards()
             try:
                 await asyncio.wait_for(self._stop.wait(), timeout=TICK_S)
             except asyncio.TimeoutError:
                 pass
+
+            # How late was this tick? Under a slow target the loop is simply
+            # awaiting and this stays near zero. Under CPU starvation it grows,
+            # which is the condition the generator guard is for.
+            now = time.perf_counter()
+            self.stats.record_loop_lag((now - next_tick_due) * 1000.0)
+            next_tick_due = max(now, next_tick_due + TICK_S)
+
+            # Guards are evaluated AFTER the tick is measured, not before. A
+            # single very late tick can be the last one before the duration
+            # expires, and checking first meant the lag that proved the
+            # generator was starved was recorded and then never looked at.
+            self._check_guards()
 
     async def _run_open(self) -> None:
         """Issue arrivals on a schedule, whatever the target is doing.
@@ -378,6 +395,13 @@ class Scheduler:
                 await asyncio.sleep(min(next_arrival - now, TICK_S))
                 self._check_guards()
                 continue
+
+            # An arrival issued after it was due, while there was capacity to
+            # issue it, is the generator failing to keep time. Shedding because
+            # max_in_flight is reached is a different thing and is counted
+            # separately as a missed arrival.
+            if len(self._open_tasks) < self.config.max_in_flight:
+                self.stats.record_loop_lag((now - next_arrival) * 1000.0)
 
             if len(self._open_tasks) >= self.config.max_in_flight:
                 # Shedding rather than blocking. Blocking here would reintroduce
@@ -488,6 +512,7 @@ class Scheduler:
             rendered = apply_cache_bust(rendered, marker)
 
         ctx = StepContext(
+            spl_template=step.spl or "",
             run_id=self.config.run_id,
             slot=self.config.slot,
             vu_id=job.vu_id,
@@ -514,6 +539,15 @@ class Scheduler:
             self.stats.leave()
 
         finished = time.perf_counter()
+        # The engine stamps service_time_ms before its own cleanup (deleting
+        # the job on the search head), so `finished` includes a REST DELETE
+        # that the service time does not. Reconstructing the completion instant
+        # from the service time keeps latency and service time on the same
+        # footing, so latency minus service time is schedule debt and nothing
+        # else. The contamination was load-correlated, since the DELETE hits the
+        # same saturated search head, so it inflated the tail most.
+        if record.service_time_ms:
+            finished = began + (record.service_time_ms / 1000.0)
 
         # The scheduler owns these three fields. See engines/base.py.
         record.intended_start = self._t0_wall + (intended_start - self._t0_monotonic)
@@ -557,13 +591,31 @@ class Scheduler:
         """
         guards = self.scenario.abort_if
 
-        if guards.generator_drift_ms is not None and self.stats.max_drift_ms > guards.generator_drift_ms:
+        # Generator health is measured by whether THIS PROCESS can run its own
+        # scheduling loop on time, not by how far behind the timetable the work
+        # fell.
+        #
+        # Those are different things and conflating them was a real defect. In
+        # the paced closed model, schedule debt is created by an iteration
+        # overrunning its pacing interval, which happens because the TARGET is
+        # slow. Guarding on it meant that any target running slower than the
+        # pacing interval invalidated the run on its second iteration and
+        # blamed the load box, discarding exactly the saturation measurement
+        # the tool exists to take.
+        #
+        # Loop lag does not move when the target is slow (the loop is awaiting,
+        # not working) and does move when this process is starved of CPU, which
+        # is the condition the guard is for.
+        if (
+            guards.generator_drift_ms is not None
+            and self.stats.max_loop_lag_ms > guards.generator_drift_ms
+        ):
             self._invalid_reason = (
-                f"generator fell {self.stats.max_drift_ms:.0f}ms behind its own schedule "
-                f"(limit {guards.generator_drift_ms:.0f}ms): this worker was the "
-                f"bottleneck, not the target"
+                f"the generator's own scheduling loop ran {self.stats.max_loop_lag_ms:.0f}ms "
+                f"late (limit {guards.generator_drift_ms:.0f}ms): this worker was starved, "
+                f"so the numbers describe it rather than the target"
             )
-            self.request_stop("generator drift")
+            self.request_stop("generator loop lag")
             return
 
         if self.stats.executions < MIN_SAMPLES_FOR_GUARD:

@@ -187,6 +187,7 @@ class StepStats:
     service_time: LatencyHistogram = field(default_factory=LatencyHistogram)
     dispatch: LatencyHistogram = field(default_factory=LatencyHistogram)
     ttfr: LatencyHistogram = field(default_factory=LatencyHistogram)
+    failure_latency: LatencyHistogram = field(default_factory=LatencyHistogram)
     scan_count_total: int = 0
     result_count_total: int = 0
     run_duration_total_s: float = 0.0
@@ -194,12 +195,24 @@ class StepStats:
 
     def add(self, record: StepRecord) -> None:
         self.executions += 1
-        self.latency.record_ms(record.latency_ms)
-        self.service_time.record_ms(record.service_time_ms)
-        if record.dispatch_ms is not None:
-            self.dispatch.record_ms(record.dispatch_ms)
-        if record.ttfr_ms is not None:
-            self.ttfr.record_ms(record.ttfr_ms)
+        # Only successful executions feed the latency histograms.
+        #
+        # A search head at its admission ceiling refuses work in the time of one
+        # POST, so a few tens of milliseconds. Mixing those into the latency
+        # distribution makes REPORTED LATENCY IMPROVE AS THE TARGET FAILS: at
+        # 96% refusals the p95 is the refusal time, the progress line shows the
+        # numbers getting better while the cluster collapses, and a p95 guard
+        # never fires. Failure latency is kept separately, because how fast a
+        # target refuses is worth knowing and is not the same measurement.
+        if record.ok:
+            self.latency.record_ms(record.latency_ms)
+            self.service_time.record_ms(record.service_time_ms)
+            if record.dispatch_ms is not None:
+                self.dispatch.record_ms(record.dispatch_ms)
+            if record.ttfr_ms is not None:
+                self.ttfr.record_ms(record.ttfr_ms)
+        else:
+            self.failure_latency.record_ms(record.service_time_ms)
         if record.scan_count:
             self.scan_count_total += record.scan_count
         if record.result_count:
@@ -220,6 +233,7 @@ class StepStats:
             "error_rate_pct": round(100.0 * self.errors / self.executions, 3) if self.executions else 0.0,
             "errors_by_class": dict(self.errors_by_class),
             "latency": self.latency.summary(),
+            "failure_latency": self.failure_latency.summary(),
             "service_time": self.service_time.summary(),
             "dispatch": self.dispatch.summary(),
             "ttfr": self.ttfr.summary(),
@@ -250,12 +264,23 @@ class RunStats:
         self.executions = 0
         self.errors = 0
         self.errors_by_class: Dict[str, int] = {}
+        # Successful executions only. See StepStats.add for why.
         self.overall_latency = LatencyHistogram()
+        self.failure_latency = LatencyHistogram()
         # Generator health. If these go bad, the run is measuring the load
         # generator rather than Splunk, and the result is invalid rather than
         # merely disappointing.
+        # Schedule debt: how far behind its timetable the work fell. This is a
+        # TARGET signal in the paced closed model, because an iteration that
+        # overruns its pacing interval does so because the searches were slow.
         self.max_drift_ms = 0.0
         self.drift = LatencyHistogram()
+        # Generator health: whether this process could run its own scheduling
+        # loop on time. Independent of how slow the target is, which is exactly
+        # why the two are kept apart. Conflating them blames a saturated
+        # cluster on the load box and throws the run away.
+        self.max_loop_lag_ms = 0.0
+        self.loop_lag = LatencyHistogram()
         self.in_flight = 0
         self.peak_in_flight = 0
         self.iterations_completed = 0
@@ -274,7 +299,10 @@ class RunStats:
         stats.add(record)
 
         self.executions += 1
-        self.overall_latency.record_ms(record.latency_ms)
+        if record.ok:
+            self.overall_latency.record_ms(record.latency_ms)
+        else:
+            self.failure_latency.record_ms(record.service_time_ms)
         if record.late_by_ms:
             self.drift.record_ms(record.late_by_ms)
             self.max_drift_ms = max(self.max_drift_ms, record.late_by_ms)
@@ -285,6 +313,18 @@ class RunStats:
             self.errors += 1
             cls = record.error_class or ERROR_CLIENT
             self.errors_by_class[cls] = self.errors_by_class.get(cls, 0) + 1
+
+    def record_loop_lag(self, lag_ms: float) -> None:
+        """How late the scheduling loop was for its own tick.
+
+        The honest measure of whether the generator is keeping up: it rises
+        when this process is starved of CPU and does not move when the target
+        is merely slow.
+        """
+        if lag_ms <= 0:
+            return
+        self.loop_lag.record_ms(lag_ms)
+        self.max_loop_lag_ms = max(self.max_loop_lag_ms, lag_ms)
 
     def enter(self) -> None:
         self.in_flight += 1
@@ -317,6 +357,7 @@ class RunStats:
                 round(self.executions / self.elapsed_s, 2) if self.elapsed_s > 0 else 0.0
             ),
             "latency": self.overall_latency.summary(),
+            "failure_latency": self.failure_latency.summary(),
             "queueing": {
                 "searches_queued": self.queued_executions,
                 "queued_pct": (
@@ -327,8 +368,16 @@ class RunStats:
                 "queued_ms": self.queued.summary(),
             },
             "generator": {
+                # Generator health. These are about this process.
+                "max_loop_lag_ms": round(self.max_loop_lag_ms, 1),
+                "loop_lag_p95_ms": round(self.loop_lag.percentile_ms(95), 1),
+                # Schedule debt. This is about the target: how far behind the
+                # timetable its slowness pushed the work.
+                "max_schedule_debt_ms": round(self.max_drift_ms, 1),
+                "schedule_debt_p95_ms": round(self.drift.percentile_ms(95), 1),
+                # Kept under the old name so nothing downstream breaks, but it
+                # is the debt rather than generator lag: see above.
                 "max_drift_ms": round(self.max_drift_ms, 1),
-                "drift_p95_ms": round(self.drift.percentile_ms(95), 1),
             },
             "steps": [s.summary() for s in self.steps.values()],
         }

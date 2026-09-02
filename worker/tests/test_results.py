@@ -76,7 +76,11 @@ def test_step_stats_accumulate():
     assert summary["errors"] == 2
     assert summary["error_rate_pct"] == pytest.approx(20.0)
     assert summary["errors_by_class"] == {ERROR_SERVER: 2}
-    assert summary["latency"]["count"] == 10
+    # Successes only. A target refusing work in the time of one POST would
+    # otherwise drag the latency distribution down and make the numbers improve
+    # as the cluster fails.
+    assert summary["latency"]["count"] == 8
+    assert summary["failure_latency"]["count"] == 2
 
 
 def test_run_stats_keep_steps_separate():

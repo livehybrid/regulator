@@ -373,7 +373,7 @@ class ApiEngine:
     async def execute(self, ctx: StepContext) -> StepRecord:
         """Execute one step. Returns a record for every outcome bar a dead target."""
         record = ctx.blank_record()
-        record.spl_hash = spl_hash(ctx.spl)
+        record.spl_hash = spl_hash(ctx.spl_template or ctx.spl)
         started = time.perf_counter()
         sid: Optional[str] = None
 

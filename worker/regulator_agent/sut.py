@@ -58,6 +58,7 @@ import time
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 
+from .params import sanitise_marker_part
 from .splunk import SplunkClient, SplunkError
 from .timepolicy import TimeWindow
 
@@ -349,5 +350,10 @@ def marker_prefix_for(run_id: str) -> str:
     Matches ``cache_bust_marker`` in params.py, which builds
     ``reg:<run>:vu<n>:i<n>:<step>``. Only the run portion is needed to select a
     run's searches and exclude everyone else's.
+
+    Sanitised through the same filter, because this value is interpolated into
+    a quoted SPL operand: an unfiltered run label containing a double quote
+    would close the string and append arbitrary SPL to a search that runs under
+    the target's credentials.
     """
-    return f"reg:{run_id}:"
+    return f"reg:{sanitise_marker_part(run_id)}:"

@@ -189,9 +189,39 @@ class ParameterResolver:
             name = match.group(1)
             value = self.value(name, ctx)
             used[name] = value
-            return str(value)
+            # Escaped, because a choice_from_search value comes from the
+            # TARGET'S OWN DATA. Anyone who can get an event into the searched
+            # index with a crafted field value could otherwise have the next
+            # run dispatch their SPL under the load-test account: the shipped
+            # scenarios substitute these inside quoted operands such as
+            # sourceIPAddress="{{src_ip}}", and a double quote closes it.
+            return _escape_spl_value(value)
 
         return PLACEHOLDER_RE.sub(_sub, text or ""), used
+
+
+# The marker is concatenated into SPL, so anything outside this set is
+# stripped. Three backticks close the Splunk comment the marker lives in, and a
+# double quote closes the string operand it sits in inside the _audit
+# correlation query, so an unfiltered run label was an SPL injection reaching
+# every search a run dispatched. The run label is operator-supplied and, in the
+# GitHub Action, comes from a branch name, which git permits backticks in.
+_MARKER_SAFE = re.compile(r"[^A-Za-z0-9_.:-]")
+
+
+def sanitise_marker_part(value: str) -> str:
+    """Strip anything that could escape the SPL comment or string it lands in."""
+    return _MARKER_SAFE.sub("_", str(value))[:64]
+
+
+def _escape_spl_value(value: Any) -> str:
+    """Make a drawn value safe to substitute into an SPL string operand."""
+    text = str(value)
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        # Numeric values often sit outside quotes (`| makeresults count={{n}}`),
+        # and escaping them would break the search.
+        return text
+    return text.replace("\\", "\\\\").replace('"', '\\"')
 
 
 def cache_bust_marker(run_id: str, vu_id: int, iteration: int, step_id: str) -> str:
@@ -201,8 +231,14 @@ def cache_bust_marker(run_id: str, vu_id: int, iteration: int, step_id: str) -> 
     ``_audit`` index against the dispatched search. That is a useful accident:
     it lets a run be reconciled against the target's own audit trail without
     any correlation guesswork.
+
+    Every component is sanitised, because this string is concatenated into SPL
+    that runs under the target's own credentials.
     """
-    return f"reg:{run_id}:vu{vu_id}:i{iteration}:{step_id}"
+    return (
+        f"reg:{sanitise_marker_part(run_id)}:vu{int(vu_id)}:"
+        f"i{int(iteration)}:{sanitise_marker_part(step_id)}"
+    )
 
 
 def apply_cache_bust(spl: str, marker: str) -> str:

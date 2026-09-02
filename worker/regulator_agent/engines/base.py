@@ -56,6 +56,11 @@ class StepContext:
     window: TimeWindow
     spl: str
     marker: str
+    # The search BEFORE parameter substitution. Hashing the rendered SPL gives
+    # a different identity for every draw, so `stats by spl_hash` produced one
+    # group per execution and no per-search analysis was possible at all, which
+    # is most of the value of the record.
+    spl_template: str = ""
     params: Dict[str, Any] = field(default_factory=dict)
 
     def blank_record(self) -> StepRecord:

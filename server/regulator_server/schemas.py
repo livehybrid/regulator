@@ -7,12 +7,29 @@ A test asserts that no response body from any GET contains a known secret.
 
 from __future__ import annotations
 
+import re
 import time
 from typing import Any, Dict, List, Optional
+from urllib.parse import urlsplit
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 _ORM = ConfigDict(from_attributes=True)
+
+# A run label ends up inside the SPL comment appended to every dispatched
+# search, and inside a quoted operand in the _audit correlation query. Three
+# backticks close the comment; a double quote closes the operand. Unfiltered,
+# it was an SPL injection reaching every search a run dispatched, running under
+# the target's own stored credentials, in a tool that otherwise deliberately
+# offers no way to dispatch arbitrary SPL. The GitHub Action makes it worse by
+# sourcing the label from a branch name, and git permits backticks there.
+_LABEL_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
+
+# A scenario name is joined onto the library directory. Unfiltered, "../.." or
+# an absolute path loaded and EXECUTED a scenario from anywhere on the
+# filesystem, which turns anything that can drop a file on the box into
+# arbitrary SPL against the target.
+_SCENARIO_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 
 
 class TargetCreate(BaseModel):
@@ -37,6 +54,17 @@ class TargetCreate(BaseModel):
             return None
         if not (value.startswith("http://") or value.startswith("https://")):
             raise ValueError("must start with http:// or https://")
+        # A credential in the URL would be echoed back: the base URL appears in
+        # transport exception messages, which land in health_detail and in a
+        # run's error, both of which are returned by the API and rendered in
+        # the UI. Credentials belong in the token or password field, which is
+        # write-only by construction.
+        parts = urlsplit(value)
+        if parts.username or parts.password:
+            raise ValueError(
+                "a URL must not embed a username or password: put the credential in the "
+                "token, or the username and password fields, which are never returned"
+            )
         return value.rstrip("/")
 
     @field_validator("api_version")
@@ -116,6 +144,30 @@ class RunCreate(BaseModel):
     pacing_s: Optional[float] = Field(default=None, ge=0)
     evict_cache: bool = False
     evict_cache_indexes: List[str] = Field(default_factory=list)
+
+    @field_validator("scenario")
+    @classmethod
+    def _safe_scenario(cls, value: str) -> str:
+        if not _SCENARIO_RE.match(value):
+            raise ValueError(
+                "a scenario name may contain letters, digits, dots, underscores and "
+                "dashes only. It is joined onto the scenario library path, so anything "
+                "else could load a scenario from outside it"
+            )
+        return value
+
+    @field_validator("label")
+    @classmethod
+    def _safe_label(cls, value: Optional[str]) -> Optional[str]:
+        if value is None:
+            return None
+        if not _LABEL_RE.match(value):
+            raise ValueError(
+                "a label may contain letters, digits, dots, colons, underscores and "
+                "dashes only. It is embedded in the SPL comment appended to every "
+                "search this run dispatches"
+            )
+        return value
 
     def check(self) -> None:
         if self.virtual_users and self.arrival_rate_per_min:
