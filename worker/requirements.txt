@@ -1,0 +1,30 @@
+# Regulator worker runtime dependencies (py3.12). Single source of truth: the
+# Dockerfile installs exactly this file, so anything added here lands in the
+# image and anything test-only stays out of it and lives in CI config instead.
+#
+# Style is floor-plus-major-cap rather than an exact pin. The worker is a thin
+# client of well-behaved libraries and we want security patches without a PR,
+# but a major bump is a breaking change we want to opt into deliberately.
+
+# Search driver (worker/regulator_agent). HTTP/2 is not decoration: a search
+# generator opens many concurrent requests to one splunkd, and multiplexing
+# them over a single connection is what keeps the load profile about Splunk
+# rather than about TCP and TLS handshakes on the worker.
+httpx[http2]>=0.27,<1
+
+# Scenario library parsing (scenarios/*.yaml).
+PyYAML>=6,<7
+
+# Latency recording deliberately has NO dependency. Percentiles are the whole
+# point of the result set and an averaged or naively sampled p99 is worthless,
+# so latencies go into a mergeable log-linear histogram, but that histogram is
+# forty lines of arithmetic in regulator_agent/histogram.py rather than a
+# third-party package. Three reasons: the wire format stays plain JSON that a
+# human can read inside a heartbeat body, merging across workers is a
+# dictionary sum rather than a library call, and the worker image carries one
+# fewer transitive dependency for something this small.
+
+# Phase 2 (headless browser driver) needs Playwright plus its browser bundle,
+# which is several hundred megabytes. It deliberately does NOT go here: it will
+# get its own requirements-browser.txt and its own image layer so the base
+# worker image stays small and fast to pull onto every node in a swarm.

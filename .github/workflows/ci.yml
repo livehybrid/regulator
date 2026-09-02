@@ -1,0 +1,177 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+
+env:
+  IMAGE_NAME: ghcr.io/livehybrid/regulator-worker
+
+# Concurrency is set per job, not once at workflow level, because the two
+# halves of this pipeline want opposite behaviour.
+#
+# Test-shaped jobs (test, smoke, any future lint) are cancelled the moment a
+# newer commit arrives on the same PR or branch. A superseded test run tells
+# you about code nobody will merge, so it is pure waste of Actions minutes and
+# is killed on sight.
+#
+# Publishing jobs (build, sign) are not. Pushing a multi-arch manifest and then
+# signing its digest is meant to be one atomic act, and a cancellation landing
+# between the two leaves an unsigned digest sitting in the registry: it looks
+# published, it pulls fine, and it fails verification. So those get a group
+# keyed on the commit SHA, which is unique per run anyway, with cancellation
+# switched off, and an in-flight publish is always allowed to finish.
+#
+# This is not a licence to build stale commits. `build` needs `test`, so when a
+# newer push cancels the older test job the build gated behind it never starts:
+# only a build that has already begun (and therefore already has a green test)
+# is permitted to run to completion.
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    # The matrix suffix is load-bearing. Job-level concurrency is evaluated per
+    # matrix entry, so if 3.11 and 3.12 shared one group name they would sit in
+    # the same cancel-in-progress group and shoot each other inside a single
+    # run: one python would report green and the other would report cancelled,
+    # at random. Keying the group on the version keeps the intended behaviour
+    # (a newer commit cancels the older run of the same python) and drops the
+    # self-inflicted one. Do not remove the suffix.
+    concurrency:
+      group: ${{ github.workflow }}-test-${{ github.event.pull_request.number || github.ref }}-${{ matrix.python-version }}
+      cancel-in-progress: true
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.11", "3.12"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          # The dependency set is small but httpx[http2] drags in a compiled
+          # h2 stack, and re-resolving it on every push is the slowest part of
+          # a job that otherwise takes seconds.
+          cache: pip
+          cache-dependency-path: worker/requirements.txt
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r worker/requirements.txt
+          pip install pytest pytest-timeout
+
+      - name: Unit tests (agent)
+        run: python -m pytest worker/tests -q
+
+      - name: Unit tests (tools)
+        run: python -m pytest tools/tests -q --timeout=60
+
+  smoke:
+    needs: test
+    runs-on: ubuntu-latest
+    concurrency:
+      group: ${{ github.workflow }}-test-${{ github.event.pull_request.number || github.ref }}
+      cancel-in-progress: true
+    steps:
+      - uses: actions/checkout@v4
+
+      # One python only. The smoke exercises the end-to-end path, not the
+      # version matrix, and 3.12 is what the worker image ships.
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: worker/requirements.txt
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r worker/requirements.txt
+
+      # Starts the fake splunkd, drives a real agent through it and asserts the
+      # run completed, was valid, and recorded both halves of the measurement.
+      # A unit suite can be entirely green while the entrypoint is broken, the
+      # scenario library did not make it into the package, or an environment
+      # variable was renamed on one side only.
+      - name: Local smoke
+        run: tools/smoke.sh local
+
+  build:
+    # Gated on the smoke as well as the unit tests: an image whose end-to-end
+    # path is broken must never reach the registry, signed or otherwise.
+    needs: [test, smoke]
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+    concurrency:
+      group: ${{ github.workflow }}-build-${{ github.sha }}
+      cancel-in-progress: false
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+    outputs:
+      digest: ${{ steps.push.outputs.digest }}
+    steps:
+      - uses: actions/checkout@v4
+
+      # arm64 is emulated here. Workers get scheduled onto whatever the cluster
+      # has, and a Pi or a Graviton node with no image is a node that sits idle
+      # while the rest of the run is already generating load.
+      - uses: docker/setup-qemu-action@v3
+
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - uses: docker/metadata-action@v5
+        id: meta
+        with:
+          images: ${{ env.IMAGE_NAME }}
+          tags: |
+            type=sha
+            type=ref,event=tag
+            type=raw,value=latest,enable={{is_default_branch}}
+
+      - uses: docker/build-push-action@v6
+        id: push
+        with:
+          context: .
+          file: worker/Dockerfile
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  sign:
+    needs: build
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+    concurrency:
+      group: ${{ github.workflow }}-build-${{ github.sha }}
+      cancel-in-progress: false
+    permissions:
+      packages: write
+      id-token: write
+    steps:
+      - uses: sigstore/cosign-installer@v3
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # Sign the digest, never a tag: a tag can be moved to point at a different
+      # manifest after signing, a digest cannot.
+      - name: Keyless sign the pushed digest
+        run: cosign sign --yes "${IMAGE_NAME}@${{ needs.build.outputs.digest }}"

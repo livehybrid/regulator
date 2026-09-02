@@ -1,0 +1,42 @@
+# Python
+__pycache__/
+*.pyc
+.venv/
+.venv-*/
+venv/
+.pytest_cache/
+*.egg-info/
+.coverage
+.coverage.*
+htmlcov/
+dist/
+build/
+
+# Node, for the Phase 1 UI shell
+node_modules/
+ui/dist/
+
+# Docs build output
+site/
+
+# Secrets and local state. The control plane keeps a Fernet key and a SQLite
+# file next to the code when run from a checkout, so both are excluded rather
+# than relying on anyone remembering at `git add` time.
+.env
+*.db
+*.sqlite
+data/
+
+# Local run artefacts. A Regulator run writes per-search latency samples, and
+# those are large, machine-specific and reproducible: they belong in object
+# storage or a report, never in the repository.
+results/
+*.parquet
+
+# Editor and OS noise
+.DS_Store
+Thumbs.db
+*.swp
+*~
+.idea/
+.vscode/

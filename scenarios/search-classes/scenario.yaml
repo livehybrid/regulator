@@ -1,0 +1,223 @@
+# One search per class, so a single run tells you which part of the stack moved.
+#
+# Splunk's own scale-testing methodology separates searches by how much of the
+# index they touch relative to how much they return, because the classes stress
+# completely different components:
+#
+#   dense        most events match. Aggregation and pipeline bound, so it moves
+#                with search-head and indexer CPU.
+#   sparse       a minority match. Filter bound.
+#   rare         a needle in a haystack. I/O and bloom-filter bound, and the
+#                single best detector of a SmartStore cache miss, because a
+#                cold bucket has to come back from object storage before the
+#                filter can even run.
+#   accelerated  tstats and mstats against the TSIDX and metric stores. Should
+#                be near-instant, so a regression here is very loud.
+#   heavy        lookups, transactions and joins. Search-head memory and CPU,
+#                and the first thing to suffer when a search head is
+#                undersized for its concurrency.
+#   subsearch    the classic performance killer, and the most reliable way to
+#                expose a search head that is fine at low concurrency and falls
+#                over at high.
+#
+# A benchmark that runs only one class tells you about one third of your
+# cluster. Running all six at known weights is what makes a p95 comparable
+# between two cluster shapes.
+#
+# CORPUS: this expects data from the Stoker packs listed below. Fill first, or
+# every rare search legitimately returns nothing and the timings mean nothing.
+
+name: search-classes
+engine: api
+seed: 4242
+description: "One representative search per class (dense, sparse, rare, accelerated, heavy, subsearch) against Stoker-generated data, so a single run attributes a regression to a component"
+tags: benchmark, reference, stoker-corpus
+
+corpus:
+  requires_packs:
+    - web-access
+    - aws-cloudtrail
+    - aws-s3-access
+    - splunk-tutorial-secure
+    - splunk-tutorial-vendor-sales
+    - splunk-tutorial-web
+    - apigw
+    - host-infra-metrics
+  index: main
+  metric_index: stoker_metrics
+
+parameters:
+  # Drawn from the data itself at run start, so the rare search hunts for
+  # something that genuinely exists but is genuinely uncommon. Hunting for a
+  # value that is not in the index at all measures the filter and never the
+  # retrieval, which is a different and much cheaper thing.
+  src_ip:
+    type: choice_from_search
+    spl: 'search index=main sourcetype=aws:cloudtrail | stats count by sourceIPAddress | sort - count | head 200'
+    field: sourceIPAddress
+    refresh: per_run
+    limit: 200
+
+  api_key:
+    type: choice_from_search
+    spl: 'search index=main sourcetype=stoker:apigw | stats count by apikey_id | head 100'
+    field: apikey_id
+    refresh: per_run
+    limit: 100
+
+  host_name:
+    type: choice
+    values: [web-01, web-02, db-01, cache-01]
+
+time_policy:
+  mode: rolling
+  window: 24h
+  # Half an hour of jitter moves the window enough that successive iterations
+  # read different buckets, so the host page cache is not quietly answering on
+  # the indexers' behalf.
+  jitter: 30m
+  align: 1m
+
+personas:
+  - name: mixed-workload
+    weight: 100
+    think_time:
+      dist: lognormal
+      median_s: 3
+      sigma: 0.5
+      max_s: 30
+    steps:
+      # ---------------------------------------------------------------- dense
+      - id: dense-web-status
+        type: search
+        engine: api
+        class: dense
+        spl: 'search index=main sourcetype=access_combined | stats count, sum(bytes) as bytes by status'
+        result_count: 20
+
+      - id: dense-cloudtrail-timechart
+        type: search
+        engine: api
+        class: dense
+        spl: 'search index=main sourcetype=aws:cloudtrail | timechart span=5m count by eventName limit=10'
+        result_count: 100
+
+      # --------------------------------------------------------------- sparse
+      - id: sparse-s3-puts
+        type: search
+        engine: api
+        class: sparse
+        spl: 'search index=main sourcetype=aws:s3:accesslogs "REST.PUT.OBJECT" | stats count by key | sort - count | head 50'
+        result_count: 50
+
+      - id: sparse-failed-auth
+        type: search
+        engine: api
+        class: sparse
+        spl: 'search index=main sourcetype=linux_secure "Failed password" | rex "from (?<src_ip>\d+\.\d+\.\d+\.\d+)" | stats count, dc(user) as users by src_ip | where count > 20'
+        result_count: 50
+
+      # ----------------------------------------------------------------- rare
+      - id: rare-bucket-policy
+        type: search
+        engine: api
+        class: rare
+        spl: 'search index=main sourcetype=aws:cloudtrail eventName=PutBucketPolicy | table _time, eventName, sourceIPAddress, awsRegion'
+        result_count: 20
+        # A week rather than a day. A rare search over a wide window is the
+        # cleanest signal for cold-bucket retrieval, which on SmartStore means
+        # a cache miss and a fetch from object storage.
+        time_range:
+          mode: rolling
+          window: 7d
+          jitter: 2h
+          align: 1m
+
+      - id: rare-apikey-errors
+        type: search
+        engine: api
+        class: rare
+        spl: 'search index=main sourcetype=stoker:apigw apikey_id="{{api_key}}" status>=500 | stats count by gw, path, status'
+        result_count: 20
+        time_range:
+          mode: rolling
+          window: 7d
+          jitter: 2h
+          align: 1m
+
+      - id: rare-source-ip-hunt
+        type: search
+        engine: api
+        class: rare
+        spl: 'search index=main sourcetype=aws:cloudtrail sourceIPAddress="{{src_ip}}" | stats count by eventName, awsRegion'
+        result_count: 50
+
+      # ---------------------------------------------------------- accelerated
+      - id: accel-tstats-by-sourcetype
+        type: search
+        engine: api
+        class: accelerated
+        spl: '| tstats count where index=main by _time span=1m, sourcetype'
+        result_count: 100
+
+      - id: accel-mstats-cpu
+        type: search
+        engine: api
+        class: accelerated
+        spl: '| mstats avg(_value) as cpu WHERE index=stoker_metrics AND metric_name="host.cpu.usage.pct" AND host="{{host_name}}" BY host span=1m'
+        result_count: 100
+        time_range:
+          mode: rolling
+          window: 6h
+          jitter: 15m
+          align: 1m
+
+      # ---------------------------------------------------------------- heavy
+      - id: heavy-transaction-sessions
+        type: search
+        engine: api
+        class: heavy
+        # transaction is expensive and memory hungry on the search head by
+        # design. Included precisely because it is the thing that falls over
+        # first when a search head is undersized for its concurrency.
+        spl: 'search index=main sourcetype=access_combined_wcookie | transaction JSESSIONID maxspan=30m | stats avg(duration) as avg_session_s, avg(eventcount) as avg_pages'
+        result_count: 10
+        time_range:
+          mode: rolling
+          window: 6h
+          jitter: 15m
+          align: 1m
+
+      - id: heavy-vendor-sales
+        type: search
+        engine: api
+        class: heavy
+        spl: 'search index=main sourcetype=vendor_sales | stats sum(VendorID) as vendor_sum, count as sales by Code | sort - sales'
+        result_count: 20
+
+      # ------------------------------------------------------------ subsearch
+      - id: subsearch-auth-correlation
+        type: search
+        engine: api
+        class: subsearch
+        # A subsearch has its own result and time limits and runs to completion
+        # before the outer search starts, so this measures serialised work plus
+        # the outer scan. head 1000 keeps it inside the default subsearch
+        # ceiling: without it the subsearch silently truncates and the test
+        # quietly measures something smaller than it looks.
+        spl: 'search index=main sourcetype=linux_secure [ search index=main sourcetype=aws:cloudtrail eventName=ConsoleLogin | stats count by sourceIPAddress | fields sourceIPAddress | rename sourceIPAddress as src_ip | head 1000 ] | stats count by src_ip'
+        result_count: 50
+
+load:
+  model: closed
+  virtual_users: 10
+  ramp:
+    - to: 10
+      over_s: 30
+    - hold_s: 240
+  duration: 270s
+
+abort_if:
+  error_rate_pct: 20
+  p95_ms: 120000
+  generator_drift_ms: 2000

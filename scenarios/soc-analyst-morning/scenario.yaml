@@ -1,0 +1,180 @@
+# Morning triage in a security operations centre.
+#
+# The point of a persona scenario, as opposed to a class scenario, is that it
+# applies load in the shape a real user population applies it: a few people
+# hunting hard, more people refreshing the same overview, and long think times
+# between actions because humans read.
+#
+# That shape matters for capacity work. A hundred virtual users with a twelve
+# second median think time and three second searches produce nowhere near a
+# hundred concurrent searches, and the difference between those two numbers is
+# the whole reason "how many users can we support" is a harder question than it
+# sounds. The run report gives you both: the virtual-user count you asked for,
+# and the concurrent searches it actually produced against the target's
+# computed ceiling.
+#
+# Phase 2 adds the browser half of this persona (open the triage dashboard,
+# wait for the first panel to paint) so the same run measures both what the
+# search tier did and what the analyst actually saw. Until then it is API only.
+
+name: soc-analyst-morning
+engine: api
+seed: 90210
+description: "SOC morning triage: heavy hunters, dashboard refreshers and a compliance reporter, at realistic weights and think times, against Stoker CloudTrail and auth data"
+tags: security, cloudtrail, triage, persona
+
+corpus:
+  requires_packs:
+    - aws-cloudtrail
+    - splunk-tutorial-secure
+    - apigw
+    - aws-s3-access
+  index: main
+
+parameters:
+  src_ip:
+    type: choice_from_search
+    spl: 'search index=main sourcetype=aws:cloudtrail | stats count by sourceIPAddress | sort - count | head 200'
+    field: sourceIPAddress
+    refresh: per_run
+    limit: 200
+
+  aws_region:
+    type: choice
+    values: [eu-west-1, eu-west-2, us-east-1, us-west-2]
+
+  event_name:
+    type: choice
+    values: [ConsoleLogin, AssumeRole, PutBucketPolicy, CreateBucket, RunInstances, DeleteObject]
+
+time_policy:
+  mode: rolling
+  window: 24h
+  jitter: 45m
+  align: 1m
+
+personas:
+  # The hunter is the expensive user: wide windows, rare terms, correlation
+  # across sourcetypes. There are never many of them, which is why the weight
+  # is low, but they generate a disproportionate share of the load.
+  - name: hunter
+    weight: 20
+    think_time:
+      dist: lognormal
+      median_s: 25
+      sigma: 0.7
+      min_s: 3
+      max_s: 180
+    steps:
+      - id: hunt-rare-event
+        type: search
+        engine: api
+        class: rare
+        spl: 'search index=main sourcetype=aws:cloudtrail eventName={{event_name}} awsRegion={{aws_region}} | table _time, eventName, sourceIPAddress, awsRegion, recipientAccountId'
+        result_count: 50
+        time_range:
+          mode: rolling
+          window: 7d
+          jitter: 3h
+          align: 1m
+
+      - id: hunt-pivot-on-ip
+        type: search
+        engine: api
+        class: rare
+        spl: 'search index=main sourcetype=aws:cloudtrail sourceIPAddress="{{src_ip}}" | stats count, values(eventName) as events, dc(awsRegion) as regions by sourceIPAddress'
+        result_count: 20
+        time_range:
+          mode: rolling
+          window: 7d
+          jitter: 3h
+          align: 1m
+
+      - id: hunt-correlate-auth
+        type: search
+        engine: api
+        class: subsearch
+        spl: 'search index=main sourcetype=linux_secure [ search index=main sourcetype=aws:cloudtrail eventName=ConsoleLogin | stats count by sourceIPAddress | fields sourceIPAddress | rename sourceIPAddress as src_ip | head 500 ] | stats count by src_ip | sort - count'
+        result_count: 50
+
+  # The watcher is what most of a SOC actually does most of the time: the same
+  # few overview searches, over and over, on a short cycle. Cheap individually,
+  # and the dominant share of dispatches by volume.
+  - name: watcher
+    weight: 65
+    think_time:
+      dist: lognormal
+      median_s: 45
+      sigma: 0.4
+      min_s: 10
+      max_s: 240
+    steps:
+      - id: watch-auth-failures
+        type: search
+        engine: api
+        class: sparse
+        spl: 'search index=main sourcetype=linux_secure "Failed password" | timechart span=10m count'
+        result_count: 150
+
+      - id: watch-api-errors
+        type: search
+        engine: api
+        class: dense
+        spl: 'search index=main sourcetype=stoker:apigw status>=400 | stats count by status, path | sort - count | head 20'
+        result_count: 20
+
+      - id: watch-volume-overview
+        type: search
+        engine: api
+        class: accelerated
+        spl: '| tstats count where index=main by _time span=5m, sourcetype'
+        result_count: 200
+
+  # The reporter runs one expensive aggregation and then goes away for a long
+  # time. Low frequency, high cost: the workload that a scheduled search would
+  # normally carry, included here because it competes for the same concurrency
+  # slots as everything else.
+  - name: reporter
+    weight: 15
+    think_time:
+      dist: lognormal
+      median_s: 120
+      sigma: 0.6
+      min_s: 30
+      max_s: 600
+    steps:
+      - id: report-s3-activity
+        type: search
+        engine: api
+        class: dense
+        spl: 'search index=main sourcetype=aws:s3:accesslogs | stats count, sum(bytes_sent) as bytes by operation, http_status | sort - count'
+        result_count: 100
+
+      - id: report-daily-summary
+        type: search
+        engine: api
+        class: dense
+        spl: 'search index=main sourcetype=aws:cloudtrail | timechart span=1h dc(sourceIPAddress) as unique_ips, count as events'
+        result_count: 200
+
+load:
+  model: closed
+  virtual_users: 50
+  # Pacing turns this into a coordinated-omission-corrected run: each virtual
+  # user has a timetable, and an iteration that overruns makes the next one
+  # late and says so, rather than quietly absorbing the queue on the target's
+  # behalf. Set it slightly above the expected iteration cost, otherwise every
+  # iteration is late from the start and the correction dominates the signal.
+  pacing_s: 90
+  ramp:
+    - to: 10
+      over_s: 60
+    - to: 50
+      over_s: 300
+    - hold_s: 900
+  duration: 1260s
+
+abort_if:
+  error_rate_pct: 10
+  p95_ms: 90000
+  generator_drift_ms: 3000

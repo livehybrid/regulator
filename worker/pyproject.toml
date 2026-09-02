@@ -1,0 +1,39 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "regulator-agent"
+version = "0.1.0"
+description = "Regulator worker agent: paced concurrent Splunk search load over the splunkd REST API"
+readme = { text = "Regulator worker agent. The buildable contract lives in docs/WORKER-CONTRACT.md at the repository root. The container image copies source directly; this file exists for metadata, editable installs and pytest configuration.", content-type = "text/markdown" }
+requires-python = ">=3.11"
+license = { text = "Apache-2.0" }
+dependencies = [
+    "httpx[http2]",
+    "PyYAML",
+    "hdrhistogram",
+]
+
+[project.optional-dependencies]
+test = [
+    "pytest",
+    "pytest-timeout",
+]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["regulator_agent*"]
+
+[tool.pytest.ini_options]
+# rootdir for this config is worker/, so "tests" is worker/tests. Running
+# `pytest worker/tests` from the repo root picks this file up and applies
+# the timeout; testpaths covers a bare `pytest` run from inside worker/.
+#
+# The timeout is not a style choice. Every test here talks to a fake or a
+# stubbed transport, so a test that runs longer than 60 s is a test that has
+# deadlocked on a lease, a heartbeat or a barrier wait. Without the cap that
+# failure mode presents as a hung CI job with no useful output.
+testpaths = ["tests"]
+timeout = 60
+addopts = "-ra"

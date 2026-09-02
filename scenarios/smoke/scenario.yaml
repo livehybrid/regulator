@@ -1,0 +1,67 @@
+# The smallest useful scenario: proves the whole path works.
+#
+# Deliberately depends on NO indexed data. Both searches are generated on the
+# search head itself, so this runs green against an empty Splunk, a fresh
+# container, or the fake splunkd in tools/. That is what makes it usable as the
+# CI smoke test: it fails when Regulator is broken, never because the corpus is
+# missing.
+#
+# It is not a benchmark. Nothing here touches an indexer, so the numbers say
+# nothing about cluster capacity. Use search-classes or soc-analyst-morning for
+# anything you intend to draw a conclusion from.
+
+name: smoke
+engine: api
+seed: 20260902
+description: "Two trivial searches at low concurrency: proves dispatch, polling, job stats and result fetch all work end to end"
+tags: smoke, ci, no-data
+
+corpus:
+  index: main
+
+parameters:
+  bucket_count:
+    type: int_range
+    min: 50
+    max: 500
+
+time_policy:
+  mode: rolling
+  window: 15m
+  jitter: 5m
+  align: 1m
+
+personas:
+  - name: smoker
+    weight: 100
+    think_time:
+      dist: fixed
+      value_s: 0.5
+    steps:
+      - id: makeresults-stats
+        type: search
+        engine: api
+        class: accelerated
+        # Runs entirely on the search head. Costs a dispatch and nothing else,
+        # which is exactly what we want to measure here: that the dispatch,
+        # poll and job-stats path works.
+        spl: '| makeresults count={{bucket_count}} | eval bucket=random()%10 | stats count by bucket'
+        result_count: 10
+
+      - id: internal-head
+        type: search
+        engine: api
+        class: sparse
+        # _internal exists on every Splunk instance ever installed, so this
+        # still needs no fixture data, but it does exercise a real index read.
+        spl: 'search index=_internal | head 200 | stats count by sourcetype'
+        result_count: 20
+
+load:
+  model: closed
+  virtual_users: 2
+  duration: 20s
+
+abort_if:
+  error_rate_pct: 50
+  p95_ms: 30000
