@@ -9,10 +9,10 @@ Stoker fills a Splunk cluster with realistic data. Regulator drives realistic
 demand against it. On a steam locomotive the stoker shovels coal into the
 firebox and the driver opens the regulator to demand work from the boiler.
 
-> **Phases 0 to 3.** The API engine, the scenario format, the standalone worker,
-> the control plane, the web UI, the headless-browser engine and the CI regression
-> gate are here and tested. The worker fleet and the Kubernetes driver are on the
-> roadmap below.
+> **Phases 0 to 4.** The API engine, the scenario format, the standalone worker,
+> the control plane, the web UI, the headless-browser engine, the CI regression
+> gate and server-side correlation are here and tested. The distributed worker
+> fleet is the remaining piece.
 
 ---
 
@@ -41,6 +41,59 @@ The last two matter most. "The cluster is too slow" and "the load box was too
 small" need opposite responses, so they never share an outcome or an exit code.
 
 ---
+
+## What the cluster thought was happening
+
+Everything above measures from the outside. After each run Regulator asks the
+cluster its own opinion, because the difference between "p95 went from 4 s to
+11 s" and "p95 went from 4 s to 11 s **because** indexer CPU hit 95% and 340
+scheduled searches were skipped" is the difference between a load test and a
+benchmark.
+
+Six questions, each one search against Splunk's own internal indexes:
+
+| Probe | What it answers |
+|---|---|
+| `_audit`, this run | The cluster's own account of the searches we dispatched, matched by the marker each one carries |
+| `_audit`, everything | All searches in the window, so other traffic on a shared cluster is visible rather than silently mixed in |
+| `search_telemetry` | Where the time went by phase. Indexer-side elapsed time separates a busy search head from busy indexers, which no client-side timing can |
+| Scheduler | Scheduled searches skipped or deferred. Past the concurrency ceiling the first casualty is usually somebody else's scheduled work, a cost that is otherwise invisible |
+| Cache manager | SmartStore downloads and evictions over the wire, corroborating the bucket-level provenance |
+| Resource usage | Search head and indexer CPU, so the latency curve can be laid against the machine's own load |
+
+Two honest caveats, both established against a live 10.4 instance rather than
+assumed. **The count of this run's own searches is a floor, not a total**: audit
+records keep arriving for a minute or two after a run and correlation happens
+immediately, so reason with the aggregate probes. And **these searches are
+themselves load**: they run on the cluster under test, after the run rather than
+during it, and the run record says so rather than pretending otherwise.
+
+Everything degrades. A load-test account frequently cannot read `_audit` or
+`_introspection`, and a benchmark that refused to report because it could not
+also ask the cluster's opinion would be worse than useless. Each probe that
+fails becomes a note, and the run stands on its client-side measurement.
+
+## Running it in the cluster it measures
+
+`infra/k8s/` deploys the control plane onto a **dedicated node group**, and the
+placement is the point rather than a detail. A load generator sharing nodes with
+the system under test competes with it for CPU, memory and network, so the
+benchmark measures the contention it created. Every pod is pinned to
+`workload=regulator` and tolerates a matching taint, so nothing else lands there
+and it lands nowhere else.
+
+```bash
+eksctl create nodegroup --cluster <name> --name regulator \
+  --node-labels workload=regulator --node-type m6i.2xlarge --nodes 1 \
+  --taints workload=regulator:NoSchedule
+
+kubectl apply -f infra/k8s/regulator.yaml
+```
+
+Note the deployment sets **memory limits but no CPU limit**. A throttled load
+generator cannot keep to its own schedule, and the result is a run marked
+invalid rather than a slow one. Requests reserve the capacity; a limit would cap
+it at exactly the wrong moment.
 
 ## Gating a pipeline on it
 
@@ -635,7 +688,8 @@ needs `test`, a cancelled test means the stale build never starts at all.
 | 1b | Worker fleet over Docker Swarm, Postgres, merged histograms across the fleet, which lifts the in-process virtual-user ceiling |
 | **2** | **Browser engine** (done): Playwright, a persistent context per virtual user, Navigation Timing and LCP, and every search the page fires captured from the wire and joined back to its own server-side job statistics |
 | **3** | **CI and regression gates** (done): named baselines, run comparison with per-step deltas, a small gate language, and a GitHub Action |
-| 4 | Kubernetes and Splunk Operator: Indexed Jobs, dedicated node groups so the generator never shares a node with the system under test, and correlation against `_audit`, `_introspection` and the scheduler's skipped-search counts |
+| **4** | **Server-side correlation and Kubernetes** (done): every run pulls back the cluster's own account of it from `_audit`, `_introspection`, the scheduler and the cache manager, and manifests deploy it onto a dedicated node group so the generator never shares a node with the system under test |
+| 5 | Distributed worker fleet: Indexed Jobs and Swarm services driven by a claim protocol, which lifts the in-process virtual-user ceiling |
 
 ---
 

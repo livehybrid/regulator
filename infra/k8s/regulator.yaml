@@ -1,0 +1,161 @@
+# Regulator on Kubernetes, for running it in the same cluster as the Splunk it
+# measures.
+#
+# THE PLACEMENT IS THE POINT. A load generator sharing nodes with the system
+# under test competes with it for CPU, memory and network, so the benchmark
+# measures the contention it created rather than the cluster's behaviour. Every
+# pod here is pinned to a node group labelled `workload=regulator` and tolerates
+# a matching taint, so nothing else lands there and it lands nowhere else.
+#
+# Create that node group first. On EKS:
+#
+#   eksctl create nodegroup --cluster <name> --name regulator \
+#     --node-labels workload=regulator \
+#     --node-type m6i.2xlarge --nodes 1 \
+#     --taints workload=regulator:NoSchedule
+#
+# Without the taint the scheduler is free to put other people's pods on your
+# load box, which is the same problem in reverse.
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: regulator
+  labels:
+    app.kubernetes.io/name: regulator
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: regulator
+  namespace: regulator
+type: Opaque
+stringData:
+  # Encrypts every target credential at rest. Generate with:
+  #   python -c 'from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())'
+  #
+  # NOT optional in a deployment. Left unset, Regulator generates a throwaway
+  # key on every start, so every credential stored becomes undecryptable the
+  # first time the pod restarts.
+  REG_MASTER_KEY: "replace-me-with-a-generated-fernet-key"
+  # Unset means no authentication at all. This service can evict a production
+  # SmartStore cache and drive a cluster to saturation.
+  REG_ADMIN_PASSWORD: "replace-me"
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: regulator-data
+  namespace: regulator
+spec:
+  accessModes: ["ReadWriteOnce"]
+  resources:
+    requests:
+      storage: 10Gi
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: regulator
+  namespace: regulator
+  labels:
+    app.kubernetes.io/name: regulator
+spec:
+  replicas: 1
+  # Recreate, not RollingUpdate: the control plane owns a SQLite file on one
+  # ReadWriteOnce volume, so two pods must never contend for it during a
+  # rollout.
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: regulator
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: regulator
+    spec:
+      nodeSelector:
+        workload: regulator
+      tolerations:
+        - key: workload
+          operator: Equal
+          value: regulator
+          effect: NoSchedule
+      # The image creates /data owned by uid 10012, but mounting a PVC there
+      # shadows that: a fresh volume arrives root-owned and the pod cannot
+      # create its database. fsGroup makes the kubelet fix the group ownership.
+      # OnRootMismatch so it does not walk the whole volume on every restart.
+      securityContext:
+        runAsUser: 10012
+        runAsGroup: 10012
+        fsGroup: 10012
+        fsGroupChangePolicy: OnRootMismatch
+      # The control plane drains in-flight runs on SIGTERM rather than
+      # abandoning them mid-measurement.
+      terminationGracePeriodSeconds: 60
+      containers:
+        - name: regulator
+          image: ghcr.io/livehybrid/regulator:latest
+          ports:
+            - name: http
+              containerPort: 8080
+          envFrom:
+            - secretRef:
+                name: regulator
+          env:
+            - name: REG_DATABASE_URL
+              value: sqlite:////data/regulator.db
+            # The in-process ceiling. The control plane generates the load
+            # itself, so this is sized to the node group above rather than to
+            # how many users you wish you could simulate. Raising it past what
+            # the node can carry does not produce more load, it produces runs
+            # marked invalid by the generator-drift guard.
+            - name: REG_MAX_VIRTUAL_USERS
+              value: "300"
+            - name: REG_MAX_CONCURRENT_RUNS
+              value: "1"
+          volumeMounts:
+            - name: data
+              mountPath: /data
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            initialDelaySeconds: 30
+            periodSeconds: 30
+            failureThreshold: 5
+          resources:
+            requests:
+              cpu: "2"
+              memory: 2Gi
+            limits:
+              # No CPU limit on purpose. A throttled load generator cannot keep
+              # to its own schedule, and the result is a run marked invalid
+              # rather than a slow one. Requests reserve the capacity; a limit
+              # would cap it at exactly the wrong moment.
+              memory: 4Gi
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: regulator-data
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: regulator
+  namespace: regulator
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: regulator
+  ports:
+    - name: http
+      port: 8080
+      targetPort: http

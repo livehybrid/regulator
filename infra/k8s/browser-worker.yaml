@@ -1,0 +1,69 @@
+# The browser-engine worker as a Job, for when a browser cohort needs more
+# memory than the control plane's node can spare.
+#
+# Chromium is the reason this is separate. A context is 150 to 300 MB, and the
+# default /dev/shm in a container is 64 MB, which is not enough for a real page:
+# tabs crash and it looks like a flaky test. The emptyDir below is the fix, and
+# --disable-dev-shm-usage in the engine is the belt to that pair of braces.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: regulator-browser
+  namespace: regulator
+spec:
+  backoffLimit: 0
+  template:
+    spec:
+      restartPolicy: Never
+      nodeSelector:
+        workload: regulator
+      tolerations:
+        - key: workload
+          operator: Equal
+          value: regulator
+          effect: NoSchedule
+      # Nothing here talks to the Kubernetes API.
+      automountServiceAccountToken: false
+      containers:
+        - name: worker
+          image: ghcr.io/livehybrid/regulator-worker:browser
+          env:
+            - name: REG_STANDALONE
+              value: "1"
+            - name: REG_SCENARIO
+              value: dashboard-triage
+            - name: REG_TARGET_URL
+              value: https://splunk.splunk.svc:8089
+            - name: REG_TARGET_WEB_URL
+              value: https://splunk.splunk.svc:8000
+            - name: REG_TARGET_VERIFY_TLS
+              value: "0"
+            # Splunk Web needs a native account: a bearer token authenticates
+            # the REST API but not a web session, and SAML cannot be driven
+            # headlessly at all.
+            - name: REG_TARGET_USERNAME
+              valueFrom:
+                secretKeyRef: {name: regulator-splunk, key: username}
+            - name: REG_TARGET_PASSWORD
+              valueFrom:
+                secretKeyRef: {name: regulator-splunk, key: password}
+            - name: REG_VUS
+              value: "10"
+            - name: REG_DURATION_S
+              value: "600"
+          volumeMounts:
+            - name: dshm
+              mountPath: /dev/shm
+          resources:
+            requests:
+              cpu: "2"
+              # Roughly 300 MB per browser context plus headroom. Ten contexts
+              # is the default cohort size for a reason.
+              memory: 4Gi
+            limits:
+              memory: 6Gi
+      volumes:
+        - name: dshm
+          emptyDir:
+            medium: Memory
+            sizeLimit: 1Gi

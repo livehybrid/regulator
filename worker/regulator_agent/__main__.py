@@ -45,6 +45,7 @@ from .hec import HecEmitter
 from .params import ParameterResolver
 from .report import render, target_report
 from .smartstore import CacheState, cache_state, delta as cache_delta, evict_all
+from .sut import correlate, marker_prefix_for
 from .smartstore import render as render_cache
 from .results import NdjsonEmitter, RunStats, RunSummary
 from .scenario import ScenarioError, is_advice, lint, load_scenario
@@ -407,6 +408,20 @@ async def _run(config: Config, args: argparse.Namespace) -> int:
         stop_progress.set()
 
         summary.cache = await _cache_provenance(engine.client, cache_before, eviction)
+
+        # Ask the cluster its own opinion of what just happened. Best effort:
+        # a load-test account frequently cannot read _audit or _introspection,
+        # and refusing to report a run because correlation failed is absurd.
+        if summary.started_at and summary.ended_at:
+            summary.sut = await correlate(
+                engine.client,
+                summary.started_at,
+                summary.ended_at,
+                marker_prefix_for(config.run_id),
+                settle_s=float(os.environ.get("REG_SUT_SETTLE_S", "8")),
+            )
+            for finding in summary.sut.get("findings", []):
+                log.info("target: %s", finding)
 
         await _report_summary(summary, hec, config)
         return _exit_code(summary)

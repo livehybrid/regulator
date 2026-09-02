@@ -363,6 +363,9 @@ class RunSummary:
     # SmartStore provenance. Without it, a fast run and a slow run of the same
     # scenario are not comparable and nobody can tell why.
     cache: Optional[Dict[str, Any]] = None
+    # What the cluster itself recorded: its account of our searches, where the
+    # time went by phase, scheduled searches it had to skip, and its own CPU.
+    sut: Optional[Dict[str, Any]] = None
     abort_reason: Optional[str] = None
     scenario_seed: int = 0
     agent_version: str = ""

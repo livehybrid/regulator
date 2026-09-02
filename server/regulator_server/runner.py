@@ -33,6 +33,7 @@ from regulator_agent.results import RunStats
 from regulator_agent.scenario import lint, load_scenario
 from regulator_agent.scheduler import Scheduler
 from regulator_agent.smartstore import cache_state, delta as cache_delta, evict_all
+from regulator_agent.sut import correlate, marker_prefix_for
 
 from .adapters import load_named_scenario, worker_config
 from .config import get_settings
@@ -222,6 +223,13 @@ class RunManager:
             summary = await scheduler.run()
 
             summary.cache = await self._cache_provenance(engine.client, before, eviction)
+            if summary.started_at and summary.ended_at:
+                summary.sut = await correlate(
+                    engine.client,
+                    summary.started_at,
+                    summary.ended_at,
+                    marker_prefix_for(config.run_id),
+                )
 
             payload = summary.to_dict()
             self._finish(
