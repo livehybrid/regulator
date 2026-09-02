@@ -192,10 +192,44 @@ records the cache state before and after**, so the summary carries a
 `provenance` of `warm`, `cold`, `mixed` or `unknown`, along with how many
 buckets and bytes the run pulled down.
 
+There are two ways to force the cold path, because they answer different
+questions.
+
+**Evict before a run.** `REG_EVICT_CACHE=1` drops the cache, then runs. Use it
+when the question is "how does this workload behave against unlocalised data".
+
+```bash
+REG_EVICT_CACHE=1 REG_EVICT_CACHE_INDEXES=main python -m regulator_agent
+```
+
+**Evict now, then do whatever you like.** `--evict-cache` drops the cache and
+exits, so you can run a search by hand, watch the indexer, or start a run from
+somewhere else afterwards. Use it when you are investigating rather than
+benchmarking.
+
+```bash
+python -m regulator_agent --evict-cache --index main --index cultivar_web
+python -m regulator_agent --evict-cache --all-indexes    # explicit on purpose
+```
+
+It reports the cache before and after, and how many buckets refused eviction
+(a bucket with a live reader cannot be evicted, which is correct behaviour
+rather than a fault). Without `--index` or `--all-indexes` it refuses: there is
+no undo beyond waiting for everything to re-download, and on a shared cluster
+most of that cache belongs to other people's dashboards.
+
 | Variable | Default | Notes |
 |---|---|---|
-| `REG_EVICT_CACHE` | `0` | Evict the local cache before the run, so it measures the cold path. Opt-in and never a default: throwing away a warm cache means paying to re-download everything the next run touches |
-| `REG_EVICT_CACHE_INDEXES` | the scenario's corpus index | Comma-separated. Restricting eviction to the indexes the scenario actually searches is strongly preferred: on a shared cluster the rest of the cache belongs to other people's dashboards |
+| `REG_EVICT_CACHE` | `0` | Evict before the run, so it measures the cold path. Opt-in and never a default |
+| `REG_EVICT_CACHE_INDEXES` | the scenario's corpus index | Comma-separated. Also supplies the default index list for `--evict-cache` |
+
+**One caveat worth knowing when reading a cold run.** Splunk re-localises as
+the run proceeds, so the first searches read cold and later ones increasingly
+do not. The provenance comes back as `mixed` rather than `cold`, and the
+`buckets_downloaded` count is what tells you how much of the run actually paid
+for the network. For a *sustained* cold measurement, point the scenario at a
+time range outside the cache's hotlist window instead: every iteration then
+reads cold, repeatably, without evicting anything or disturbing anyone else.
 
 The target report also gives you the picture before you start:
 

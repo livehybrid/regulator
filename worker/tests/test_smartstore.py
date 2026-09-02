@@ -13,6 +13,7 @@ deliberate, human decision.
 
 from __future__ import annotations
 
+import json
 import sys
 import urllib.parse
 from pathlib import Path
@@ -244,6 +245,59 @@ def test_eviction_on_a_non_smartstore_instance_does_nothing(env):
 
     assert result.attempted == 0
     assert result.errors == []
+
+
+def test_the_evict_command_refuses_to_flush_the_estate_by_default(monkeypatch, capsys, env):
+    """There is no undo beyond waiting for everything to re-download.
+
+    On a shared cluster most of the cache belongs to other people's
+    dashboards, so flushing all of it has to be an explicit act.
+    """
+    from regulator_agent.__main__ import main
+
+    splunkd = server(smartstore_buckets=20, smartstore_local_pct=100)
+    try:
+        for key, value in {
+            "REG_STANDALONE": "1",
+            "REG_TARGET_URL": splunkd.base_url,
+            "REG_TARGET_TOKEN": "t",
+            "REG_TARGET_VERIFY_TLS": "0",
+        }.items():
+            monkeypatch.setenv(key, value)
+        monkeypatch.delenv("REG_SCENARIO", raising=False)
+        monkeypatch.delenv("REG_EVICT_CACHE_INDEXES", raising=False)
+
+        assert main(["--evict-cache"]) == 1
+        # Nothing was touched: the refusal happens before any request.
+        assert with_client(splunkd, env, cache_state).local_buckets == 20
+    finally:
+        splunkd.close()
+
+
+def test_the_evict_command_drops_one_named_index(monkeypatch, capsys):
+    from regulator_agent.__main__ import main
+
+    splunkd = server(smartstore_buckets=20, smartstore_local_pct=100)
+    try:
+        for key, value in {
+            "REG_STANDALONE": "1",
+            "REG_TARGET_URL": splunkd.base_url,
+            "REG_TARGET_TOKEN": "t",
+            "REG_TARGET_VERIFY_TLS": "0",
+        }.items():
+            monkeypatch.setenv(key, value)
+        monkeypatch.delenv("REG_SCENARIO", raising=False)
+
+        index = sorted({b.split("|")[1].split("~")[0] for b in splunkd._buckets})[0]
+        assert main(["--evict-cache", "--index", index]) == 0
+
+        payload = json.loads(capsys.readouterr().out)
+        assert payload["indexes"] == [index]
+        assert payload["eviction"]["evicted"] > 0
+        assert payload["after"]["local_buckets"] < payload["before"]["local_buckets"]
+        assert payload["after"]["per_index"][index]["local_buckets"] == 0
+    finally:
+        splunkd.close()
 
 
 def test_the_evict_endpoint_refuses_a_get(env):

@@ -136,6 +136,77 @@ async def _progress(stats: RunStats, stop: asyncio.Event) -> None:
         )
 
 
+async def _do_evict(config: Config, args: argparse.Namespace) -> int:
+    """Evict cached buckets now, and exit. Needs no scenario.
+
+    Separate from the pre-run eviction on purpose. Sometimes you want to drop
+    the cache, go and do something else, and come back: run a search by hand,
+    watch the indexer, start a run from the control plane later. Tying eviction
+    to a run would make that impossible.
+
+    Refuses to flush the whole estate unless told to explicitly. On a shared
+    cluster most of that cache belongs to other people's dashboards, and there
+    is no undo beyond waiting for it to re-download.
+    """
+    indexes = list(args.index or []) or list(config.evict_cache_indexes)
+    if not indexes and not args.all_indexes:
+        log.error(
+            "refusing to evict every index without being told to. Pass --index <name> "
+            "(repeatable), or set REG_EVICT_CACHE_INDEXES, or pass --all-indexes if you "
+            "really do mean the whole cache"
+        )
+        return EXIT_FAILED
+
+    engine = get_engine("api", config)
+    try:
+        await engine.start()
+
+        before = await cache_state(engine.client)
+        if not before.available:
+            log.error("no SmartStore cache to evict: %s", before.reason)
+            return EXIT_FAILED
+
+        sys.stderr.write("before:\n" + render_cache(before) + "\n")
+
+        result = await evict_all(engine.client, indexes=indexes or None)
+        after = await cache_state(engine.client)
+
+        sys.stderr.write("after:\n" + render_cache(after) + "\n")
+        log.info(
+            "evicted %d of %d bucket(s), %.1f GB. Local buckets %d -> %d",
+            result.evicted,
+            result.attempted,
+            result.bytes_evicted / 1e9,
+            before.local_buckets,
+            after.local_buckets,
+        )
+        if result.failed:
+            # A bucket with a live reader cannot be evicted, which is correct
+            # behaviour rather than a fault: something is searching it.
+            log.warning(
+                "%d bucket(s) refused eviction, most likely because a search is "
+                "currently reading them",
+                result.failed,
+            )
+
+        print(
+            json.dumps(
+                {
+                    "indexes": indexes or "all",
+                    "eviction": result.to_dict(),
+                    "before": before.to_dict(),
+                    "after": after.to_dict(),
+                },
+                indent=2,
+                default=str,
+            )
+        )
+        return EXIT_OK
+    finally:
+        with contextlib.suppress(Exception):
+            await engine.close()
+
+
 async def _describe_target(config: Config) -> int:
     """Report on the target and exit. Needs no scenario.
 
@@ -157,6 +228,9 @@ async def _describe_target(config: Config) -> int:
 
 
 async def _run(config: Config, args: argparse.Namespace) -> int:
+    if args.evict_cache:
+        return await _do_evict(config, args)
+
     if args.target_report:
         return await _describe_target(config)
 
@@ -434,6 +508,28 @@ def main(argv: Optional[List[str]] = None) -> int:
         help="validate the scenario offline and against the target, then exit",
     )
     parser.add_argument(
+        "--evict-cache",
+        action="store_true",
+        help=(
+            "evict cached SmartStore buckets now and exit, so the next searches read "
+            "cold. Needs --index or --all-indexes"
+        ),
+    )
+    parser.add_argument(
+        "--index",
+        action="append",
+        metavar="NAME",
+        help="index to evict, repeatable. Used with --evict-cache",
+    )
+    parser.add_argument(
+        "--all-indexes",
+        action="store_true",
+        help=(
+            "with --evict-cache, flush the entire cache rather than named indexes. On a "
+            "shared cluster this drops other people's cached data too"
+        ),
+    )
+    parser.add_argument(
         "--target-report",
         action="store_true",
         help=(
@@ -450,7 +546,9 @@ def main(argv: Optional[List[str]] = None) -> int:
     args = parser.parse_args(argv)
 
     env = dict(os.environ)
-    if (args.target_report or args.probe_only) and not env.get("REG_SCENARIO"):
+    if (args.target_report or args.probe_only or args.evict_cache) and not env.get(
+        "REG_SCENARIO"
+    ):
         # Both modes exit before a scenario is used, so requiring one would be
         # a pointless obstacle when pointing this at an unfamiliar cluster.
         env["REG_SCENARIO"] = "smoke"
