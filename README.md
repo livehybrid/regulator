@@ -9,9 +9,10 @@ Stoker fills a Splunk cluster with realistic data. Regulator drives realistic
 demand against it. On a steam locomotive the stoker shovels coal into the
 firebox and the driver opens the regulator to demand work from the boiler.
 
-> **Phases 0, 1 and 2.** The API engine, the scenario format, the standalone
-> worker, the control plane, the web UI and the headless-browser engine are here
-> and tested. The worker fleet and the CI regression gate are on the roadmap below.
+> **Phases 0 to 3.** The API engine, the scenario format, the standalone worker,
+> the control plane, the web UI, the headless-browser engine and the CI regression
+> gate are here and tested. The worker fleet and the Kubernetes driver are on the
+> roadmap below.
 
 ---
 
@@ -40,6 +41,101 @@ The last two matter most. "The cluster is too slow" and "the load box was too
 small" need opposite responses, so they never share an outcome or an exit code.
 
 ---
+
+## Gating a pipeline on it
+
+A single run is a number. Two runs are a comparison, which is the point: did
+this release make search slower, does adding two indexers help, is this cluster
+shape faster than that one.
+
+```bash
+python -m regulator_agent \
+  --compare run.json --baseline main-green.json \
+  --gate "p95 <= baseline + 15%" \
+  --gate "error_rate <= 2%" \
+  --gate "queued == 0"
+```
+
+```
+FAIL: 1/2 gates met
+  FAIL p95 <= baseline + 15%: 1420.0 versus a baseline of 1000.0 (+42.0%, worse), limit 1150.0
+  ok   error_rate <= 2%: 0.0 against a limit of 2.0
+
+  step                           baseline  candidate      delta
+  rare-bucket-policy                2000ms      4100ms    +105.0%  (scanned more)
+  dense-web-status                   800ms       820ms      +2.5%
+```
+
+Comparison is arithmetic over two JSON documents, so it needs no target and no
+network. The gate language is deliberately small, because a gate nobody can read
+aloud in a review is a gate that will eventually be misread:
+
+| Gate | Meaning |
+|---|---|
+| `p95 <= baseline + 15%` | The common one: no more than 15% slower |
+| `p95 <= 5000ms` | An absolute ceiling, no baseline needed |
+| `throughput >= baseline - 10%` | Where a bigger number is better, worse means down |
+| `error_rate <= 2%` | |
+| `queued == 0` | Nothing waited at the concurrent-search ceiling |
+| `valid` | The run measured Splunk rather than itself |
+| `p95[rare-bucket-policy] <= baseline + 25%` | One step, so a slow rare search is not hidden by a fast average |
+
+### Three things it refuses to do
+
+Each of these would let it lie, and somebody would merge on the strength of it.
+
+- **It will not compare an invalid run.** A run whose generator could not keep
+  to its own schedule measured the load box, not Splunk. The comparison is
+  blocked with that as the reason rather than producing a confident percentage.
+- **It will not silently compare a warm run to a cold one.** On SmartStore those
+  are different work, sometimes by an order of magnitude. The comparison still
+  runs, because sometimes that is exactly what you are measuring, but the
+  mismatch is reported as a warning.
+- **It will not quietly compare different workloads.** A different scenario,
+  seed, concurrency, target or coordinated-omission setting is a different
+  question, and each is called out.
+
+The per-step table separates the two ways a benchmark gets slower:
+`scanned more` means the candidate did more work, so the comparison was never
+valid. Latency up with scan count flat is contention or queueing, which is the
+finding you were looking for.
+
+### The exit contract
+
+| Code | Meaning |
+|---|---|
+| 0 | Every gate met, or report-only |
+| 1 | Something broke: unreachable control plane, a scenario that does not exist |
+| 2 | A gate was breached. A real result, and the thing the pull request should argue about |
+| 3 | The run was invalid, so it measured the generator. A tooling problem, not a regression |
+
+Codes 2 and 3 are separate so a pipeline never sends somebody hunting for a
+slowdown that never happened.
+
+### GitHub Action
+
+```yaml
+- uses: livehybrid/regulator/.github/actions/benchmark@main
+  with:
+    server: https://regulator.example
+    token: ${{ secrets.REGULATOR_TOKEN }}
+    target: 1
+    scenario: search-classes
+    virtual-users: 200
+    baseline: main-green
+    gates: |
+      p95 <= baseline + 15%
+      error_rate <= 2%
+      valid
+    # Only a green main becomes the new baseline.
+    promote-baseline: ${{ github.ref == 'refs/heads/main' && 'main-green' || '' }}
+```
+
+It launches the run, streams progress into the job log, writes the comparison
+into the job summary where a reviewer will actually see it, and annotates each
+breached gate. The first run of a new benchmark has nothing to compare against,
+so it reports rather than failing: a check that goes red the day you add it is a
+check everybody disables.
 
 ## The web interface
 
@@ -538,7 +634,7 @@ needs `test`, a cancelled test means the stale build never starts at all.
 | **1** | **Control plane and web interface** (done): targets, the report, cache inspection and eviction, scenario launch, and a live run detail with an inline latency chart. Scenarios execute in the control plane's own process |
 | 1b | Worker fleet over Docker Swarm, Postgres, merged histograms across the fleet, which lifts the in-process virtual-user ceiling |
 | **2** | **Browser engine** (done): Playwright, a persistent context per virtual user, Navigation Timing and LCP, and every search the page fires captured from the wire and joined back to its own server-side job statistics |
-| 3 | CI/CD: baselines, run comparison, regression gates, a GitHub Action |
+| **3** | **CI and regression gates** (done): named baselines, run comparison with per-step deltas, a small gate language, and a GitHub Action |
 | 4 | Kubernetes and Splunk Operator: Indexed Jobs, dedicated node groups so the generator never shares a node with the system under test, and correlation against `_audit`, `_introspection` and the scheduler's skipped-search counts |
 
 ---

@@ -1,0 +1,75 @@
+name: Regulator benchmark
+description: >
+  Run a Splunk search-load benchmark and judge it against a baseline. Fails the
+  step only when a gate is breached, or when the run turned out to be invalid.
+
+inputs:
+  server:
+    description: Control-plane base URL, for example https://regulator.example
+    required: true
+  token:
+    description: A control-plane session password or API token
+    required: true
+  target:
+    description: Target id to run against
+    required: true
+  scenario:
+    description: Scenario name, for example search-classes
+    required: true
+  virtual-users:
+    description: Override the scenario's virtual-user count
+    required: false
+    default: ""
+  duration:
+    description: Override the scenario's duration, in seconds
+    required: false
+    default: ""
+  baseline:
+    description: Baseline label to compare against, for example main-green
+    required: false
+    default: ""
+  gates:
+    description: >
+      Newline-separated gate expressions, for example "p95 <= baseline + 15%".
+      An empty list reports without judging.
+    required: false
+    default: ""
+  promote-baseline:
+    description: >
+      When set, and the run passed every gate, promote it to this baseline
+      label. Point this at a branch condition so only a green main promotes.
+    required: false
+    default: ""
+  timeout:
+    description: How long to wait for the run, in seconds
+    required: false
+    default: "3600"
+
+outputs:
+  run-id:
+    description: The id of the run that was launched
+    value: ${{ steps.bench.outputs.run-id }}
+  verdict:
+    description: pass, fail or blocked
+    value: ${{ steps.bench.outputs.verdict }}
+  report:
+    description: The human-readable comparison report
+    value: ${{ steps.bench.outputs.report }}
+
+runs:
+  using: composite
+  steps:
+    - id: bench
+      shell: bash
+      env:
+        REGULATOR_SERVER: ${{ inputs.server }}
+        REGULATOR_TOKEN: ${{ inputs.token }}
+        REGULATOR_TARGET: ${{ inputs.target }}
+        REGULATOR_SCENARIO: ${{ inputs.scenario }}
+        REGULATOR_VUS: ${{ inputs.virtual-users }}
+        REGULATOR_DURATION: ${{ inputs.duration }}
+        REGULATOR_BASELINE: ${{ inputs.baseline }}
+        REGULATOR_GATES: ${{ inputs.gates }}
+        REGULATOR_PROMOTE: ${{ inputs.promote-baseline }}
+        REGULATOR_TIMEOUT: ${{ inputs.timeout }}
+      run: python3 "${GITHUB_ACTION_PATH}/benchmark.py"

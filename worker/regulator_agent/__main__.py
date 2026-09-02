@@ -38,6 +38,7 @@ import time
 from pathlib import Path
 from typing import List, Optional
 
+from .compare import GateError, compare_runs
 from .config import Config, ConfigError, load_config
 from .engines import BrowserUnavailable, get_engine
 from .hec import HecEmitter
@@ -205,6 +206,46 @@ async def _do_evict(config: Config, args: argparse.Namespace) -> int:
     finally:
         with contextlib.suppress(Exception):
             await engine.close()
+
+
+def _do_compare(args: argparse.Namespace) -> int:
+    """Compare two run summaries and judge them against gates. No target needed.
+
+    Deliberately offline: a comparison is arithmetic over two JSON documents, so
+    it belongs in a pipeline step that has the artefacts and no access to
+    Splunk at all.
+    """
+    try:
+        candidate = json.loads(Path(args.compare).read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        log.error("could not read the run summary %s: %s", args.compare, exc)
+        return EXIT_FAILED
+
+    baseline = None
+    if args.baseline:
+        try:
+            baseline = json.loads(Path(args.baseline).read_text(encoding="utf-8"))
+        except (OSError, ValueError) as exc:
+            log.error("could not read the baseline %s: %s", args.baseline, exc)
+            return EXIT_FAILED
+
+    try:
+        result = compare_runs(
+            candidate,
+            baseline,
+            gates=args.gate or [],
+            allow_invalid=args.allow_invalid,
+        )
+    except GateError as exc:
+        log.error("%s", exc)
+        return EXIT_FAILED
+
+    sys.stderr.write(result.explain() + "\n")
+    print(json.dumps(result.to_dict(), indent=2, default=str))
+
+    if result.blocked:
+        return EXIT_INVALID
+    return EXIT_OK if result.ok else EXIT_GUARD_RAIL
 
 
 async def _describe_target(config: Config) -> int:
@@ -513,6 +554,37 @@ def main(argv: Optional[List[str]] = None) -> int:
         help="validate the scenario offline and against the target, then exit",
     )
     parser.add_argument(
+        "--compare",
+        metavar="RUN.json",
+        help=(
+            "compare a run summary against a baseline and judge it against --gate "
+            "expressions, then exit. Needs no target: it is arithmetic over two JSON "
+            "documents"
+        ),
+    )
+    parser.add_argument(
+        "--baseline",
+        metavar="BASELINE.json",
+        help="the run summary to compare against. Used with --compare",
+    )
+    parser.add_argument(
+        "--gate",
+        action="append",
+        metavar="EXPR",
+        help=(
+            "a gate to judge the comparison by, repeatable. For example "
+            "'p95 <= baseline + 15%%', 'error_rate <= 2%%', 'queued == 0', 'valid'"
+        ),
+    )
+    parser.add_argument(
+        "--allow-invalid",
+        action="store_true",
+        help=(
+            "compare even when a run is marked invalid. Off by default because an "
+            "invalid run measured the load generator rather than Splunk"
+        ),
+    )
+    parser.add_argument(
         "--evict-cache",
         action="store_true",
         help=(
@@ -549,6 +621,10 @@ def main(argv: Optional[List[str]] = None) -> int:
         help="report what the target is and what its search-concurrency ceiling is, then exit",
     )
     args = parser.parse_args(argv)
+
+    if args.compare:
+        _setup_logging(os.environ.get("REG_LOG_LEVEL", "INFO").upper())
+        return _do_compare(args)
 
     env = dict(os.environ)
     if (args.target_report or args.probe_only or args.evict_cache) and not env.get(

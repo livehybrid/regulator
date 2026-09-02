@@ -25,6 +25,7 @@ from . import auth
 from .adapters import scenarios_dir
 from .config import get_settings
 from .db import init_engine
+from .routes import baselines as baselines_routes
 from .routes import runs as runs_routes
 from .routes import targets as targets_routes
 from .schemas import AuthStatus, LoginRequest
@@ -107,6 +108,7 @@ def create_app() -> FastAPI:
 
     app.include_router(targets_routes.router)
     app.include_router(runs_routes.router)
+    app.include_router(baselines_routes.router)
 
     # ------------------------------------------------------------------- ui
 

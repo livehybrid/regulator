@@ -91,6 +91,25 @@ class Run(Base):
     target: Mapped[Target] = relationship(back_populates="runs")
 
 
+class Baseline(Base):
+    """A named run that later runs are judged against.
+
+    A label rather than a run id, because a pipeline says "compare against
+    main-green" and should not have to know which run that is this week.
+    Re-labelling is how a new baseline is promoted, so the label is the primary
+    key and pointing it at a different run is a single update.
+    """
+
+    __tablename__ = "baselines"
+
+    label: Mapped[str] = mapped_column(String(128), primary_key=True)
+    run_id: Mapped[int] = mapped_column(ForeignKey("runs.id", ondelete="CASCADE"))
+    scenario: Mapped[str] = mapped_column(String(128))
+    target_id: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    created_at: Mapped[float] = mapped_column(Float, default=time.time)
+    note: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+
+
 TERMINAL_STATES = ("completed", "stopped", "aborted", "failed")
 
 
