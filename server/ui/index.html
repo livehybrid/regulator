@@ -809,6 +809,7 @@ function drawRun(r){
     (num(sm.peak_virtual_users) ? "" : '<div class="note">Peak virtual users: ' + fmtInt(sm.peak_virtual_users) +
       ". Virtual users are not concurrent searches: a user idles between iterations, so the in-flight figure is the one to compare against the ceiling.</div>") +
     '<div class="chart"><h3 style="margin-top:0">Latency over the run</h3>' + chartSvg(live) + "</div>" +
+    sutSection(sm.sut) +
     "<h3>Steps, worst p95 first</h3>" +
     (stepRows ? '<div class="panel scroll" style="padding:0"><table><thead><tr><th>Step</th><th>Class</th>' +
       "<th class='num'>Execs</th><th class='num'>Errors</th><th class='num'>Err %</th><th class='num'>p50</th>" +
@@ -819,6 +820,32 @@ function drawRun(r){
   if (wrap) wrap.outerHTML = '<div id="runWrap">' + html + "</div>";
   else if ($("#view")) $("#view").innerHTML = '<div id="runWrap">' + html + "</div>";
 }
+// What the cluster itself said about the run. This is the half no client-side
+// timing can produce: whether the time went to the indexers, whether somebody
+// else's scheduled searches were skipped to make room, and how hot the box got.
+function sutSection(sut){
+  if (!sut) return "";
+  const findings = (sut.findings || []).map(f => "<li>" + esc(f) + "</li>").join("");
+  const probes = sut.probes || {};
+  const rows = Object.keys(probes).map(name => {
+    const p = probes[name] || {};
+    const state = p.available
+      ? (p.rows && p.rows.length ? fmtInt(p.rows.length) + " row(s)" : "no matching events")
+      : "unavailable";
+    return "<tr><td class='mono'>" + esc(name) + "</td><td>" + esc(state) + "</td>" +
+      "<td class='muted small'>" + esc(p.available ? (p.description || "") : (p.reason || "")) + "</td></tr>";
+  }).join("");
+
+  return '<div class="panel" style="margin-top:14px"><h3 style="margin-top:0">What the cluster said</h3>' +
+    (findings
+      ? '<ul style="margin:0 0 10px;padding-left:18px">' + findings + "</ul>"
+      : '<p class="muted">No server-side correlation was available.</p>') +
+    (rows ? "<table><thead><tr><th>Probe</th><th>Result</th><th>Detail</th></tr></thead><tbody>" +
+      rows + "</tbody></table>" : "") +
+    '<p class="muted small" style="margin-bottom:0">These searches ran on the target after the load ' +
+    "stopped, so they add a small, known amount of work to the system being measured.</p></div>";
+}
+
 // A deliberately small inline SVG line chart: no library, no external request.
 function chartSvg(live){
   const pts = samples.filter(s => !num(s.p95) || !num(s.p50));
