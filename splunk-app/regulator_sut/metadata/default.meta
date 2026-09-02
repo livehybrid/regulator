@@ -1,0 +1,5 @@
+# World-readable so a load-test account with a minimal role can open the
+# dashboards without being granted anything else.
+[]
+access = read : [ * ], write : [ admin ]
+export = system
