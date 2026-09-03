@@ -178,6 +178,8 @@ dialog::backdrop{background:rgba(0,0,0,.6)}
     <a class="navlink" href="#targets" data-route="targets">Targets</a>
     <a class="navlink" href="#scenarios" data-route="scenarios">Scenarios</a>
     <a class="navlink" href="#runs" data-route="runs">Runs</a>
+    <a class="navlink" href="#baselines" data-route="baselines">Baselines</a>
+    <a class="navlink" href="#audit" data-route="audit">Audit</a>
     <div style="height:8px"></div>
     <button class="btn primary" data-act="launch">Launch a run</button>
     <div class="spacer"></div>
@@ -202,6 +204,7 @@ dialog::backdrop{background:rgba(0,0,0,.6)}
 const $ = (s, r) => (r || document).querySelector(s);
 const state = { targets: [], scenarios: [], lastJson: null, currentRun: null, setupNeeded: false };
 let pollTimer = null;      // run-detail poll handle
+let pollGeneration = 0;    // bumped on every navigation, so a stale tick never reschedules
 let samples = [];          // client-side latency history for the live chart
 let samplesRunId = null;
 
@@ -376,6 +379,14 @@ async function viewTargets(){
     '<label class="f"><span>App context</span><input type="text" name="app" placeholder="search"></label>' +
     '<label class="f"><span>Owner</span><input type="text" name="owner" placeholder="nobody"></label>' +
     '<label class="f"><span>API version (optional)</span><input type="text" name="api_version"></label>' +
+    '</div>' +
+    '<h3>Indexers, for SmartStore (optional)</h3>' +
+    '<p class="note">The cache lives on the indexers. Against a search head, list their management URLs (or leave empty to discover the search peers) and, if the search head\'s credential is not valid on them, a credential that is.</p>' +
+    '<div class="grid2">' +
+    '<label class="f"><span>Indexer management URLs, comma separated</span><input type="text" name="indexer_urls" placeholder="https://idx1:8089, https://idx2:8089"></label>' +
+    '<label class="f"><span>Indexer bearer token</span><input type="password" name="indexer_token" autocomplete="off"></label>' +
+    '<label class="f"><span>Indexer username</span><input type="text" name="indexer_username" autocomplete="off"></label>' +
+    '<label class="f"><span>Indexer password</span><input type="password" name="indexer_password" autocomplete="new-password"></label>' +
     '</div><label class="chk"><input type="checkbox" name="verify_tls" checked> Verify TLS certificates</label>' +
     '<div class="btns"><button class="btn primary" type="submit">Create target</button>' +
     '<button class="btn ghost" type="button" data-act="toggle-add">Cancel</button></div></form></section>' +
@@ -396,7 +407,8 @@ async function loadTargets(){
   const rows = state.targets.map(t =>
     '<tr data-id="' + esc(t.id) + '"><td>' + esc(t.name || "(unnamed)") + "</td>" +
     '<td class="url">' + esc(t.mgmt_url || "") + (t.web_url ? '<br><span class="muted">' + esc(t.web_url) + "</span>" : "") + "</td>" +
-    "<td class='mono'>" + esc(t.app || "\u2013") + (t.owner ? " / " + esc(t.owner) : "") + "</td>" +
+    "<td class='mono'>" + esc(t.app || "\u2013") + (t.owner ? " / " + esc(t.owner) : "") +
+      (t.indexer_urls ? '<br><span class="muted small">' + esc(String(t.indexer_urls).split(",").length) + " indexer(s)</span>" : "") + "</td>" +
     "<td>" + (t.verify_tls === false ? '<span class="pill warn">off</span>' : '<span class="pill ok">on</span>') + "</td>" +
     "<td>" + healthPill(t) + "</td>" +
     "<td>" + fmtWhen(t.created_at) + "</td>" +
@@ -405,6 +417,7 @@ async function loadTargets(){
     '<button class="btn" data-act="report" data-id="' + esc(t.id) + '">Report</button>' +
     '<button class="btn" data-act="cache" data-id="' + esc(t.id) + '">Cache</button>' +
     '<button class="btn" data-act="evict" data-id="' + esc(t.id) + '">Evict</button>' +
+    '<button class="btn" data-act="saved" data-id="' + esc(t.id) + '">Saved searches</button>' +
     '<button class="btn danger" data-act="delete" data-id="' + esc(t.id) + '">Delete</button>' +
     "</div></td></tr>" +
     '<tr class="inline hidden"><td colspan="7"></td></tr>').join("");
@@ -421,9 +434,12 @@ async function onAddTarget(ev){
   ev.preventDefault();
   const f = ev.target, fd = new FormData(f);
   const body = { name: fd.get("name"), mgmt_url: fd.get("mgmt_url"), verify_tls: fd.get("verify_tls") === "on" };
-  ["web_url", "token", "username", "password", "app", "owner", "api_version"].forEach(k => {
+  ["web_url", "token", "username", "password", "app", "owner", "api_version",
+   "indexer_token", "indexer_username", "indexer_password"].forEach(k => {
     const v = (fd.get(k) || "").trim(); if (v) body[k] = v;
   });
+  const idx = (fd.get("indexer_urls") || "").split(",").map(x => x.trim()).filter(Boolean);
+  if (idx.length) body.indexer_urls = idx;
   const btn = f.querySelector('button[type=submit]');
   await busy(btn, async () => {
     await api("/targets", { method: "POST", body });
@@ -577,9 +593,140 @@ async function actDelete(btn, id){
   });
 }
 
+/* ---------- saved searches on a target ---------- */
+function savedRows(rows){
+  if (!rows.length) return '<p class="muted">No saved searches were returned.</p>';
+  return '<div class="scroll"><table><thead><tr><th>Name</th><th>App</th><th>Cron</th><th class="num">Fires/day</th>' +
+    '<th>Class</th><th>Range</th><th>Would be</th></tr></thead><tbody>' + rows.map(r =>
+    "<tr><td class='mono' title='" + esc(r.search) + "'>" + esc(r.name) + "</td><td class='mono'>" + esc(r.app || "") + "</td>" +
+    "<td class='mono'>" + esc(r.cron || "") + "</td><td class='num'>" + (num(r.firings_per_day) ? "\u2013" : fmtNum(r.firings_per_day, 2)) + "</td>" +
+    "<td><span class='tag'>" + esc(r.guessed_class) + "</span></td><td class='mono'>" + esc(r.earliest || "") + " \u2192 " + esc(r.latest || "now") + "</td>" +
+    "<td>" + (r.skipped_reason ? '<span class="pill warn" title="' + esc(r.skipped_reason) + '">left out</span> <span class="muted small">' + esc(r.skipped_reason) + "</span>"
+      : '<span class="pill ok">included</span>') + "</td></tr>").join("") + "</tbody></table></div>";
+}
+async function actSaved(btn, id){
+  await busy(btn, async () => {
+    const t = state.targets.find(x => String(x.id) === String(id)) || {};
+    dialog({
+      title: "Saved searches on " + (t.name || id), wide: true,
+      html: '<p class="note">These are the searches this Splunk already runs. Pick an app, then turn them into a scenario: the file Regulator keeps is Splunk\'s own savedsearches.conf, and a search that writes anywhere is left out unless you say otherwise.</p>' +
+        '<div class="btns" style="margin-bottom:10px"><input type="text" id="ssApp" placeholder="app (blank for all)" style="width:220px">' +
+        '<button class="btn" id="ssLoad">Load</button>' +
+        '<a class="btn" id="ssExport" href="/api/targets/' + encodeURIComponent(id) + '/savedsearches.conf" target="_blank">Open as .conf</a>' +
+        '<button class="btn primary" id="ssImport" disabled>Create a scenario from these</button></div>' +
+        '<div id="ssBody" class="muted">Press Load.</div>'
+    });
+    let confText = "";
+    const load = async () => {
+      const app = ($("#ssApp").value || "").trim();
+      const q = app ? "?app=" + encodeURIComponent(app) : "";
+      $("#ssBody").innerHTML = '<p class="muted">Loading\u2026</p>';
+      try {
+        const rows = await api("/targets/" + encodeURIComponent(id) + "/savedsearches" + q);
+        $("#ssBody").innerHTML = savedRows(rows || []);
+        const res = await fetch("/api/targets/" + encodeURIComponent(id) + "/savedsearches.conf" + q, { credentials: "same-origin" });
+        confText = res.ok ? await res.text() : "";
+        $("#ssExport").href = "/api/targets/" + encodeURIComponent(id) + "/savedsearches.conf" + q;
+        $("#ssImport").disabled = !confText;
+      } catch (e) { $("#ssBody").innerHTML = '<p class="muted">' + esc(e.message) + "</p>"; }
+    };
+    $("#ssLoad").addEventListener("click", load);
+    $("#ssImport").addEventListener("click", () => { $("#dlg").close(); openImport(confText, (t.name || "target") + "-" + (($("#ssApp").value || "all").trim() || "all")); });
+  });
+}
+
+/* ---------- import a savedsearches.conf ---------- */
+function openImport(prefill, suggestedName){
+  const name = String(suggestedName || "imported").toLowerCase().replace(/[^a-z0-9_-]+/g, "-").replace(/^-+|-+$/g, "").slice(0, 60) || "imported";
+  dialog({
+    title: "Create a scenario from saved searches", wide: true,
+    html: '<p class="note">Paste a savedsearches.conf (any app\'s default/ or local/ file), or use the one loaded from a target. ' +
+      'Regulator keeps the file as it is and runs the searches from it. Preview first: it shows which searches would take part and why the rest would not.</p>' +
+      '<div class="grid2">' +
+      '<label class="f"><span>Scenario name</span><input type="text" id="imName" value="' + esc(name) + '"></label>' +
+      '<label class="f"><span>Load model</span><select id="imModel"><option value="closed">closed: virtual users sampling the searches, weighted by how often each is scheduled</option>' +
+      '<option value="schedule">schedule: every scheduled search fires on its own cron, as Splunk\'s scheduler would</option></select></label>' +
+      '<label class="f"><span>Virtual users (closed model)</span><input type="number" id="imVu" value="10" min="1"></label>' +
+      '<label class="f"><span>Duration in seconds</span><input type="number" id="imDur" value="600" min="1"></label>' +
+      '<label class="f"><span>Median think time in seconds (closed model)</span><input type="number" id="imThink" value="30" min="0"></label>' +
+      '<label class="f"><span>Corpus index (for the empty-corpus check)</span><input type="text" id="imIndex" value="main"></label>' +
+      '<label class="f"><span>Virtual clock start HH:MM (schedule model, blank for now)</span><input type="text" id="imStart" placeholder="09:00"></label>' +
+      '<label class="f"><span>Time ranges</span><select id="imTime"><option value="derived">derived: keep each search\'s window, roll it with jitter so the cache is not what is measured</option>' +
+      '<option value="as_saved">as saved: pass -24h@h and friends straight through, exactly as the scheduler runs them</option></select></label>' +
+      '</div>' +
+      '<label class="chk"><input type="checkbox" id="imEnabled" checked> Only enabled searches</label>' +
+      '<label class="chk"><input type="checkbox" id="imSched"> Only scheduled searches</label>' +
+      '<label class="chk"><input type="checkbox" id="imSide"> Allow searches that write somewhere (collect, outputlookup, sendemail). Off unless you mean it: a load test replays a search hundreds of times</label>' +
+      '<label class="f"><span>savedsearches.conf</span><textarea id="imConf" rows="12" spellcheck="false">' + esc(prefill || "") + "</textarea></label>" +
+      '<div id="imPreview"></div>',
+    actions: [
+      { label: "Preview", onClick: b => importPreview(b) },
+      { label: "Create scenario", kind: "primary", onClick: b => importCreate(b) }
+    ]
+  });
+}
+function importBody(){
+  return {
+    name: ($("#imName").value || "").trim(),
+    savedsearches: $("#imConf").value || "",
+    load_model: $("#imModel").value,
+    virtual_users: parseInt($("#imVu").value || "10", 10),
+    duration_s: parseFloat($("#imDur").value || "600"),
+    think_median_s: parseFloat($("#imThink").value || "30"),
+    index: ($("#imIndex").value || "main").trim(),
+    schedule_start: ($("#imStart").value || "").trim() || null,
+    time_from_saved: $("#imTime").value,
+    only_enabled: $("#imEnabled").checked,
+    only_scheduled: $("#imSched").checked || $("#imModel").value === "schedule",
+    allow_side_effects: $("#imSide").checked
+  };
+}
+async function importPreview(btn){
+  await busy(btn, async () => {
+    const rows = await api("/scenarios/preview", { method: "POST", body: importBody() });
+    const included = (rows || []).filter(r => !r.skipped_reason).length;
+    $("#imPreview").innerHTML = "<h3>" + fmtInt(included) + " of " + fmtInt((rows || []).length) + " searches would take part</h3>" + savedRows(rows || []);
+  });
+}
+async function importCreate(btn){
+  await busy(btn, async () => {
+    const created = await api("/scenarios", { method: "POST", body: importBody() });
+    $("#dlg").close();
+    toast("Scenario " + created.name + " created with " + fmtInt((created.saved_selected || []).length) + " searches", "ok");
+    state.scenarios = [];
+    location.hash = "#scenarios";
+    if (route() === "scenarios") render();
+  });
+}
+
 /* ---------- scenarios ---------- */
+async function viewScenarioDetail(name){
+  let d;
+  try { d = await api("/scenarios/" + encodeURIComponent(name)); }
+  catch (e) { toast(e.message); return; }
+  const steps = (d.steps || []).map(st =>
+    "<tr><td class='mono'>" + esc(st.persona) + "</td><td class='mono'>" + esc(st.id) + "</td><td><span class='tag'>" + esc(st.class) + "</span></td>" +
+    "<td class='mono'>" + esc(st.cron || "") + "</td><td class='num'>" + (st.weight ? fmtNum(st.weight, 2) : "") + "</td>" +
+    "<td class='mono small' style='white-space:pre-wrap;word-break:break-all'>" + esc(st.spl || (st.dashboard ? st.app + "/" + st.dashboard : "")) +
+    (st.saved ? '<br><span class="muted">from saved search ' + esc(st.saved) + (st.dispatch === "saved" ? ", dispatched by name on the target" : "") + "</span>" : "") + "</td></tr>").join("");
+  const skipped = Object.entries(d.saved_skipped || {}).map(([k, v]) => "<li><span class='mono'>" + esc(k) + "</span>: " + esc(v) + "</li>").join("");
+  const files = Object.entries(d.files || {}).map(([k, v]) => "<h3>" + esc(k) + "</h3><pre class='mono small' style='white-space:pre-wrap;max-height:260px;overflow:auto;background:var(--bg);padding:8px;border:1px solid var(--line);border-radius:4px'>" + esc(v) + "</pre>").join("");
+  dialog({
+    title: d.name, wide: true,
+    html: '<p>' + esc(d.description || "") + '</p><dl class="kv small"><dt>Origin</dt><dd>' + esc(d.origin) + '</dd><dt>Load model</dt><dd>' + esc(d.load_model) +
+      '</dd><dt>Digest</dt><dd>' + esc(d.digest || "") + '</dd><dt>Sourcetypes</dt><dd>' + esc((d.sourcetypes || []).join(", ") || "none declared") + "</dd></dl>" +
+      (d.runnable_here ? "" : '<div class="banner warn"><b>Not runnable from this control plane</b>' + esc(d.not_runnable_reason) + "</div>") +
+      "<h3>Steps</h3><div class='scroll'><table><thead><tr><th>Persona</th><th>Step</th><th>Class</th><th>Cron</th><th class='num'>Weight</th><th>Search</th></tr></thead><tbody>" + steps + "</tbody></table></div>" +
+      (skipped ? "<h3>Left out of the saved searches, and why</h3><ul class='small'>" + skipped + "</ul>" : "") + files,
+    actions: d.origin === "user" ? [{ label: "Delete scenario", kind: "danger", onClick: async b => {
+      await busy(b, async () => { await api("/scenarios/" + encodeURIComponent(name), { method: "DELETE" }); $("#dlg").close(); toast("Scenario deleted", "ok"); state.scenarios = []; render(); });
+    }}] : []
+  });
+}
 async function viewScenarios(){
-  setView('<div class="head"><h1>Scenarios</h1><button class="btn primary" data-act="launch">Launch a run</button></div>' +
+  setView('<div class="head"><h1>Scenarios</h1><div class="btns"><button class="btn" data-act="import">Import saved searches</button>' +
+    '<button class="btn primary" data-act="launch">Launch a run</button></div></div>' +
+    '<p class="note">A scenario is a directory: a scenario.yaml and, for imported workloads, the savedsearches.conf it was built from, in Splunk\'s own format. Built-in scenarios ship with the image; the ones you import live on the data volume.</p>' +
     '<div id="scenBody" class="muted">Loading scenarios\u2026</div>');
   let list;
   try { list = await api("/scenarios"); }
@@ -590,21 +737,24 @@ async function viewScenarios(){
     return;
   }
   $("#scenBody").innerHTML = '<div class="cards">' + state.scenarios.map(s =>
-    '<div class="card"><div class="t">' + esc(s.name) + "</div>" +
+    '<div class="card"><div class="t">' + esc(s.name) + (s.origin === "user" ? ' <span class="pill info">imported</span>' : "") + "</div>" +
     '<div class="small">' + esc(s.description || "No description.") + "</div>" +
     "<div>" + (s.tags || []).map(t => '<span class="tag">' + esc(t) + "</span>").join("") + "</div>" +
     '<dl class="kv small">' +
-    "<dt>Engine</dt><dd>" + esc(s.engine || "?") + "</dd>" +
-    "<dt>Shape</dt><dd>" + fmtInt(s.personas) + " personas, " + fmtInt(s.steps) + " steps</dd>" +
-    "<dt>Default load</dt><dd>" + fmtInt(s.virtual_users) + " users for " +
+    "<dt>Engine</dt><dd>" + esc(s.engine || "?") + " / " + esc(s.load_model || "closed") + "</dd>" +
+    "<dt>Shape</dt><dd>" + fmtInt(s.personas) + " personas, " + fmtInt(s.steps) + " steps" +
+      (s.saved_searches ? " (" + fmtInt(s.saved_searches) + " saved searches)" : "") + "</dd>" +
+    "<dt>Default load</dt><dd>" + (s.load_model === "schedule" ? "the schedule" : fmtInt(s.virtual_users) + " users") + " for " +
       (num(s.duration_s) ? "an unbounded run" : fmtDur(s.duration_s)) + "</dd>" +
-    "<dt>Corpus index</dt><dd>" + esc(s.index || "\u2013") + "</dd>" +
+    "<dt>Corpus</dt><dd>" + esc(s.index || "\u2013") + ((s.sourcetypes || []).length ? ": " + esc(s.sourcetypes.join(", ")) : "") + "</dd>" +
     "<dt>Needs packs</dt><dd>" + ((s.requires_packs || []).length ? esc(s.requires_packs.join(", ")) : "none") + "</dd>" +
     "</dl>" +
+    (s.runnable_here === false ? '<div class="note">' + esc(s.not_runnable_reason) + "</div>" : "") +
     // Lint findings are the difference between a run and a wasted hour, so they
     // sit on the card rather than behind a click.
     ((s.lint || []).length ? '<div class="note">Lint: ' + s.lint.map(esc).join("; ") + "</div>" : "") +
-    "<div class='btns'><button class='btn primary' data-act='run-scenario' data-scenario='" + esc(s.name) + "'>Run</button></div></div>"
+    "<div class='btns'><button class='btn primary' data-act='run-scenario' data-scenario='" + esc(s.name) + "'" + (s.runnable_here === false ? " disabled" : "") + ">Run</button>" +
+    "<button class='btn' data-act='scenario-detail' data-scenario='" + esc(s.name) + "'>Details</button></div></div>"
   ).join("") + "</div>";
 }
 
@@ -616,9 +766,12 @@ async function openLaunch(scenarioName){
   } catch (e) { if (e.status !== 401) toast(e.message); }
   if (!state.targets.length) { toast("Add a target before launching a run"); location.hash = "#targets"; return; }
   if (!state.scenarios.length) { toast("This server has no scenarios registered, so there is nothing to run"); return; }
+  const chosen = state.scenarios.find(x => x.name === scenarioName);
+  if (chosen && chosen.runnable_here === false) { toast(chosen.not_runnable_reason); return; }
   const tOpts = state.targets.map(t => '<option value="' + esc(t.id) + '">' + esc(t.name) + " (" + esc(t.mgmt_url) + ")</option>").join("");
   const sOpts = state.scenarios.map(s => '<option value="' + esc(s.name) + '"' +
-    (s.name === scenarioName ? " selected" : "") + ">" + esc(s.name) + "</option>").join("");
+    (s.name === scenarioName ? " selected" : "") + (s.runnable_here === false ? " disabled" : "") + ">" + esc(s.name) +
+    (s.runnable_here === false ? " (not runnable here)" : "") + "</option>").join("");
   // The dialog is built from strings, then wired with real listeners below: no inline handlers.
   dialog({
     title: "Launch a run",
@@ -630,6 +783,7 @@ async function openLaunch(scenarioName){
       '<label class="f"><span>Duration in seconds</span><input type="number" id="lqDur" min="1"></label>' +
       '<label class="f"><span>Pacing in seconds per iteration</span><input type="number" id="lqPace" min="0" step="0.1"></label>' +
       '<label class="f"><span>Arrival rate per minute (open model)</span><input type="number" id="lqRate" min="0" step="1"></label>' +
+      '<label class="f"><span>Seed (blank keeps the scenario\'s, so runs stay comparable)</span><input type="number" id="lqSeed" min="1"></label>' +
       "</div>" +
       '<p class="note">Pacing decides what the latency numbers mean: with pacing, iterations are scheduled against the wall clock and the run reports coordinated-omission-corrected latency, without it each user waits for its own response so the figures are service times.</p>' +
       '<label class="chk"><input type="checkbox" id="lqEvict"> Evict the SmartStore cache first (measures the cold path)</label>' +
@@ -658,7 +812,8 @@ async function onEvictToggle(){
     "Leave the list empty to let the scenario's own corpus index decide.</div>" +
     (names.length ? names.map(n => '<label class="chk"><input type="checkbox" class="lqIdxChk" value="' + esc(n) +
       '"> <span class="mono">' + esc(n) + "</span></label>").join("")
-      : '<p class="muted small">No per-index breakdown was returned for this target.</p>');
+      : '<p class="muted small">No per-index breakdown was returned for this target.</p>') +
+    '<label class="chk"><input type="checkbox" id="lqEvictAll"> <b style="color:var(--bad)">Every index</b> <span class="muted small">(the whole cache on this target)</span></label>';
 }
 async function submitLaunch(btn){
   // Target ids are integers on the wire, and a select always hands back a string.
@@ -669,12 +824,14 @@ async function submitLaunch(btn){
     if (v !== "") body[key] = asFloat ? parseFloat(v) : parseInt(v, 10);
   };
   opt("lqVu", "virtual_users"); opt("lqDur", "duration_s", true);
-  opt("lqPace", "pacing_s", true); opt("lqRate", "arrival_rate_per_min", true);
+  opt("lqPace", "pacing_s", true); opt("lqRate", "arrival_rate_per_min", true); opt("lqSeed", "seed");
   const label = ($("#lqLabel").value || "").trim();
   if (label) body.label = label;
   if ($("#lqEvict").checked) {
     body.evict_cache = true;
     body.evict_cache_indexes = Array.prototype.filter.call(document.querySelectorAll(".lqIdxChk"), i => i.checked).map(i => i.value);
+    const all = $("#lqEvictAll");
+    if (all && all.checked) body.evict_all_indexes = true;
   }
   await busy(btn, async () => {
     const run = await api("/runs", { method: "POST", body });
@@ -696,38 +853,42 @@ async function viewRuns(){
     return;
   }
   const rows = runs.map(r => {
-    const st = r.stats || {}, sm = r.summary || {};
-    const valid = sm.valid === false
-      ? '<span class="pill bad" title="' + esc(sm.invalid_reason || "") + '">invalid</span>'
+    const h = r.headline || {};
+    const valid = h.valid === false
+      ? '<span class="pill bad" title="' + esc(h.invalid_reason || "") + '">invalid</span>'
       : (r.state === "completed" ? '<span class="pill ok">valid</span>' : '<span class="pill idle">\u2013</span>');
+    const cache = h.cache_provenance ? '<span class="pill ' + (h.cache_provenance === "warm" ? "idle" : "warn") + '">' + esc(h.cache_provenance) + "</span>" : "";
     return "<tr class='clickable' data-run='" + esc(r.id) + "'><td>" + esc(r.label || "(no label)") + "</td>" +
-      "<td class='mono'>" + esc(r.scenario || "") + "</td><td>" + esc(r.target_name || r.target_id || "") + "</td>" +
+      "<td class='mono'>" + esc(r.scenario || "") + "</td><td>" + esc(r.target_name || (r.target_id ? r.target_id : "(deleted)")) + "</td>" +
       "<td>" + statePill(r.state) + "</td><td>" + fmtWhen(r.created_at) + "</td>" +
-      "<td class='num'>" + fmtInt(st.executions) + "</td>" +
-      "<td class='num'>" + fmtMs((st.latency || {}).p95_ms) + "</td>" +
-      "<td class='num'>" + fmtPct(st.error_rate_pct) + "</td><td>" + valid + "</td></tr>";
+      "<td class='num'>" + fmtInt(h.executions) + "</td>" +
+      "<td class='num'>" + fmtMs(h.p95_ms) + "</td>" +
+      "<td class='num'>" + fmtPct(h.error_rate_pct) + "</td>" +
+      "<td class='num'>" + fmtInt(h.searches_queued) + "</td><td>" + valid + " " + cache + "</td></tr>";
   }).join("");
   $("#runsBody").innerHTML = '<div class="panel scroll" style="padding:0"><table><thead><tr><th>Label</th><th>Scenario</th>' +
     "<th>Target</th><th>State</th><th>Started</th><th class='num'>Executions</th><th class='num'>p95</th>" +
-    "<th class='num'>Errors</th><th>Validity</th></tr></thead><tbody>" + rows + "</tbody></table></div>";
+    "<th class='num'>Errors</th><th class='num'>Queued</th><th>Validity</th></tr></thead><tbody>" + rows + "</tbody></table></div>";
 }
 
 /* ---------- run detail ---------- */
-function stopPolling(){ if (pollTimer) { clearTimeout(pollTimer); pollTimer = null; } }
+function stopPolling(){ pollGeneration += 1; if (pollTimer) { clearTimeout(pollTimer); pollTimer = null; } }
 async function viewRun(id){
   if (samplesRunId !== id) { samples = []; samplesRunId = id; }
   state.currentRun = id;
   setView('<div id="runWrap" class="muted">Loading run\u2026</div>');
-  await tickRun(id);
+  await tickRun(id, pollGeneration);
 }
-async function tickRun(id){
+async function tickRun(id, generation){
   let run;
   try { run = await api("/runs/" + encodeURIComponent(id)); }
   catch (e) {
-    if (e.status !== 401) { toast(e.message); const w = $("#runWrap"); if (w) w.innerHTML = '<p class="muted">' + esc(e.message) + "</p>"; }
+    if (e.status === 401) return;
+    // One transient failure must not end the live view for good: retry.
+    if (generation === pollGeneration && state.currentRun === id) pollTimer = setTimeout(() => tickRun(id, generation), 5000);
     return;
   }
-  if (state.currentRun !== id) return;   // the user navigated away mid-request
+  if (generation !== pollGeneration || state.currentRun !== id) return;   // the user navigated away mid-request
   const live = run.state === "running" || run.state === "pending";
   if (live) {
     const st = run.stats || {}, lat = st.latency || {};
@@ -737,7 +898,7 @@ async function tickRun(id){
     if (samples.length > 400) samples.shift();
   }
   drawRun(run);
-  if (live) pollTimer = setTimeout(() => tickRun(id), 2000);
+  if (live) pollTimer = setTimeout(() => tickRun(id, generation), 2000);
 }
 function drawRun(r){
   const st = r.stats || {}, sm = r.summary || {}, lat = st.latency || {}, q = st.queueing || {};
@@ -780,7 +941,29 @@ function drawRun(r){
     tile("p99", fmtMs(lat.p99_ms), "mean " + fmtMs(lat.mean_ms)) +
     tile("Error rate", fmtPct(st.error_rate_pct), "", errCls) +
     tile("Peak in flight", fmtInt(peak) + (num(ceiling) ? "" : " / " + fmtInt(ceiling)),
-      num(ceiling) ? "ceiling unknown" : "ceiling", atCeiling ? "bad" : "");
+      num(ceiling) ? "ceiling unknown" : "ceiling", atCeiling ? "bad" : "") +
+    (st.partial ? tile("Partial", fmtInt(st.partial), "finished with less than asked", "warn") : "") +
+    (st.abandoned ? tile("Abandoned", fmtInt(st.abandoned), "still running at the end", "warn") : "");
+  if (st.partial)
+    quiet.push('<div class="note">' + fmtInt(st.partial) + " search(es) finished DONE but reported incomplete results (a peer dropped out, a limit truncated them, or the dashboard did not honour the pinned time range). Their latency is real; their work was less than asked.</div>");
+  if (st.abandoned)
+    quiet.push('<div class="note">' + fmtInt(st.abandoned) + " search(es) were still in flight when the run ended and are recorded as cancelled failures with the time they had accrued, so the tail is a floor rather than a measurement.</div>");
+
+  // Per class: which part of the stack moved. The classes stress different
+  // components, and a p95 over all of them hides which one got slower.
+  const byClass = {};
+  (st.steps || []).forEach(sx => {
+    const k = sx.class || "unclassified";
+    const b = byClass[k] || (byClass[k] = { execs: 0, errors: 0, worst: null, steps: 0 });
+    b.execs += sx.executions || 0; b.errors += sx.errors || 0; b.steps += 1;
+    const p = (sx.latency || {}).p95_ms;
+    if (!num(p) && (b.worst === null || p > b.worst)) b.worst = p;
+  });
+  const classRows = Object.keys(byClass).sort().map(k => {
+    const b = byClass[k];
+    return "<tr><td><span class='tag'>" + esc(k) + "</span></td><td class='num'>" + fmtInt(b.steps) + "</td><td class='num'>" + fmtInt(b.execs) +
+      "</td><td class='num'>" + fmtPct(b.execs ? 100 * b.errors / b.execs : null) + "</td><td class='num'>" + fmtMs(b.worst) + "</td></tr>";
+  }).join("");
 
   const steps = (st.steps || []).slice().sort((a, b) =>
     ((b.latency || {}).p95_ms || 0) - ((a.latency || {}).p95_ms || 0));
@@ -801,14 +984,22 @@ function drawRun(r){
     '<div class="muted small mono">' + esc(r.scenario || "") + " against " + esc(r.target_name || r.target_id || "?") +
     " \u00b7 id " + esc(r.id) + " \u00b7 started " + fmtWhen(r.started_at || r.created_at) +
     (elapsed === null ? "" : " \u00b7 elapsed " + fmtDur(elapsed)) +
-    (sm.outcome ? " \u00b7 outcome " + esc(sm.outcome) : "") + "</div></div>" +
+    (sm.outcome ? " \u00b7 outcome " + esc(sm.outcome) : "") +
+    (sm.load_model ? " \u00b7 " + esc(sm.load_model) + " model" : "") +
+    (num(sm.effective_seed) ? "" : " \u00b7 seed " + esc(sm.effective_seed)) +
+    (sm.scenario_digest ? " \u00b7 digest " + esc(sm.scenario_digest) : "") + "</div></div>" +
     '<div class="btns"><a class="btn" href="#runs">All runs</a>' +
-    (live ? '<button class="btn danger" data-act="stop-run" data-id="' + esc(r.id) + '">Stop</button>' : "") + "</div></div>" +
+    (live ? '<button class="btn danger" data-act="stop-run" data-id="' + esc(r.id) + '">Stop</button>'
+      : (r.state === "completed" ? '<button class="btn" data-act="promote" data-id="' + esc(r.id) + '">Make baseline</button>' +
+        '<button class="btn" data-act="compare" data-id="' + esc(r.id) + '">Compare</button>' : "")) +
+    '<button class="btn" data-act="copy-summary">Copy JSON</button></div></div>' +
     banners.join("") + quiet.join("") +
     '<div class="tiles">' + tiles + "</div>" +
     (num(sm.peak_virtual_users) ? "" : '<div class="note">Peak virtual users: ' + fmtInt(sm.peak_virtual_users) +
       ". Virtual users are not concurrent searches: a user idles between iterations, so the in-flight figure is the one to compare against the ceiling.</div>") +
     '<div class="chart"><h3 style="margin-top:0">Latency over the run</h3>' + chartSvg(live) + "</div>" +
+    (classRows ? '<div class="panel" style="padding:0"><table><thead><tr><th>Class</th><th class="num">Steps</th><th class="num">Execs</th><th class="num">Err %</th><th class="num">Worst p95</th></tr></thead><tbody>' + classRows + "</tbody></table></div>" : "") +
+    '<div id="compareBox"></div>' +
     sutSection(sm.sut) +
     "<h3>Steps, worst p95 first</h3>" +
     (stepRows ? '<div class="panel scroll" style="padding:0"><table><thead><tr><th>Step</th><th>Class</th>' +
@@ -819,6 +1010,84 @@ function drawRun(r){
   const wrap = $("#runWrap");
   if (wrap) wrap.outerHTML = '<div id="runWrap">' + html + "</div>";
   else if ($("#view")) $("#view").innerHTML = '<div id="runWrap">' + html + "</div>";
+  state.lastJson = JSON.stringify(sm && Object.keys(sm).length ? sm : r, null, 2);
+}
+
+/* ---------- baselines and comparison ---------- */
+async function actPromote(btn, id){
+  dialog({
+    title: "Make this run a baseline",
+    html: '<p class="note">A baseline is a label pointing at a run. A pipeline compares against the label, so promoting a newer run moves it without touching the pipeline.</p>' +
+      '<label class="f"><span>Label</span><input type="text" id="blLabel" placeholder="main-green"></label>' +
+      '<label class="f"><span>Note (optional)</span><input type="text" id="blNote"></label>',
+    actions: [{ label: "Promote", kind: "primary", onClick: async b => {
+      await busy(b, async () => {
+        const label = ($("#blLabel").value || "").trim();
+        if (!label) { toast("Give the baseline a label"); return; }
+        await api("/baselines", { method: "POST", body: { run_id: parseInt(id, 10), label, note: ($("#blNote").value || "").trim() || null } });
+        $("#dlg").close(); toast("Baseline " + label + " now points at run " + id, "ok");
+      });
+    }}]
+  });
+}
+async function actCompare(btn, id){
+  let baselines = [];
+  try { baselines = (await api("/baselines")) || []; } catch (e) { if (e.status !== 401) toast(e.message); }
+  const opts = baselines.map(b => '<option value="' + esc(b.label) + '">' + esc(b.label) + " (run " + esc(b.run_id) + ", " + esc(b.scenario) + ")</option>").join("");
+  dialog({
+    title: "Compare run " + id + " against a baseline",
+    html: (opts ? '<label class="f"><span>Baseline</span><select id="cmpLabel">' + opts + "</select></label>"
+      : '<p class="muted">No baselines yet. Make one from a completed run first, or compare against absolute gates only.</p>') +
+      '<label class="f"><span>Gates, one per line (blank reports without judging)</span><textarea id="cmpGates" rows="4" spellcheck="false">p95 <= baseline + 15%\nerror_rate <= 2%\nqueued == 0\nvalid</textarea></label>',
+    actions: [{ label: "Compare", kind: "primary", onClick: async b => {
+      await busy(b, async () => {
+        const gates = ($("#cmpGates").value || "").split("\n").map(x => x.trim()).filter(Boolean);
+        const body = { gates };
+        const sel = $("#cmpLabel"); if (sel && sel.value) body.baseline_label = sel.value;
+        const r = await api("/runs/" + encodeURIComponent(id) + "/compare", { method: "POST", body });
+        $("#dlg").close();
+        renderComparison(r);
+      });
+    }}]
+  });
+}
+function renderComparison(c){
+  const box = $("#compareBox"); if (!box) return;
+  const gates = (c.gates || []).map(g => "<tr><td class='mono'>" + esc(g.gate) + "</td><td>" + (g.passed ? '<span class="pill ok">ok</span>' : '<span class="pill bad">FAIL</span>') +
+    "</td><td class='small'>" + esc(g.detail) + "</td></tr>").join("");
+  const steps = (c.steps || []).filter(sx => !num(sx.candidate_p95_ms) && !num(sx.baseline_p95_ms)).sort((a, b) => (b.delta_pct || 0) - (a.delta_pct || 0)).map(sx =>
+    "<tr><td class='mono'>" + esc(sx.step_id) + "</td><td class='num'>" + fmtMs(sx.baseline_p95_ms) + "</td><td class='num'>" + fmtMs(sx.candidate_p95_ms) +
+    "</td><td class='num'>" + (num(sx.delta_pct) ? "\u2013" : (sx.delta_pct > 0 ? "+" : "") + fmtNum(sx.delta_pct, 1) + "%") +
+    "</td><td>" + (sx.scanned_more ? '<span class="pill warn">scanned more</span> ' : "") + (sx.too_few_samples ? '<span class="pill idle">few samples</span>' : "") + "</td></tr>").join("");
+  box.innerHTML = '<div class="panel"><h3 style="margin-top:0">Comparison' + (c.baseline_run_id ? " against run " + esc(c.baseline_run_id) : "") + "</h3>" +
+    (c.blocked ? '<div class="banner bad"><b>Blocked</b>' + esc(c.blocked) + "</div>" :
+      ((c.gates || []).length ? '<div class="banner ' + (c.ok ? "info" : "bad") + '"><b>' + (c.ok ? "Every gate met" : "A gate was breached") + "</b></div>"
+        : '<div class="banner info"><b>Report only</b>No gates were given, so nothing was judged.</div>')) +
+    (c.warnings || []).map(w => '<div class="note">' + esc(w) + "</div>").join("") +
+    (gates ? "<table><thead><tr><th>Gate</th><th></th><th>Detail</th></tr></thead><tbody>" + gates + "</tbody></table>" : "") +
+    (steps ? "<h3>Per step, p95</h3><div class='scroll'><table><thead><tr><th>Step</th><th class='num'>Baseline</th><th class='num'>Candidate</th><th class='num'>Delta</th><th></th></tr></thead><tbody>" + steps + "</tbody></table></div>" : "") +
+    "</div>";
+  box.scrollIntoView({ behavior: "smooth", block: "start" });
+}
+async function viewBaselines(){
+  setView('<div class="head"><h1>Baselines</h1></div><p class="note">A label a pipeline compares against. Promote a completed run from its detail page.</p><div id="blBody" class="muted">Loading\u2026</div>');
+  let list;
+  try { list = await api("/baselines"); }
+  catch (e) { if (e.status !== 401) { $("#blBody").innerHTML = '<p class="muted">' + esc(e.message) + "</p>"; } return; }
+  const rows = (list || []).map(b => "<tr><td class='mono'>" + esc(b.label) + "</td><td class='clickable mono' data-run='" + esc(b.run_id) + "'>run " + esc(b.run_id) + "</td><td class='mono'>" + esc(b.scenario) +
+    "</td><td>" + fmtWhen(b.created_at) + "</td><td>" + esc(b.note || "") + "</td><td><button class='btn danger' data-act='delete-baseline' data-label='" + esc(b.label) + "'>Delete</button></td></tr>").join("");
+  $("#blBody").innerHTML = rows ? '<div class="panel scroll" style="padding:0"><table><thead><tr><th>Label</th><th>Run</th><th>Scenario</th><th>Made</th><th>Note</th><th></th></tr></thead><tbody>' + rows + "</tbody></table></div>"
+    : '<div class="panel"><p class="muted">No baselines yet.</p></div>';
+}
+async function viewAudit(){
+  setView('<div class="head"><h1>Audit</h1></div><p class="note">Who did what: logins, launches, stops, evictions and scenario changes, with the caller\'s address and how they authenticated.</p><div id="auBody" class="muted">Loading\u2026</div>');
+  let r;
+  try { r = await api("/audit"); }
+  catch (e) { if (e.status !== 401) { $("#auBody").innerHTML = '<p class="muted">' + esc(e.message) + "</p>"; } return; }
+  const rows = ((r && r.events) || []).map(e => "<tr><td>" + fmtWhen(e.at) + "</td><td class='mono'>" + esc(e.action) + "</td><td>" + esc(e.actor) + "</td><td class='mono'>" + esc(e.client || "") +
+    "</td><td>" + (num(e.target_id) ? "" : "target " + esc(e.target_id)) + "</td><td class='small'>" + esc(e.detail || "") + "</td></tr>").join("");
+  $("#auBody").innerHTML = rows ? '<div class="panel scroll" style="padding:0"><table><thead><tr><th>When</th><th>Action</th><th>Actor</th><th>From</th><th>Target</th><th>Detail</th></tr></thead><tbody>' + rows + "</tbody></table></div>"
+    : '<div class="panel"><p class="muted">Nothing recorded yet.</p></div>';
 }
 // What the cluster itself said about the run. This is the half no client-side
 // timing can produce: whether the time went to the indexers, whether somebody
@@ -912,6 +1181,8 @@ async function render(){
     if (r.indexOf("run/") === 0) await viewRun(decodeURIComponent(r.slice(4)));
     else if (r === "scenarios") await viewScenarios();
     else if (r === "runs") await viewRuns();
+    else if (r === "baselines") await viewBaselines();
+    else if (r === "audit") await viewAudit();
     else await viewTargets();
   } catch (e) {
     if (!(e instanceof ApiError) || e.status !== 401) { toast(e.message); console.error(e); }
@@ -974,7 +1245,16 @@ const actions = {
   "delete": (b, el) => actDelete(b, el.dataset.id),
   "launch": () => openLaunch(null),
   "run-scenario": (b, el) => openLaunch(el.dataset.scenario),
+  "scenario-detail": (b, el) => viewScenarioDetail(el.dataset.scenario),
+  "import": () => openImport("", "imported"),
+  "saved": (b, el) => actSaved(b, el.dataset.id),
   "stop-run": (b, el) => actStop(b, el.dataset.id),
+  "promote": (b, el) => actPromote(b, el.dataset.id),
+  "compare": (b, el) => actCompare(b, el.dataset.id),
+  "copy-summary": b => copyLastJson(b),
+  "delete-baseline": async (b, el) => {
+    await busy(b, async () => { await api("/baselines/" + encodeURIComponent(el.dataset.label), { method: "DELETE" }); toast("Baseline deleted", "ok"); render(); });
+  },
   "logout": async b => {
     await busy(b, async () => { try { await api("/auth/logout", { method: "POST" }); } catch (e) {} showLogin(); });
   }

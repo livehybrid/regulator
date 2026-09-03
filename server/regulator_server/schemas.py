@@ -46,6 +46,28 @@ class TargetCreate(BaseModel):
     app: str = "search"
     owner: str = "nobody"
     api_version: str = "v2"
+    # SmartStore state lives on the indexers. On a distributed target these
+    # say where they are and how to log in; empty means discover the search
+    # peers and reuse the target's own credential on each.
+    indexer_urls: List[str] = Field(default_factory=list)
+    indexer_token: Optional[str] = None
+    indexer_username: Optional[str] = None
+    indexer_password: Optional[str] = None
+
+    @field_validator("indexer_urls")
+    @classmethod
+    def _indexers_http_only(cls, value: List[str]) -> List[str]:
+        cleaned = []
+        for url in value:
+            url = (url or "").strip()
+            if not url:
+                continue
+            if not (url.startswith("http://") or url.startswith("https://")):
+                raise ValueError(f"indexer URL {url!r} must start with http:// or https://")
+            if urlsplit(url).username or urlsplit(url).password:
+                raise ValueError("an indexer URL must not embed a credential")
+            cleaned.append(url.rstrip("/"))
+        return cleaned
 
     @field_validator("mgmt_url", "web_url")
     @classmethod
@@ -93,8 +115,10 @@ class TargetOut(BaseModel):
     created_at: float
     health: str
     health_detail: Optional[str]
-    # Deliberately absent: token, username, password. There is no field to
-    # accidentally populate.
+    indexer_urls: Optional[str] = None
+    indexer_username: Optional[str] = None
+    # Deliberately absent: token, username, password, and their indexer
+    # counterparts. There is no field to accidentally populate.
 
 
 class TargetTestResult(BaseModel):
@@ -123,27 +147,112 @@ class ScenarioOut(BaseModel):
     name: str
     description: str
     engine: str
+    origin: str = "builtin"
     tags: List[str] = Field(default_factory=list)
     personas: int
     steps: int
+    saved_searches: int = 0
+    load_model: str = "closed"
     virtual_users: int
     duration_s: Optional[float] = None
     requires_packs: List[str] = Field(default_factory=list)
+    sourcetypes: List[str] = Field(default_factory=list)
     index: str
     seed: int
+    digest: Optional[str] = None
+    runnable_here: bool = True
+    not_runnable_reason: str = ""
     lint: List[str] = Field(default_factory=list)
+
+
+class ScenarioCreate(BaseModel):
+    """A scenario built from a savedsearches.conf.
+
+    The conf text is stored verbatim next to a generated scenario.yaml, so
+    what runs is exactly what was pasted, in Splunk's own format.
+    """
+
+    name: str
+    savedsearches: str = Field(min_length=1, max_length=4_000_000)
+    description: str = ""
+    app: Optional[str] = None
+    # closed: virtual users sampling the searches by cron weight.
+    # schedule: every scheduled search fires on its own cron.
+    load_model: str = "closed"
+    virtual_users: int = Field(default=10, ge=1)
+    duration_s: float = Field(default=600.0, gt=0)
+    only_enabled: bool = True
+    only_scheduled: bool = False
+    allow_side_effects: bool = False
+    time_from_saved: str = "derived"
+    index: str = "main"
+    seed: int = Field(default=0, ge=0)
+    think_median_s: float = Field(default=30.0, ge=0)
+    schedule_start: Optional[str] = None
+
+    @field_validator("name")
+    @classmethod
+    def _safe_name(cls, value: str) -> str:
+        if not re.match(r"^[a-z0-9][a-z0-9_-]{0,63}$", value):
+            raise ValueError(
+                "a scenario name is lowercase letters, digits, dashes and underscores, up "
+                "to 64 characters"
+            )
+        return value
+
+    @field_validator("load_model")
+    @classmethod
+    def _known_model(cls, value: str) -> str:
+        if value not in ("closed", "schedule"):
+            raise ValueError("load_model must be closed or schedule")
+        return value
+
+    @field_validator("time_from_saved")
+    @classmethod
+    def _known_time_mode(cls, value: str) -> str:
+        if value not in ("derived", "as_saved"):
+            raise ValueError("time_from_saved must be derived or as_saved")
+        return value
+
+    @field_validator("schedule_start")
+    @classmethod
+    def _hhmm(cls, value: Optional[str]) -> Optional[str]:
+        if value is None or value == "":
+            return None
+        if not re.match(r"^\d{1,2}:\d{2}$", value):
+            raise ValueError("schedule_start must be HH:MM")
+        return value
+
+
+class SavedSearchPreview(BaseModel):
+    name: str
+    app: Optional[str]
+    search: str
+    cron: Optional[str]
+    scheduled: bool
+    disabled: bool
+    earliest: str
+    latest: str
+    guessed_class: str
+    side_effects: List[str] = Field(default_factory=list)
+    firings_per_day: Optional[float] = None
+    skipped_reason: Optional[str] = None
 
 
 class RunCreate(BaseModel):
     target_id: int
     scenario: str
     label: Optional[str] = None
-    virtual_users: Optional[int] = Field(default=None, ge=1)
-    duration_s: Optional[float] = Field(default=None, gt=0)
-    arrival_rate_per_min: Optional[float] = Field(default=None, gt=0)
-    pacing_s: Optional[float] = Field(default=None, ge=0)
+    virtual_users: Optional[int] = Field(default=None, ge=1, le=100_000)
+    # Bounded, and finite: json accepts the non-standard Infinity literal
+    # and gt=0 let it through, so a run could occupy a slot for ever.
+    duration_s: Optional[float] = Field(default=None, gt=0, le=7 * 86400, allow_inf_nan=False)
+    arrival_rate_per_min: Optional[float] = Field(default=None, gt=0, le=1_000_000, allow_inf_nan=False)
+    pacing_s: Optional[float] = Field(default=None, ge=0, le=86400, allow_inf_nan=False)
+    seed: Optional[int] = Field(default=None, ge=1)
     evict_cache: bool = False
     evict_cache_indexes: List[str] = Field(default_factory=list)
+    evict_all_indexes: bool = False
 
     @field_validator("scenario")
     @classmethod
@@ -175,6 +284,9 @@ class RunCreate(BaseModel):
                 "set virtual_users (closed model) or arrival_rate_per_min (open model), "
                 "not both"
             )
+        for name in self.evict_cache_indexes:
+            if not re.match(r"^[A-Za-z0-9_:.-]{1,128}$", name or ""):
+                raise ValueError(f"index name {name!r} is not a valid Splunk index name")
 
 
 class RunOut(BaseModel):
@@ -182,12 +294,14 @@ class RunOut(BaseModel):
 
     id: int
     label: Optional[str]
-    target_id: int
+    target_id: Optional[int]
     target_name: Optional[str] = None
     scenario: str
     state: str
     virtual_users: Optional[int]
     duration_s: Optional[float]
+    seed: Optional[int] = None
+    scenario_digest: Optional[str] = None
     created_at: float
     started_at: Optional[float]
     ended_at: Optional[float]

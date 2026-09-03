@@ -55,10 +55,11 @@ def client(tmp_path, monkeypatch):
             master_key_generated=False,
             admin_password=None,
             session_ttl_s=3600,
-            port=8080,
             scenarios_dir=str(REPO / "scenarios"),
+            user_scenarios_dir=str(tmp_path / "user-scenarios"),
             max_virtual_users=50,
             max_concurrent_runs=2,
+            allow_unauthenticated=True,
         )
     )
     db.reset_engine()
@@ -406,8 +407,8 @@ def test_with_a_password_set_the_api_is_closed(tmp_path, splunkd):
             master_key_generated=False,
             admin_password="letmein",
             session_ttl_s=3600,
-            port=8080,
             scenarios_dir=str(REPO / "scenarios"),
+            user_scenarios_dir=str(tmp_path / "user-scenarios"),
             max_virtual_users=50,
             max_concurrent_runs=2,
         )

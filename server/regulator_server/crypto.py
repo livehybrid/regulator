@@ -56,8 +56,13 @@ def decrypt(value: Optional[str]) -> Optional[str]:
 def _session_serializer() -> URLSafeTimedSerializer:
     # Domain-separated from the Fernet key so a session cookie signature and a
     # credential ciphertext never share key material.
+    # The password is part of the key material on purpose: rotating the
+    # admin password must invalidate every session issued under the old one,
+    # otherwise a copied cookie outlives the credential it was minted with.
+    settings = get_settings()
     secret = hashlib.blake2b(
-        (SESSION_DOMAIN + get_settings().master_key).encode(), digest_size=32
+        (SESSION_DOMAIN + settings.master_key + "|" + (settings.admin_password or "")).encode(),
+        digest_size=32,
     ).hexdigest()
     return URLSafeTimedSerializer(secret, salt=SESSION_DOMAIN)
 

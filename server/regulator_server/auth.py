@@ -65,16 +65,62 @@ def clear_session(response: Response) -> None:
     response.delete_cookie(SESSION_COOKIE)
 
 
+def bearer_matches(request: Request) -> bool:
+    """An ``Authorization: Bearer`` header naming one of the configured API tokens.
+
+    This is what a pipeline uses. The GitHub Action presents one, and so can
+    curl. Compared in constant time against every configured token, so the
+    endpoint does not leak which prefix was right.
+    """
+    header = request.headers.get("authorization", "")
+    if not header.lower().startswith("bearer "):
+        return False
+    presented = header[7:].strip().encode()
+    matched = False
+    for token in get_settings().api_tokens:
+        # Every candidate is compared so the timing does not depend on which
+        # token, if any, was the right one.
+        if hmac.compare_digest(presented, token.encode()):
+            matched = True
+    return matched
+
+
 def is_authenticated(request: Request) -> bool:
     settings = get_settings()
     if not settings.auth_enabled:
-        # No password configured: everything is permitted, and /api/auth/status
+        # Nothing configured: everything is permitted, and /api/auth/status
         # reports setup_needed so the UI can say so out loud.
+        return True
+    if bearer_matches(request):
         return True
     token = request.cookies.get(SESSION_COOKIE)
     if not token:
         return False
     return verify_session(token, settings.session_ttl_s) is not None
+
+
+# A small, honest throttle on the one password. Not a substitute for putting
+# the control plane behind something that rate-limits properly, but enough
+# that a script cannot try a wordlist against a service that can evict a
+# production cache. In-memory and per process, which is the deployment shape.
+_FAILURES: dict[str, list[float]] = {}
+LOGIN_WINDOW_S = 300.0
+LOGIN_MAX_FAILURES = 8
+
+
+def login_allowed(client: str) -> bool:
+    now = time.time()
+    recent = [t for t in _FAILURES.get(client, []) if now - t < LOGIN_WINDOW_S]
+    _FAILURES[client] = recent
+    return len(recent) < LOGIN_MAX_FAILURES
+
+
+def record_login_failure(client: str) -> None:
+    _FAILURES.setdefault(client, []).append(time.time())
+
+
+def record_login_success(client: str) -> None:
+    _FAILURES.pop(client, None)
 
 
 def path_is_exempt(path: str) -> bool:
@@ -84,6 +130,15 @@ def path_is_exempt(path: str) -> bool:
 def warn_if_open() -> None:
     settings = get_settings()
     if not settings.auth_enabled:
+        if not settings.allow_unauthenticated:
+            # Refusing is the safe default. An unauthenticated control plane
+            # on a network interface is an unauthenticated HTTP client into
+            # that network with the response echoed back, plus the buttons.
+            raise RuntimeError(
+                "refusing to start with no authentication: set REG_ADMIN_PASSWORD (or "
+                "REG_API_TOKENS), or set REG_ALLOW_UNAUTHENTICATED=1 if this really is a "
+                "laptop on a network you control"
+            )
         log.warning(
             "SECURITY: REG_ADMIN_PASSWORD is not set, so this control plane is "
             "unauthenticated. It can evict a SmartStore cache and drive a cluster to "

@@ -52,7 +52,14 @@ class Target(Base):
     health_detail: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     last_report_json: Mapped[Optional[Dict[str, Any]]] = mapped_column(JSON, nullable=True)
 
-    runs: Mapped[list["Run"]] = relationship(back_populates="target")
+    runs: Mapped[list["Run"]] = relationship(back_populates="target", passive_deletes=True)
+    # Indexer management URIs for SmartStore state on a distributed target,
+    # comma separated. Empty means discover the search peers and reuse this
+    # target's credential on each of them.
+    indexer_urls: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    indexer_token_encrypted: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    indexer_username: Mapped[Optional[str]] = mapped_column(String(128), nullable=True)
+    indexer_password_encrypted: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
 
 
 class Run(Base):
@@ -69,7 +76,13 @@ class Run(Base):
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     label: Mapped[Optional[str]] = mapped_column(String(128), nullable=True)
-    target_id: Mapped[int] = mapped_column(ForeignKey("targets.id", ondelete="CASCADE"))
+    # Nullable, and SET NULL rather than CASCADE: a run is a measurement that
+    # outlives the target it was taken against. Deleting a target keeps its
+    # history and only loses the name, which the summary carries anyway as
+    # target_url.
+    target_id: Mapped[Optional[int]] = mapped_column(
+        ForeignKey("targets.id", ondelete="SET NULL"), nullable=True
+    )
     scenario: Mapped[str] = mapped_column(String(128))
 
     state: Mapped[str] = mapped_column(String(16), default="pending")
@@ -88,7 +101,32 @@ class Run(Base):
     summary_json: Mapped[Optional[Dict[str, Any]]] = mapped_column(JSON, nullable=True)
     error: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
 
-    target: Mapped[Target] = relationship(back_populates="runs")
+    target: Mapped[Optional[Target]] = relationship(back_populates="runs")
+    # The seed the run actually used (an override may differ from the
+    # scenario's), and a digest of the scenario files, so two runs can be
+    # proven to have been the same test.
+    seed: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    scenario_digest: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
+
+
+class AuditEvent(Base):
+    """Who did what to which target.
+
+    Eviction has no undo and a run can saturate a production cluster, so the
+    question "who pressed that at 14:20" must be answerable after the log has
+    rotated. One row per state-changing action, with the caller's address and
+    how they authenticated.
+    """
+
+    __tablename__ = "audit_events"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    at: Mapped[float] = mapped_column(Float, default=time.time)
+    actor: Mapped[str] = mapped_column(String(64))
+    client: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
+    action: Mapped[str] = mapped_column(String(64))
+    target_id: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    detail: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
 
 
 class Baseline(Base):
