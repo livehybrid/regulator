@@ -36,7 +36,7 @@ import signal
 import sys
 import time
 from pathlib import Path
-from typing import List, Optional
+from typing import Any, List, Optional
 
 from .compare import GateError, compare_runs
 from .config import Config, ConfigError, load_config
@@ -48,7 +48,7 @@ from .smartstore import CacheState, cache_state, delta as cache_delta, evict_all
 from .sut import correlate, marker_prefix_for
 from .smartstore import render as render_cache
 from .results import NdjsonEmitter, RunStats, RunSummary
-from .scenario import ScenarioError, is_advice, lint, load_scenario
+from .scenario import ScenarioError, is_advice, lint, load_scenario, scenario_digest
 from .scheduler import Scheduler
 
 EXIT_OK = 0
@@ -117,6 +117,11 @@ def _report_lint(problems: List[str], strict: bool, what: str) -> bool:
     return True
 
 
+def _ms(value: Any) -> str:
+    """Format a millisecond figure that may be None (no successful samples yet)."""
+    return "n/a" if value is None else f"{value:.0f}ms"
+
+
 async def _progress(stats: RunStats, stop: asyncio.Event) -> None:
     """A human-readable heartbeat on stderr while the run is in flight."""
     while not stop.is_set():
@@ -126,14 +131,14 @@ async def _progress(stats: RunStats, stop: asyncio.Event) -> None:
         snap = stats.snapshot()
         latency = snap["latency"]
         log.info(
-            "t=%.0fs executions=%d in_flight=%d throughput=%.1f/s p50=%.0fms p95=%.0fms "
+            "t=%.0fs executions=%d in_flight=%d throughput=%.1f/s p50=%s p95=%s "
             "errors=%.1f%%",
             snap["elapsed_s"],
             snap["executions"],
             snap["in_flight"],
             snap["throughput_per_s"],
-            latency["p50_ms"],
-            latency["p95_ms"],
+            _ms(latency["p50_ms"]),
+            _ms(latency["p95_ms"]),
             snap["error_rate_pct"],
         )
 
@@ -160,24 +165,26 @@ async def _do_evict(config: Config, args: argparse.Namespace) -> int:
         return EXIT_FAILED
 
     engine = get_engine("api", config)
+    where = _indexer_kwargs(config)
     try:
         await engine.start()
 
-        before = await cache_state(engine.client)
+        before = await cache_state(engine.client, **where)
         if not before.available:
             log.error("no SmartStore cache to evict: %s", before.reason)
             return EXIT_FAILED
 
         sys.stderr.write("before:\n" + render_cache(before) + "\n")
 
-        result = await evict_all(engine.client, indexes=indexes or None)
-        after = await cache_state(engine.client)
+        result = await evict_all(engine.client, indexes=indexes or None, **where)
+        after = await cache_state(engine.client, **where)
 
         sys.stderr.write("after:\n" + render_cache(after) + "\n")
         log.info(
-            "evicted %d of %d bucket(s), %.1f GB. Local buckets %d -> %d",
+            "evicted %d of %d bucket(s) (%d confirmed gone), %.1f GB. Local buckets %d -> %d",
             result.evicted,
             result.attempted,
+            result.confirmed,
             result.bytes_evicted / 1e9,
             before.local_buckets,
             after.local_buckets,
@@ -207,6 +214,16 @@ async def _do_evict(config: Config, args: argparse.Namespace) -> int:
     finally:
         with contextlib.suppress(Exception):
             await engine.close()
+
+
+def _indexer_kwargs(config: Config) -> dict:
+    """Where the SmartStore cache lives, for a distributed target."""
+    return {
+        "indexer_urls": config.indexer_urls,
+        "indexer_token": config.indexer_token,
+        "indexer_username": config.indexer_username,
+        "indexer_password": config.indexer_password,
+    }
 
 
 def _do_compare(args: argparse.Namespace) -> int:
@@ -249,6 +266,26 @@ def _do_compare(args: argparse.Namespace) -> int:
     return EXIT_OK if result.ok else EXIT_GUARD_RAIL
 
 
+def _library_summaries(config: Config) -> List[dict]:
+    """Name and sourcetypes of every built-in scenario, for the fit table."""
+    root = Path(config.builtin_scenarios_dir) if config.builtin_scenarios_dir else None
+    if root is None or not root.is_dir():
+        here = Path(__file__).resolve().parents[2] / "scenarios"
+        root = here if here.is_dir() else None
+    if root is None:
+        return []
+    found = []
+    for child in sorted(root.iterdir()):
+        if not (child / "scenario.yaml").is_file():
+            continue
+        try:
+            scenario = load_scenario(child)
+        except Exception:  # noqa: BLE001 - a broken scenario is not this command's problem
+            continue
+        found.append({"name": scenario.name, "sourcetypes": list(scenario.corpus.sourcetypes)})
+    return found
+
+
 async def _describe_target(config: Config) -> int:
     """Report on the target and exit. Needs no scenario.
 
@@ -259,7 +296,9 @@ async def _describe_target(config: Config) -> int:
     engine = get_engine("api", config)
     try:
         await engine.start()
-        report = await target_report(engine.client)
+        report = await target_report(
+            engine.client, scenarios=_library_summaries(config), **_indexer_kwargs(config)
+        )
     finally:
         with contextlib.suppress(Exception):
             await engine.close()
@@ -269,6 +308,21 @@ async def _describe_target(config: Config) -> int:
     return EXIT_OK if report.get("can_dispatch") else EXIT_FAILED
 
 
+async def _probe_only(config: Config) -> int:
+    """Report the target's version, roles and ceiling, and exit. Needs no scenario."""
+    engine = get_engine("api", config)
+    try:
+        await engine.start()
+        capabilities = await engine.probe()
+    finally:
+        with contextlib.suppress(Exception):
+            await engine.close()
+    for note in capabilities.notes:
+        log.warning("target: %s", note)
+    print(json.dumps(capabilities.to_dict(), indent=2))
+    return EXIT_OK
+
+
 async def _run(config: Config, args: argparse.Namespace) -> int:
     if args.evict_cache:
         return await _do_evict(config, args)
@@ -276,11 +330,22 @@ async def _run(config: Config, args: argparse.Namespace) -> int:
     if args.target_report:
         return await _describe_target(config)
 
-    scenario_path = _resolve_scenario_path(config)
-    scenario = load_scenario(scenario_path)
+    if args.probe_only:
+        # Ahead of the scenario, like the other two: it answers a question
+        # about the target and demanding a runnable scenario first turned a
+        # one-line probe into a lint exercise, or a traceback from a checkout
+        # where the bare scenario name resolves to nothing.
+        return await _probe_only(config)
+
+    try:
+        scenario_path = _resolve_scenario_path(config)
+        scenario = load_scenario(scenario_path)
+    except ScenarioError as exc:
+        log.error("scenario: %s", exc)
+        return EXIT_LINT
     log.info("scenario %s from %s", scenario.name, scenario_path)
 
-    strict = os.environ.get("REG_LINT_STRICT", "1").strip().lower() not in ("0", "false", "no")
+    strict = config.lint_strict
     if not _report_lint(lint(scenario), strict, "offline lint"):
         return EXIT_LINT
 
@@ -326,11 +391,6 @@ async def _run(config: Config, args: argparse.Namespace) -> int:
         )
         for note in capabilities.notes:
             log.warning("target: %s", note)
-
-        if args.probe_only:
-            print(json.dumps(capabilities.to_dict(), indent=2))
-            return EXIT_OK
-
 
         online = await engine.validate(scenario)
         if not _report_lint(online, strict, "online lint"):
@@ -389,17 +449,20 @@ async def _run(config: Config, args: argparse.Namespace) -> int:
                 "before this run, so it measures the cold path",
                 ", ".join(indexes_in_play) or "every index",
             )
-            eviction = await evict_all(engine.client, indexes=indexes_in_play or None)
+            eviction = await evict_all(
+                engine.client, indexes=indexes_in_play or None, **_indexer_kwargs(config)
+            )
             log.warning(
-                "evicted %d/%d bucket(s), %.1f GB",
+                "evicted %d/%d bucket(s) (%d confirmed gone), %.1f GB",
                 eviction.evicted,
                 eviction.attempted,
+                eviction.confirmed,
                 eviction.bytes_evicted / 1e9,
             )
         else:
             eviction = None
 
-        cache_before = await cache_state(engine.client)
+        cache_before = await cache_state(engine.client, **_indexer_kwargs(config))
         if cache_before.available:
             log.info(render_cache(cache_before).splitlines()[0])
 
@@ -407,7 +470,10 @@ async def _run(config: Config, args: argparse.Namespace) -> int:
         summary = await scheduler.run()
         stop_progress.set()
 
-        summary.cache = await _cache_provenance(engine.client, cache_before, eviction)
+        summary.cache = await _cache_provenance(
+            engine.client, cache_before, eviction, _indexer_kwargs(config)
+        )
+        summary.scenario_digest = scenario_digest(scenario)
 
         # Ask the cluster its own opinion of what just happened. Best effort:
         # a load-test account frequently cannot read _audit or _introspection,
@@ -418,7 +484,7 @@ async def _run(config: Config, args: argparse.Namespace) -> int:
                 summary.started_at,
                 summary.ended_at,
                 marker_prefix_for(config.run_id),
-                settle_s=float(os.environ.get("REG_SUT_SETTLE_S", "8")),
+                settle_s=config.sut_settle_s,
             )
             for finding in summary.sut.get("findings", []):
                 log.info("target: %s", finding)
@@ -449,7 +515,7 @@ async def _run(config: Config, args: argparse.Namespace) -> int:
             await engine.close()
 
 
-async def _cache_provenance(client, before: CacheState, eviction) -> Optional[dict]:
+async def _cache_provenance(client, before: CacheState, eviction, where: dict) -> Optional[dict]:
     """What the run did to the SmartStore cache, and therefore what it measured.
 
     Reported on every run rather than only when eviction was asked for. The
@@ -458,7 +524,7 @@ async def _cache_provenance(client, before: CacheState, eviction) -> Optional[di
     """
     if not before.available:
         return {"available": False, "reason": before.reason}
-    after = await cache_state(client)
+    after = await cache_state(client, **where)
     change = cache_delta(before, after)
     payload = {
         "before": before.to_dict(),
@@ -503,7 +569,7 @@ async def _report_summary(
     sys.stdout.write(json.dumps(payload, separators=(",", ":")) + "\n")
     sys.stdout.flush()
 
-    summary_path = os.environ.get("REG_SUMMARY_PATH")
+    summary_path = config.summary_path
     if summary_path:
         Path(summary_path).write_text(json.dumps(payload, indent=2), encoding="utf-8")
         log.info("summary written to %s", summary_path)
@@ -511,26 +577,41 @@ async def _report_summary(
     stats = summary.stats
     latency = stats["latency"]
     log.info(
-        "%s: %d executions in %.0fs, %.1f/s, p50=%.0fms p95=%.0fms p99=%.0fms, errors %.2f%%",
+        "%s: %d executions in %.0fs, %.1f/s, p50=%s p95=%s p99=%s, errors %.2f%%",
         summary.outcome,
         stats["executions"],
         summary.duration_s,
         stats["throughput_per_s"],
-        latency["p50_ms"],
-        latency["p95_ms"],
-        latency["p99_ms"],
+        _ms(latency["p50_ms"]),
+        _ms(latency["p95_ms"]),
+        _ms(latency["p99_ms"]),
         stats["error_rate_pct"],
     )
     queueing = stats.get("queueing", {})
     if queueing.get("searches_queued"):
         log.warning(
             "QUEUEING OBSERVED: %d of %d searches (%.1f%%) waited in QUEUED before "
-            "running, p95 %.0fms. The target was at its concurrent-search ceiling, "
+            "running, p95 %s. The target was at its concurrent-search ceiling, "
             "which is the point a capacity test is looking for",
             queueing["searches_queued"],
-            stats["executions"],
+            queueing.get("job_executions", stats["executions"]),
             queueing["queued_pct"],
-            queueing["queued_ms"]["p95_ms"],
+            _ms(queueing["queued_ms"]["p95_ms"]),
+        )
+    if stats.get("partial"):
+        log.warning(
+            "%d search(es) finished DONE but reported incomplete results (a peer dropped "
+            "out, a limit truncated them, or they were finalized early). They are counted "
+            "as partial: their latency is real but their work was less than asked",
+            stats["partial"],
+        )
+    if stats.get("abandoned"):
+        log.warning(
+            "%d search(es) were still in flight when the run ended and were abandoned "
+            "after the %.0fs drain budget. They are recorded as cancelled failures with "
+            "the time they had accrued, so the tail is a floor rather than a measurement",
+            stats["abandoned"],
+            config.drain_budget_s,
         )
 
     if not summary.co_corrected:

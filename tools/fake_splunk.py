@@ -35,6 +35,7 @@ Deliberate deviations from real splunkd, all of them to keep the double useful:
 from __future__ import annotations
 
 import argparse
+import re
 import json
 import random
 import threading
@@ -88,7 +89,10 @@ class FakeSplunkConfig:
     port: int = 0
     password: str = "changeme"
     reject_token: Optional[str] = None
-    strict_spl: bool = False
+    # splunkd requires a search to start with a command or the search keyword;
+    # the double did not, so SPL that would 400 against a real search head
+    # sailed through every test. Strict by default now.
+    strict_spl: bool = True
     max_concurrent: int = 0
     base_latency_ms: float = 200.0
     jitter_ms: float = 100.0
@@ -114,6 +118,41 @@ class FakeSplunkConfig:
         "_introspection",
         "stoker_metrics",
     )
+    # Saved searches the fake lists under /servicesNS/-/<app>/saved/searches
+    # and dispatches by name. Each is a dict of the conf attributes plus
+    # ``name`` and ``app``.
+    saved_searches: Tuple[Dict[str, Any], ...] = (
+        {
+            "name": "Errors in the last hour",
+            "app": "search",
+            "search": "index=main sourcetype=access_combined status>=500 | stats count by uri_path",
+            "dispatch.earliest_time": "-1h",
+            "dispatch.latest_time": "now",
+            "cron_schedule": "*/5 * * * *",
+            "is_scheduled": "1",
+            "disabled": "0",
+        },
+        {
+            "name": "Nightly summary writer",
+            "app": "search",
+            "search": "index=main | stats count by host | collect index=summary",
+            "dispatch.earliest_time": "-24h@h",
+            "dispatch.latest_time": "now",
+            "cron_schedule": "0 1 * * *",
+            "is_scheduled": "1",
+            "disabled": "0",
+        },
+        {
+            "name": "Disabled report",
+            "app": "search",
+            "search": "| tstats count where index=main by sourcetype",
+            "dispatch.earliest_time": "-7d@d",
+            "dispatch.latest_time": "@d",
+            "cron_schedule": "0 6 * * 1",
+            "is_scheduled": "1",
+            "disabled": "1",
+        },
+    )
 
 
 @dataclass
@@ -128,6 +167,7 @@ class _Stats:
     auth_failures: int = 0
     v1_dispatches: int = 0
     oneshots: int = 0
+    saved_dispatches: int = 0
     buckets_evicted: int = 0
     requests_by_path: Dict[str, int] = field(default_factory=dict)
     searches: List[str] = field(default_factory=list)
@@ -588,6 +628,19 @@ class FakeSplunk:
             source = form if form else query
             return self._parse(_first(source, "q", ""))
 
+        saved = _match_saved_path(path)
+        if saved is not None:
+            app, name, action = saved
+            if name is None and method == "GET":
+                return 200, self._saved_listing(app)
+            if name is not None and action == "dispatch" and method == "POST":
+                return self._saved_dispatch(app, name, form)
+            if name is not None and action == "" and method == "GET":
+                entry = self._saved_entry(app, name)
+                if entry is None:
+                    return 404, {"messages": [{"type": "ERROR", "text": f"no saved search {name}"}]}
+                return 200, {"entry": [entry]}
+
         matched = _match_job_path(path)
         if matched is not None:
             prefix, sid, tail = matched
@@ -760,6 +813,55 @@ class FakeSplunk:
         payload = self._results_payload(job, count, 0, False, available)
         self._remove_job(job)
         return 200, payload
+
+    # ------------------------------------------------------------------
+    # Saved searches
+    # ------------------------------------------------------------------
+    def _saved_entry(self, app: str, name: str) -> Optional[Dict[str, Any]]:
+        for search in self.config.saved_searches:
+            if search["name"] != name:
+                continue
+            if app not in ("-", search.get("app", "search")):
+                continue
+            content = {k: v for k, v in search.items() if k not in ("name", "app")}
+            return {
+                "name": name,
+                "acl": {"app": search.get("app", "search"), "owner": "nobody", "sharing": "app"},
+                "content": content,
+            }
+        return None
+
+    def _saved_listing(self, app: str) -> Dict[str, Any]:
+        entries = []
+        for search in self.config.saved_searches:
+            if app in ("-", search.get("app", "search")):
+                entries.append(self._saved_entry(search.get("app", "search"), search["name"]))
+        return {"entry": [e for e in entries if e is not None], "paging": {"total": len(entries)}}
+
+    def _saved_dispatch(
+        self, app: str, name: str, form: Dict[str, List[str]]
+    ) -> Tuple[int, Any]:
+        entry = self._saved_entry(app, name)
+        if entry is None:
+            return 404, {"messages": [{"type": "ERROR", "text": f"no saved search {name}"}]}
+        with self._lock:
+            self.stats.saved_dispatches += 1
+        spl = entry["content"].get("search", "")
+        if not spl.startswith("|") and not spl.lower().startswith("search "):
+            spl = "search " + spl
+        dispatch_form = {
+            "search": [spl],
+            "earliest_time": form.get(
+                "dispatch.earliest_time", [entry["content"].get("dispatch.earliest_time", "")]
+            ),
+            "latest_time": form.get(
+                "dispatch.latest_time", [entry["content"].get("dispatch.latest_time", "now")]
+            ),
+            "exec_mode": ["normal"],
+        }
+        _sleep_ms(self.config.dispatch_latency_ms)
+        job = self._create_job(spl, dispatch_form, "v2")
+        return 201, {"sid": job.sid}
 
     def _job_listing(self) -> Dict[str, Any]:
         now = time.monotonic()
@@ -1030,6 +1132,20 @@ def _parses_as_spl(spl: str) -> bool:
         return True
     head = candidate[0]
     return head.isalnum() or head in ("_", "*", '"')
+
+
+_SAVED_RE = re.compile(
+    r"^/servicesNS/[^/]+/([^/]+)/saved/searches(?:/([^/]+)(?:/([^/]+))?)?$"
+)
+
+
+def _match_saved_path(path: str) -> Optional[Tuple[str, Optional[str], str]]:
+    """Split a saved-searches path into (app, name or None, trailing action)."""
+    match = _SAVED_RE.match(path)
+    if not match:
+        return None
+    app, name, action = match.groups()
+    return unquote(app), (unquote(name) if name else None), (action or "")
 
 
 def _match_job_path(path: str) -> Optional[Tuple[str, Optional[str], str]]:

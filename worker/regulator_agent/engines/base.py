@@ -62,6 +62,11 @@ class StepContext:
     # is most of the value of the record.
     spl_template: str = ""
     params: Dict[str, Any] = field(default_factory=dict)
+    # Where an engine leaves the record when it cannot return it: on
+    # cancellation the engine must re-raise, so the record of the abandoned
+    # search rides here for the scheduler to file. A list on a frozen
+    # dataclass is the one mutable slot the contract allows.
+    outcome: List[StepRecord] = field(default_factory=list)
 
     def blank_record(self) -> StepRecord:
         """A record pre-filled with the dimensions, ready for an engine to complete."""

@@ -78,6 +78,11 @@ class GateError(ValueError):
     """A gate expression that cannot be parsed. Fatal, and names the expression."""
 
 
+# Below this many successful samples a p95 is a coin toss, and a comparison
+# built on it is a warning rather than a verdict.
+MIN_SAMPLES = 20
+
+
 @dataclass
 class Gate:
     raw: str
@@ -111,7 +116,15 @@ def parse_gate(expression: str) -> Gate:
         amount = float(baseline.group("amount"))
         if baseline.group("sign") == "-":
             amount = -amount
-        unit = (baseline.group("unit") or "%").lower()
+        unit = (baseline.group("unit") or "").lower()
+        if not unit:
+            # 'baseline + 200' used to mean 200 percent while a bare '200'
+            # meant 200 milliseconds, so the same number meant two different
+            # things one token apart. A relative threshold names its unit.
+            raise GateError(
+                f"{expression!r}: say whether the allowance is a percentage or a time, "
+                "for example 'baseline + 15%' or 'baseline + 200ms'"
+            )
         if unit == "%":
             return Gate(raw=expression, metric=metric, op=op, step=step, relative_pct=amount)
         seconds = 1000.0 if unit == "s" else 1.0
@@ -222,17 +235,43 @@ class StepDelta:
     baseline_scan_count: Optional[int] = None
     candidate_scan_count: Optional[int] = None
 
+    baseline_successes: int = 0
+    candidate_successes: int = 0
+
+    @property
+    def baseline_scan_per_search(self) -> Optional[float]:
+        if not self.baseline_scan_count or not self.baseline_successes:
+            return None
+        return self.baseline_scan_count / self.baseline_successes
+
+    @property
+    def candidate_scan_per_search(self) -> Optional[float]:
+        if not self.candidate_scan_count or not self.candidate_successes:
+            return None
+        return self.candidate_scan_count / self.candidate_successes
+
     @property
     def scanned_more(self) -> bool:
-        """Did the candidate simply do more work?
+        """Did the candidate's searches each do more work?
 
         The distinction that settles most arguments about a benchmark: latency
         up with scan count flat is contention or queueing, latency up with scan
         count up means the workload changed and the comparison was never valid.
+
+        Per search, not per run. A faster cluster fits more iterations into the
+        same duration and so scans more in total, which the run-total version
+        of this flag reported as "scanned more" on exactly the improved run.
         """
-        if not self.baseline_scan_count or not self.candidate_scan_count:
+        base = self.baseline_scan_per_search
+        cand = self.candidate_scan_per_search
+        if base is None or cand is None:
             return False
-        return self.candidate_scan_count > self.baseline_scan_count * 1.1
+        return cand > base * 1.1
+
+    @property
+    def too_few_samples(self) -> bool:
+        """Fewer successful searches than a percentile can be trusted on."""
+        return min(self.baseline_successes, self.candidate_successes) < MIN_SAMPLES
 
 
 @dataclass
@@ -267,8 +306,14 @@ class Comparison:
             lines.append(f"COMPARISON BLOCKED: {self.blocked}")
             return "\n".join(lines)
 
-        verdict = "PASS" if self.ok else "FAIL"
-        lines.append(f"{verdict}: {len(self.gates) - len(self.failed_gates)}/{len(self.gates)} gates met")
+        if not self.gates:
+            # No gates is report-only. It is not a pass, and saying "0/0 gates
+            # met" read as one, which is how a pipeline that lost its gate
+            # arguments went green on a regression.
+            lines.append("REPORT ONLY: no gates were given, so nothing was judged")
+        else:
+            verdict = "PASS" if self.ok else "FAIL"
+            lines.append(f"{verdict}: {len(self.gates) - len(self.failed_gates)}/{len(self.gates)} gates met")
         for warning in self.warnings:
             lines.append(f"  warning: {warning}")
         for gate in self.gates:
@@ -283,8 +328,18 @@ class Comparison:
                 reverse=True,
             ):
                 if step.candidate_p95_ms is None or step.baseline_p95_ms is None:
+                    lines.append(
+                        f"  {step.step_id[:28]:<28} {'n/a' if step.baseline_p95_ms is None else f'{step.baseline_p95_ms:.0f}ms':>10} "
+                        f"{'n/a' if step.candidate_p95_ms is None else f'{step.candidate_p95_ms:.0f}ms':>10} "
+                        f"{'':>10}  (no successful samples on one side)"
+                    )
                     continue
-                note = "  (scanned more)" if step.scanned_more else ""
+                notes = []
+                if step.scanned_more:
+                    notes.append("scanned more")
+                if step.too_few_samples:
+                    notes.append(f"under {MIN_SAMPLES} samples")
+                note = f"  ({', '.join(notes)})" if notes else ""
                 lines.append(
                     f"  {step.step_id[:28]:<28} {step.baseline_p95_ms:>9.0f}ms "
                     f"{step.candidate_p95_ms:>9.0f}ms {step.delta_pct:>+9.1f}%{note}"
@@ -327,6 +382,15 @@ def compare_runs(
         comparison.gates.append(_evaluate(gate, candidate, baseline))
 
     comparison.ok = all(g.passed for g in comparison.gates)
+    if baseline is not None:
+        few = [s.step_id for s in comparison.steps if s.too_few_samples]
+        if few:
+            comparison.warnings.append(
+                f"{len(few)} step(s) have fewer than {MIN_SAMPLES} successful samples on one "
+                "side, so their percentiles are noise rather than measurement: "
+                + ", ".join(few[:5])
+                + (" ..." if len(few) > 5 else "")
+            )
     comparison.summary = {
         "candidate": _headline(candidate),
         "baseline": _headline(baseline) if baseline else None,
@@ -363,12 +427,36 @@ def _workload_warnings(candidate: Dict[str, Any], baseline: Dict[str, Any]) -> L
             f"different scenarios ({baseline.get('scenario')} versus "
             f"{candidate.get('scenario')}): this is a different question, not a regression"
         )
-    if candidate.get("scenario_seed") != baseline.get("scenario_seed"):
+    if candidate.get("scenario_digest") and baseline.get("scenario_digest") and (
+        candidate.get("scenario_digest") != baseline.get("scenario_digest")
+    ):
+        warnings.append(
+            "the scenario files differ between the two runs (different content digests), "
+            "so the searches or their weights changed. This is a different test with the "
+            "same name"
+        )
+    if candidate.get("effective_seed", candidate.get("scenario_seed")) != baseline.get(
+        "effective_seed", baseline.get("scenario_seed")
+    ):
         warnings.append(
             "different seeds, so the two runs issued different searches over different "
             "time windows. The comparison is between workloads, not between clusters"
         )
-    if candidate.get("peak_virtual_users") != baseline.get("peak_virtual_users"):
+    if candidate.get("load_model") != baseline.get("load_model"):
+        warnings.append(
+            f"different load models ({baseline.get('load_model')} versus "
+            f"{candidate.get('load_model')}): a closed population and an open arrival "
+            "stream ask different questions"
+        )
+    cand_load = candidate.get("configured_load") or {}
+    base_load = baseline.get("configured_load") or {}
+    if cand_load and base_load and cand_load != base_load:
+        warnings.append(
+            f"different configured load ({base_load} versus {cand_load})"
+        )
+    elif not (cand_load and base_load) and candidate.get("peak_virtual_users") != baseline.get(
+        "peak_virtual_users"
+    ):
         warnings.append(
             f"different concurrency ({baseline.get('peak_virtual_users')} versus "
             f"{candidate.get('peak_virtual_users')} virtual users)"
@@ -422,6 +510,12 @@ def _step_deltas(candidate: Dict[str, Any], baseline: Dict[str, Any]) -> List[St
                 candidate_executions=step.get("executions", 0),
                 baseline_scan_count=base.get("scan_count_total"),
                 candidate_scan_count=step.get("scan_count_total"),
+                baseline_successes=base.get(
+                    "successes", base.get("executions", 0) - base.get("errors", 0)
+                ),
+                candidate_successes=step.get(
+                    "successes", step.get("executions", 0) - step.get("errors", 0)
+                ),
             )
         )
     return deltas
@@ -443,6 +537,11 @@ def _evaluate(
             detail=(
                 f"the run has no {gate.metric!r}"
                 + (f" for step {gate.step!r}" if gate.step else "")
+                + (
+                    " (no successful searches, so there is no latency to judge)"
+                    if gate.metric in _RUN_METRICS
+                    else ""
+                )
             ),
         )
 
@@ -486,9 +585,12 @@ def _evaluate(
         change = (
             100.0 * (actual - baseline_value) / baseline_value if baseline_value else 0.0
         )
-        direction = "better" if (
-            (change < 0) != (gate.metric in _HIGHER_IS_BETTER)
-        ) else "worse"
+        if change == 0:
+            direction = "unchanged"
+        elif (change < 0) != (gate.metric in _HIGHER_IS_BETTER):
+            direction = "better"
+        else:
+            direction = "worse"
         detail = (
             f"{actual:.1f} versus a baseline of {baseline_value:.1f} "
             f"({change:+.1f}%, {direction}), limit {limit:.1f}"

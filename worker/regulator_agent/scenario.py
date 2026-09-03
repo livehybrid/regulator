@@ -11,9 +11,18 @@ The shape, in one glance::
     corpus:      what data this assumes exists (which Stoker packs, which index)
     parameters:  named generators, resolved per iteration from a seeded stream
     time_policy: how the search time range moves between iterations
+    searches:    an optional savedsearches.conf next to the scenario, in
+                 Splunk's own format, so existing searches load untranslated
     personas:    weighted user archetypes, each a list of steps with think time
-    load:        closed (virtual users) or open (arrival rate), plus a ramp
+    load:        closed (virtual users), open (arrival rate) or schedule (each
+                 saved search fires on its own cron), plus a ramp
     abort_if:    guard rails that stop a run before it hurts the target
+
+A step can carry its SPL inline (``spl:``) or name a stanza in the scenario's
+``savedsearches.conf`` (``saved:``). A persona can also be built from the
+file wholesale (``steps_from: saved``), weighted by how often each search's
+cron fires, which is what makes "load-test the workload we already run" a
+one-line scenario rather than a transcription exercise.
 
 Two decisions in here are load-bearing and worth stating plainly.
 
@@ -36,20 +45,26 @@ into a Splunk comment so the search string differs without the work differing.
 
 from __future__ import annotations
 
+import hashlib
 import re
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 import yaml
 
+from . import savedsearches as ss
+
 VALID_ENGINES = ("api", "browser", "mixed")
 VALID_STEP_TYPES = ("search", "dashboard")
 VALID_STEP_ENGINES = ("api", "browser")
 VALID_EXEC_MODES = ("normal", "blocking", "oneshot", "export")
-VALID_LOAD_MODELS = ("closed", "open")
-VALID_TIME_MODES = ("rolling", "pinned")
+VALID_LOAD_MODELS = ("closed", "open", "schedule")
+VALID_TIME_MODES = ("rolling", "pinned", "relative")
 VALID_WAIT_FOR = ("first_result", "all_panels")
+VALID_DISPATCH = ("spl", "saved")
+VALID_ARRIVALS = ("poisson", "uniform")
+VALID_TIME_FROM_SAVED = ("derived", "as_saved")
 
 # Search classes follow the dense / sparse / rare distinction Splunk's own
 # scale-testing methodology uses, because they stress completely different
@@ -166,8 +181,18 @@ class TimePolicy:
     window_s: float = 86400.0
     jitter_s: float = 0.0
     align_s: float = 60.0
+    # How far behind now the window ends, before jitter. A saved search with
+    # dispatch.latest_time = -1h@h ends an hour ago, and replaying it against
+    # the most recent hour instead would search data it never sees.
+    offset_s: float = 0.0
     earliest_epoch: Optional[float] = None
     latest_epoch: Optional[float] = None
+    # ``relative`` passes Splunk's own modifiers straight through, so the
+    # target evaluates -24h@h exactly as its scheduler would. It is the honest
+    # choice for replaying a schedule as-is and the wrong one for a cache-proof
+    # benchmark, which is why lint says so.
+    earliest_rel: Optional[str] = None
+    latest_rel: Optional[str] = None
 
     @staticmethod
     def parse(raw: Any, where: str = "time_policy") -> "TimePolicy":
@@ -178,19 +203,22 @@ class TimePolicy:
         mode = str(raw.get("mode", "rolling")).lower()
         if mode not in VALID_TIME_MODES:
             raise ScenarioError(
-                f"{where}.mode must be rolling or pinned, got {mode!r}"
+                f"{where}.mode must be rolling, pinned or relative, got {mode!r}"
             )
         return TimePolicy(
             mode=mode,
             window_s=parse_duration(raw.get("window", "24h"), f"{where}.window"),
             jitter_s=parse_duration(raw.get("jitter", 0), f"{where}.jitter"),
             align_s=parse_duration(raw.get("align", "1m"), f"{where}.align"),
+            offset_s=parse_duration(raw.get("offset", 0), f"{where}.offset"),
             earliest_epoch=(
                 float(raw["earliest_epoch"]) if raw.get("earliest_epoch") is not None else None
             ),
             latest_epoch=(
                 float(raw["latest_epoch"]) if raw.get("latest_epoch") is not None else None
             ),
+            earliest_rel=(str(raw["earliest"]) if raw.get("earliest") is not None else None),
+            latest_rel=(str(raw["latest"]) if raw.get("latest") is not None else None),
         )
 
 
@@ -212,15 +240,33 @@ class Step:
     app: Optional[str] = None
     dashboard: Optional[str] = None
     wait_for: str = "first_result"
+    # The dashboard's time input token, so the browser engine can pin the
+    # window through form.<token>.earliest as well as the bare earliest a
+    # global picker reads. Splunk Web ignores the bare form for a named input.
+    time_token: Optional[str] = None
     # Weight within a persona when steps are sampled rather than walked in
     # order. Zero means "always run, in order", which is the default.
     weight: float = 0.0
+    # A saved search, by stanza name, from the scenario's savedsearches.conf.
+    # The loader fills spl, app and the time range from the stanza, so an
+    # engine never sees the difference. ``dispatch: saved`` runs it BY NAME
+    # on the target instead, with everything the target's copy declares.
+    saved: Optional[str] = None
+    dispatch: str = "spl"
+    # When the search fires in the schedule load model. Five-field cron, as
+    # the stanza's cron_schedule. Ignored by the closed and open models.
+    cron: Optional[str] = None
+    # Set by the loader: this step came from a savedsearches.conf.
+    from_saved: bool = False
 
     @staticmethod
     def parse(raw: Any, where: str) -> "Step":
         if not isinstance(raw, dict):
             raise ScenarioError(f"{where}: a step must be a mapping")
+        saved = raw.get("saved")
         step_id = str(raw.get("id", "")).strip()
+        if not step_id and saved:
+            step_id = ss.step_id_for(str(saved))
         if not step_id:
             raise ScenarioError(f"{where}: a step needs an id")
         return Step(
@@ -240,7 +286,11 @@ class Step:
             app=raw.get("app"),
             dashboard=raw.get("dashboard"),
             wait_for=str(raw.get("wait_for", "first_result")).lower(),
+            time_token=(str(raw["time_token"]) if raw.get("time_token") else None),
             weight=float(raw.get("weight", 0.0)),
+            saved=(str(saved) if saved else None),
+            dispatch=str(raw.get("dispatch", "spl")).lower(),
+            cron=(str(raw["cron"]) if raw.get("cron") else None),
         )
 
 
@@ -252,6 +302,17 @@ class Persona:
     weight: float
     think_time: ThinkTime
     steps: List[Step]
+    # ``steps_from: saved`` builds the step list from the scenario's
+    # savedsearches.conf at load time. ``weight_by`` decides how the steps
+    # are sampled: by cron frequency, so a five-minute search carries 288
+    # times the weight of a daily one, or equally.
+    steps_from: Optional[str] = None
+    weight_by: str = "cron"
+    # How the persona walks its steps. ``sequence`` runs every step in order
+    # each iteration, which is right for a hand-written journey. ``sample``
+    # draws one step per iteration by weight, which is right for a file of
+    # unrelated saved searches.
+    walk: str = "sequence"
 
     @staticmethod
     def parse(raw: Any, where: str) -> "Persona":
@@ -260,14 +321,23 @@ class Persona:
         name = str(raw.get("name", "")).strip()
         if not name:
             raise ScenarioError(f"{where}: a persona needs a name")
+        steps_from = raw.get("steps_from")
         steps_raw = raw.get("steps") or []
-        if not isinstance(steps_raw, list) or not steps_raw:
-            raise ScenarioError(f"{where}({name}): a persona needs at least one step")
+        if not isinstance(steps_raw, list) or (not steps_raw and not steps_from):
+            raise ScenarioError(
+                f"{where}({name}): a persona needs at least one step, or steps_from: saved"
+            )
+        walk = str(raw.get("walk", "sample" if steps_from else "sequence")).lower()
+        if walk not in ("sequence", "sample"):
+            raise ScenarioError(f"{where}({name}): walk must be sequence or sample")
         return Persona(
             name=name,
             weight=float(raw.get("weight", 1.0)),
             think_time=ThinkTime.parse(raw.get("think_time"), f"{where}({name}).think_time"),
             steps=[Step.parse(s, f"{where}({name}).steps[{i}]") for i, s in enumerate(steps_raw)],
+            steps_from=(str(steps_from).lower() if steps_from else None),
+            weight_by=str(raw.get("weight_by", "cron")).lower(),
+            walk=walk,
         )
 
 
@@ -321,10 +391,22 @@ class LoadModel:
     pacing_s: float = 0.0
     ramp: List[RampStage] = field(default_factory=list)
     duration_s: Optional[float] = None
+    # Open model only. Poisson arrivals burst the way a real population does,
+    # and bursts are what produce queueing; evenly spaced arrivals find an
+    # optimistic saturation point. Recorded in the summary either way.
+    arrivals: str = "poisson"
+    # Schedule model only. The virtual clock the crons are evaluated against
+    # starts here rather than at the wall clock, so "the 09:00 burst" can be
+    # replayed at any time of day. HH:MM, or unset for the wall clock.
+    schedule_start: Optional[str] = None
+    # Schedule model only. Splunk's scheduler spreads a search anywhere inside
+    # its schedule_window; a scenario can add the same delay here, in seconds,
+    # to every firing, drawn uniformly per firing.
+    schedule_skew_s: float = 0.0
 
     @property
     def co_corrected(self) -> bool:
-        return self.model == "open" or self.pacing_s > 0
+        return self.model in ("open", "schedule") or self.pacing_s > 0
 
     @staticmethod
     def parse(raw: Any, where: str = "load") -> "LoadModel":
@@ -334,10 +416,18 @@ class LoadModel:
             raise ScenarioError(f"{where}: must be a mapping")
         model = str(raw.get("model", "closed")).lower()
         if model not in VALID_LOAD_MODELS:
-            raise ScenarioError(f"{where}.model must be closed or open, got {model!r}")
+            raise ScenarioError(
+                f"{where}.model must be closed, open or schedule, got {model!r}"
+            )
         ramp_raw = raw.get("ramp") or []
         if not isinstance(ramp_raw, list):
             raise ScenarioError(f"{where}.ramp must be a list of stages")
+        arrivals = str(raw.get("arrivals", "poisson")).lower()
+        if arrivals not in VALID_ARRIVALS:
+            raise ScenarioError(f"{where}.arrivals must be poisson or uniform, got {arrivals!r}")
+        start = raw.get("schedule_start")
+        if start is not None and not re.fullmatch(r"\d{1,2}:\d{2}", str(start).strip()):
+            raise ScenarioError(f"{where}.schedule_start must be HH:MM, got {start!r}")
         return LoadModel(
             model=model,
             virtual_users=int(raw.get("virtual_users", 1)),
@@ -349,6 +439,9 @@ class LoadModel:
                 if raw.get("duration") is not None
                 else None
             ),
+            arrivals=arrivals,
+            schedule_start=(str(start).strip() if start is not None else None),
+            schedule_skew_s=parse_duration(raw.get("schedule_skew", 0), f"{where}.schedule_skew"),
         )
 
 
@@ -410,6 +503,12 @@ class Corpus:
     requires_packs: List[str] = field(default_factory=list)
     index: str = "main"
     metric_index: Optional[str] = None
+    # The sourcetypes the searches assume. Online lint checks each has events
+    # in the window, which is the check that catches "the index exists and
+    # holds nothing this scenario searches", the fastest-looking cluster there
+    # is. The target report also matches these against its census to say
+    # which scenarios are honest to run.
+    sourcetypes: List[str] = field(default_factory=list)
 
     @staticmethod
     def parse(raw: Any, where: str = "corpus") -> "Corpus":
@@ -420,10 +519,67 @@ class Corpus:
         packs = raw.get("requires_packs") or []
         if isinstance(packs, str):
             packs = [p.strip() for p in packs.split(",") if p.strip()]
+        sourcetypes = raw.get("sourcetypes") or []
+        if isinstance(sourcetypes, str):
+            sourcetypes = [p.strip() for p in sourcetypes.split(",") if p.strip()]
         return Corpus(
             requires_packs=[str(p) for p in packs],
             index=str(raw.get("index", "main")),
             metric_index=(str(raw["metric_index"]) if raw.get("metric_index") else None),
+            sourcetypes=[str(st) for st in sourcetypes],
+        )
+
+
+@dataclass(frozen=True)
+class SearchSource:
+    """Where a scenario's saved searches come from, and which ones count."""
+
+    file: str = "savedsearches.conf"
+    app: Optional[str] = None
+    include: List[str] = field(default_factory=lambda: ["*"])
+    exclude: List[str] = field(default_factory=list)
+    only_enabled: bool = True
+    only_scheduled: bool = False
+    allow_side_effects: bool = False
+    allow_realtime: bool = False
+    # derived: turn dispatch.earliest_time/latest_time into a rolling window
+    # with the scenario's jitter, so the working set moves. as_saved: pass the
+    # modifiers through untouched, so the target evaluates them exactly as its
+    # scheduler would. The second is a faithful replay and a cache-warm one.
+    time_from_saved: str = "derived"
+    classes: Dict[str, str] = field(default_factory=dict)
+
+    @staticmethod
+    def parse(raw: Any, where: str = "searches") -> "SearchSource":
+        if raw is None:
+            return SearchSource()
+        if isinstance(raw, str):
+            raw = {"file": raw}
+        if not isinstance(raw, dict):
+            raise ScenarioError(f"{where}: must be a mapping or a file name")
+        include = raw.get("include") or ["*"]
+        exclude = raw.get("exclude") or []
+        if isinstance(include, str):
+            include = [include]
+        if isinstance(exclude, str):
+            exclude = [exclude]
+        time_mode = str(raw.get("time_from_saved", "derived")).lower()
+        if time_mode not in VALID_TIME_FROM_SAVED:
+            raise ScenarioError(f"{where}.time_from_saved must be derived or as_saved")
+        classes = raw.get("classes") or {}
+        if not isinstance(classes, dict):
+            raise ScenarioError(f"{where}.classes must be a mapping of stanza name to class")
+        return SearchSource(
+            file=str(raw.get("file", "savedsearches.conf")),
+            app=(str(raw["app"]) if raw.get("app") else None),
+            include=[str(p) for p in include],
+            exclude=[str(p) for p in exclude],
+            only_enabled=bool(raw.get("only_enabled", True)),
+            only_scheduled=bool(raw.get("only_scheduled", False)),
+            allow_side_effects=bool(raw.get("allow_side_effects", False)),
+            allow_realtime=bool(raw.get("allow_realtime", False)),
+            time_from_saved=time_mode,
+            classes={str(k): str(v).lower() for k, v in classes.items()},
         )
 
 
@@ -443,6 +599,12 @@ class Scenario:
     load: LoadModel
     abort_if: AbortIf
     source_path: Optional[Path] = None
+    searches: Optional[SearchSource] = None
+    # Filled by the loader when a savedsearches.conf was read: which stanzas
+    # were selected and why the others were not. Reported, never silent.
+    saved_selected: List[str] = field(default_factory=list)
+    saved_skipped: Dict[str, str] = field(default_factory=dict)
+    saved_problems: List[str] = field(default_factory=list)
 
     @property
     def steps(self) -> List[Step]:
@@ -450,6 +612,36 @@ class Scenario:
 
     def resolve_time_policy(self, step: Step) -> TimePolicy:
         return step.time_policy or self.time_policy
+
+    @property
+    def directory(self) -> Optional[Path]:
+        if self.source_path is None:
+            return None
+        return self.source_path.parent if self.source_path.is_file() else self.source_path
+
+
+def scenario_digest(scenario: Scenario) -> str:
+    """A content address for the test definition.
+
+    Every file the scenario reads goes in: the YAML and any savedsearches.conf
+    it names. Two runs whose digests match ran the same searches with the same
+    weights, whatever the files were called; two whose digests differ did not,
+    however similar they look, and the comparison says so.
+    """
+    hasher = hashlib.sha256()
+    directory = scenario.directory
+    if scenario.source_path is not None and scenario.source_path.is_file():
+        hasher.update(scenario.source_path.read_bytes())
+    elif directory is not None and (directory / "scenario.yaml").is_file():
+        hasher.update((directory / "scenario.yaml").read_bytes())
+    else:
+        # Parsed from a mapping with no file behind it: hash the shape.
+        hasher.update(repr(scenario).encode("utf-8"))
+    if scenario.searches is not None and directory is not None:
+        conf = directory / scenario.searches.file
+        if conf.is_file():
+            hasher.update(b"\x00" + conf.read_bytes())
+    return hasher.hexdigest()[:16]
 
 
 def load_scenario(path: str | Path) -> Scenario:
@@ -465,7 +657,8 @@ def load_scenario(path: str | Path) -> Scenario:
         raise ScenarioError(f"{p}: not valid YAML: {exc}") from exc
     if not isinstance(raw, dict):
         raise ScenarioError(f"{p}: a scenario must be a YAML mapping")
-    return parse_scenario(raw, source_path=p)
+    scenario = parse_scenario(raw, source_path=p)
+    return bind_saved_searches(scenario)
 
 
 def parse_scenario(raw: Dict[str, Any], source_path: Optional[Path] = None) -> Scenario:
@@ -485,6 +678,14 @@ def parse_scenario(raw: Dict[str, Any], source_path: Optional[Path] = None) -> S
     if not isinstance(parameters, dict):
         raise ScenarioError(f"{name}: parameters must be a mapping of name to generator")
 
+    searches = SearchSource.parse(raw.get("searches")) if raw.get("searches") is not None else None
+    personas = [Persona.parse(p, f"personas[{i}]") for i, p in enumerate(personas_raw)]
+    if searches is None and any(
+        step.saved for persona in personas for step in persona.steps
+    ) or any(persona.steps_from for persona in personas):
+        # A step names a stanza, so there must be a file: default it.
+        searches = searches or SearchSource()
+
     return Scenario(
         name=name,
         engine=str(raw.get("engine", "api")).lower(),
@@ -497,10 +698,219 @@ def parse_scenario(raw: Dict[str, Any], source_path: Optional[Path] = None) -> S
         parameters={str(k): (v if isinstance(v, dict) else {"type": "literal", "value": v})
                     for k, v in parameters.items()},
         time_policy=TimePolicy.parse(raw.get("time_policy")),
-        personas=[Persona.parse(p, f"personas[{i}]") for i, p in enumerate(personas_raw)],
+        personas=personas,
         load=LoadModel.parse(raw.get("load")),
         abort_if=AbortIf.parse(raw.get("abort_if")),
         source_path=source_path,
+        searches=searches,
+    )
+
+
+def _policy_from_saved(
+    search: ss.SavedSearch, base: TimePolicy, mode: str
+) -> tuple[Optional[TimePolicy], Optional[str]]:
+    """A step time policy from a stanza's dispatch times, or a problem."""
+    if mode == "as_saved":
+        return (
+            TimePolicy(
+                mode="relative",
+                earliest_rel=search.earliest or "0",
+                latest_rel=search.latest or "now",
+                window_s=0.0,
+            ),
+            None,
+        )
+    try:
+        derived = ss.derive_window(search.earliest, search.latest)
+    except ss.RelativeTimeError as exc:
+        return None, f"{search.name!r}: {exc}"
+    if derived.all_time:
+        # An all-time search has no window to roll. Pass it through as saved,
+        # which is the only honest thing to do with it, and say so.
+        return (
+            TimePolicy(mode="relative", earliest_rel="0", latest_rel=search.latest or "now"),
+            None,
+        )
+    return (
+        TimePolicy(
+            mode="rolling",
+            window_s=derived.window_s,
+            offset_s=derived.offset_s,
+            # The scenario's jitter, so the working set moves. The stanza's
+            # own snap is dropped: -24h@h replayed at hour alignment reads the
+            # same buckets every iteration inside the hour, which measures the
+            # page cache rather than the cluster.
+            jitter_s=base.jitter_s,
+            align_s=min(base.align_s, 60.0) if base.align_s else 60.0,
+        ),
+        None,
+    )
+
+
+def _step_from_saved(
+    search: ss.SavedSearch,
+    base: Step,
+    source: SearchSource,
+    scenario_policy: TimePolicy,
+    taken: set[str],
+) -> tuple[Step, Optional[str]]:
+    policy, problem = _policy_from_saved(search, scenario_policy, source.time_from_saved)
+    step_class = (
+        source.classes.get(search.name)
+        or search.annotated_class
+        or (base.step_class if base.step_class != "unclassified" else None)
+        or ss.classify(search.search, search.earliest)
+    )
+    result_count = (
+        search.annotated_result_count
+        if search.annotated_result_count is not None
+        else base.result_count
+    )
+    step_id = base.id if base.id else ss.step_id_for(search.name, taken)
+    return (
+        replace(
+            base,
+            id=step_id,
+            type="search",
+            engine="api",
+            step_class=step_class,
+            spl=search.search,
+            result_count=result_count,
+            time_policy=base.time_policy or policy,
+            app=base.app or search.app or source.app,
+            saved=search.name,
+            cron=base.cron or search.cron,
+            weight=(
+                base.weight
+                if base.weight
+                else (search.annotated_weight if search.annotated_weight is not None else 0.0)
+            ),
+            from_saved=True,
+        ),
+        problem,
+    )
+
+
+def bind_saved_searches(scenario: Scenario) -> Scenario:
+    """Resolve every ``saved:`` step and ``steps_from: saved`` persona.
+
+    Reads the scenario's savedsearches.conf once, applies the selection rules,
+    and rewrites the personas with concrete steps. Problems are collected on
+    the scenario for lint to report rather than raised one at a time, so an
+    operator sees every missing stanza in one pass.
+    """
+    if scenario.searches is None:
+        return scenario
+    directory = scenario.directory
+    problems: List[str] = []
+    searches: List[ss.SavedSearch] = []
+    # A step dispatched BY NAME runs the target's own copy, so it needs no
+    # local file at all; only steps that take their SPL from the file do.
+    needs_file = any(persona.steps_from for persona in scenario.personas) or any(
+        step.saved and step.dispatch != "saved"
+        for persona in scenario.personas
+        for step in persona.steps
+    )
+    conf_path = (directory / scenario.searches.file) if directory is not None else None
+    if conf_path is None or not conf_path.is_file():
+        if needs_file:
+            problems.append(
+                f"searches.file {scenario.searches.file!r} was not found next to the scenario"
+            )
+    else:
+        try:
+            searches = ss.load_savedsearches(conf_path, app_hint=scenario.searches.app)
+        except (OSError, UnicodeDecodeError) as exc:
+            problems.append(f"could not read {conf_path}: {exc}")
+
+    by_name = {search.name: search for search in searches}
+    selection = ss.select_searches(
+        searches,
+        include=scenario.searches.include,
+        exclude=scenario.searches.exclude,
+        only_enabled=scenario.searches.only_enabled,
+        only_scheduled=scenario.searches.only_scheduled,
+        allow_side_effects=scenario.searches.allow_side_effects,
+        allow_realtime=scenario.searches.allow_realtime,
+    )
+    selected_names = [search.name for search in selection.chosen]
+
+    personas: List[Persona] = []
+    for persona in scenario.personas:
+        taken: set[str] = set()
+        steps: List[Step] = []
+        for step in persona.steps:
+            if step.saved:
+                search = by_name.get(step.saved)
+                if search is None:
+                    if step.dispatch == "saved":
+                        # The target holds the search; nothing to bind locally.
+                        steps.append(step)
+                        taken.add(step.id)
+                        continue
+                    problems.append(
+                        f"persona {persona.name}, step {step.id}: no stanza named "
+                        f"{step.saved!r} in {scenario.searches.file}"
+                    )
+                    steps.append(step)
+                    continue
+                effects = ss.side_effects(search.search)
+                if effects and not scenario.searches.allow_side_effects:
+                    problems.append(
+                        f"persona {persona.name}, step {step.id}: {step.saved!r} writes "
+                        f"somewhere ({', '.join(effects)}). A load test must not replay it "
+                        "unless searches.allow_side_effects is set"
+                    )
+                bound, problem = _step_from_saved(
+                    search, step, scenario.searches, scenario.time_policy, taken
+                )
+                if problem:
+                    problems.append(f"persona {persona.name}, step {step.id}: {problem}")
+                steps.append(bound)
+                taken.add(bound.id)
+            else:
+                steps.append(step)
+                taken.add(step.id)
+        if persona.steps_from:
+            if persona.steps_from != "saved":
+                problems.append(
+                    f"persona {persona.name}: steps_from must be 'saved', got {persona.steps_from!r}"
+                )
+            for search in selection.chosen:
+                template = Step(id="", saved=search.name)
+                bound, problem = _step_from_saved(
+                    search, template, scenario.searches, scenario.time_policy, taken
+                )
+                if problem:
+                    problems.append(f"persona {persona.name}: {problem}")
+                    continue
+                if persona.weight_by == "cron" and not bound.weight:
+                    if search.cron:
+                        try:
+                            bound = replace(bound, weight=max(ss.cron_firings_per_day(search.cron), 1e-6))
+                        except ss.CronError as exc:
+                            problems.append(f"persona {persona.name}: {search.name!r}: {exc}")
+                            continue
+                    else:
+                        # An unscheduled search has no frequency to weight
+                        # by; one firing a day is the least surprising stand-in.
+                        bound = replace(bound, weight=1.0)
+                elif not bound.weight:
+                    bound = replace(bound, weight=1.0)
+                steps.append(bound)
+            if not selection.chosen:
+                problems.append(
+                    f"persona {persona.name}: steps_from selected no searches from "
+                    f"{scenario.searches.file}"
+                )
+        personas.append(replace(persona, steps=steps))
+
+    return replace(
+        scenario,
+        personas=personas,
+        saved_selected=selected_names,
+        saved_skipped=dict(selection.skipped),
+        saved_problems=problems,
     )
 
 
@@ -526,6 +936,7 @@ def lint(scenario: Scenario) -> List[str]:
     and lives in the engine's validate path.
     """
     errors: List[str] = []
+    errors.extend(scenario.saved_problems)
 
     if not _IDENT_RE.match(scenario.name):
         errors.append(
@@ -577,9 +988,36 @@ def lint(scenario: Scenario) -> List[str]:
             if step.result_count < 0:
                 errors.append(f"{where}: result_count must not be negative")
 
+            if step.dispatch not in VALID_DISPATCH:
+                errors.append(f"{where}: dispatch must be spl or saved")
+            if step.dispatch == "saved" and not step.saved:
+                errors.append(f"{where}: dispatch: saved needs a saved: stanza name")
+            if step.dispatch == "saved" and not step.app:
+                errors.append(
+                    f"{where}: dispatch: saved needs the app the search lives in on the "
+                    "target (app:, or request.ui_dispatch_app in the stanza)"
+                )
+            if step.cron:
+                try:
+                    ss.parse_cron(step.cron)
+                except ss.CronError as exc:
+                    errors.append(f"{where}: {exc}")
+            if step.type == "search" and step.spl and not step.from_saved:
+                effects = ss.side_effects(step.spl)
+                if effects and not (scenario.searches and scenario.searches.allow_side_effects):
+                    errors.append(
+                        f"{where}: the search writes somewhere ({', '.join(effects)}). A load "
+                        "test replays a search hundreds of times; set "
+                        "searches.allow_side_effects if that is really what you want"
+                    )
+
             if step.type == "search":
-                if not step.spl or not step.spl.strip():
-                    errors.append(f"{where}: a search step needs spl")
+                if step.dispatch == "saved" and not (step.spl or "").strip():
+                    pass  # the SPL lives on the target
+                elif not step.spl or not step.spl.strip():
+                    errors.append(f"{where}: a search step needs spl" + (
+                        " (its saved: stanza did not resolve)" if step.saved else ""
+                    ))
                 elif not _looks_like_spl(step.spl):
                     errors.append(
                         f"{where}: spl should start with 'search ', '|' or a bare search "
@@ -637,6 +1075,23 @@ def lint(scenario: Scenario) -> List[str]:
             f"parameter {pname}: {problem}" for problem in PARAMETER_TYPES[ptype](spec)
         )
 
+    # Think time. A persona whose distribution is declared with the wrong
+    # parameter silently thinks for zero seconds, which turns "200 virtual
+    # users" into 200 concurrent searches with no report of the difference.
+    for persona in scenario.personas:
+        think = persona.think_time
+        where = f"persona {persona.name}: think_time"
+        if think.dist == "fixed" and not think.value_s and (think.median_s or think.min_s or think.max_s):
+            errors.append(f"{where}: dist fixed reads value_s, and it is unset")
+        if think.dist == "lognormal" and not (think.median_s or think.value_s):
+            errors.append(f"{where}: dist lognormal needs median_s")
+        if think.dist == "exponential" and not (think.value_s or think.median_s):
+            errors.append(f"{where}: dist exponential needs value_s (the mean)")
+        if think.dist == "uniform" and think.max_s <= think.min_s:
+            errors.append(f"{where}: dist uniform needs max_s above min_s")
+        if think.max_s and think.min_s and think.max_s < think.min_s:
+            errors.append(f"{where}: max_s is below min_s")
+
     # Load model.
     load = scenario.load
     if load.model == "closed":
@@ -644,11 +1099,22 @@ def lint(scenario: Scenario) -> List[str]:
             errors.append("load.virtual_users must be at least 1 in the closed model")
         if load.arrival_rate_per_min:
             errors.append("load.arrival_rate_per_min is meaningless in the closed model")
-    else:
+    elif load.model == "open":
         if load.arrival_rate_per_min <= 0:
             errors.append("load.arrival_rate_per_min must be positive in the open model")
         if load.pacing_s:
             errors.append("load.pacing_s is meaningless in the open model, arrivals are already paced")
+    else:
+        crons = [step for step in scenario.steps if step.cron]
+        if not crons:
+            errors.append(
+                "load.model is schedule but no step has a cron: use steps_from: saved with "
+                "only_scheduled, or give each step a cron"
+            )
+        if load.arrival_rate_per_min or load.pacing_s:
+            errors.append("load.arrival_rate_per_min and pacing_s are meaningless in the schedule model")
+        if not load.duration_s:
+            errors.append("load.duration is required in the schedule model")
     for i, stage in enumerate(load.ramp):
         if stage.to is not None and stage.to < 0:
             errors.append(f"load.ramp[{i}]: target must not be negative")
@@ -672,6 +1138,32 @@ def lint(scenario: Scenario) -> List[str]:
             f"{ADVICE_PREFIX}time_policy.jitter is 0: every iteration then reads the same "
             "buckets, which the host page cache will serve from RAM and make the cluster "
             "look faster than it is. Set a jitter of at least a few minutes"
+        )
+    if tp.mode == "rolling" and 0 < tp.jitter_s < tp.align_s:
+        errors.append(
+            f"time_policy.jitter ({tp.jitter_s:.0f}s) is smaller than align ({tp.align_s:.0f}s), "
+            "so alignment rounds the jitter away and every iteration in the same minute "
+            "dispatches an identical window. Raise the jitter or lower the alignment"
+        )
+    if tp.mode == "relative":
+        errors.append(
+            f"{ADVICE_PREFIX}time_policy.mode is relative: the target evaluates the saved "
+            "modifiers itself, so the working set does not move between iterations and the "
+            "page cache is part of what is measured. Faithful to the schedule, not to the "
+            "cluster"
+        )
+    relative_steps = 0
+    for step in scenario.steps:
+        policy = step.time_policy
+        if policy is not None and policy.mode == "relative":
+            relative_steps += 1
+            if not (policy.earliest_rel and policy.latest_rel):
+                errors.append(f"step {step.id}: a relative time range needs earliest and latest")
+    if relative_steps and tp.mode != "relative":
+        errors.append(
+            f"{ADVICE_PREFIX}{relative_steps} step(s) use relative time ranges (time_from_saved: "
+            "as_saved): the target evaluates the saved modifiers itself, so the working set "
+            "does not move between iterations and the page cache is part of what is measured"
         )
 
     # Guard rails.

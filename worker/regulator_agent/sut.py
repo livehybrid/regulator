@@ -6,7 +6,7 @@ and the difference between "p95 went from 4 s to 11 s" and "p95 went from 4 s to
 11 s because indexer CPU hit 95% and 340 scheduled searches were skipped" is the
 difference between a load test and a benchmark.
 
-Five questions, each answered by one search against Splunk's own internal
+Seven questions, each answered by one search against Splunk's own internal
 indexes:
 
 ``_audit``
@@ -117,12 +117,31 @@ def build_probes(marker_prefix: str) -> List[Probe]:
                 "the cluster's own account of the searches this run dispatched, matched "
                 "by the run marker each one carries as a Splunk comment"
             ),
+            # info=completed: Splunk writes a granted record at dispatch and a
+            # completed record at the end, and only the second carries
+            # total_run_time. Counting both reported twice the searches and
+            # averaged a field half the rows did not have. Confirmed on a
+            # live 10.4 instance.
             spl=(
-                f'search index=_audit action=search "{marker_prefix}" '
+                f'search index=_audit action=search info=completed "{marker_prefix}" '
                 "| stats count as searches, "
                 "avg(total_run_time) as avg_run_time_s, "
                 "perc95(total_run_time) as p95_run_time_s, "
-                "max(total_run_time) as max_run_time_s"
+                "max(total_run_time) as max_run_time_s, "
+                "sum(scan_count) as scan_count, sum(event_count) as event_count"
+            ),
+        ),
+        Probe(
+            name="our_page_loads",
+            description=(
+                "dashboard loads this run's browser cohort made, matched by the marker "
+                "each page URL carries. Browser searches are the page's own and carry "
+                "no marker, so this is the browser channel's audit trail"
+            ),
+            spl=(
+                f'search index=_internal sourcetype=splunk_web_access "_reg={marker_prefix}" '
+                "| stats count as page_loads, avg(spent) as avg_spent_ms, "
+                "perc95(spent) as p95_spent_ms"
             ),
         ),
         Probe(
@@ -133,7 +152,8 @@ def build_probes(marker_prefix: str) -> List[Probe]:
                 "silently mixed into the result"
             ),
             spl=(
-                "search index=_audit action=search "
+                "search index=_audit action=search info=completed "
+                "| eval search_type=coalesce(search_type, \"unknown\") "
                 "| stats count as searches, dc(user) as users, "
                 "perc95(total_run_time) as p95_run_time_s by search_type"
             ),
@@ -144,11 +164,17 @@ def build_probes(marker_prefix: str) -> List[Probe]:
                 "where the time went, split by phase. Indexer-side elapsed time is what "
                 "separates a busy search head from busy indexers"
             ),
+            # phase_0 is the map phase on the peers and phase_1 the reduce on
+            # the search head. A standalone instance reports only phase_1
+            # (checked live), so both are read and the summary says which.
             spl=(
                 "search index=_introspection sourcetype=search_telemetry "
                 "| stats count as searches, "
                 "avg('phases.phase_0.elapsed_time_aggregations.avg') as avg_indexer_ms, "
-                "perc95('phases.phase_0.elapsed_time_aggregations.max') as p95_indexer_ms"
+                "perc95('phases.phase_0.elapsed_time_aggregations.max') as p95_indexer_ms, "
+                "avg('phases.phase_1.elapsed_time_aggregations.avg') as avg_reduce_ms, "
+                "perc95('phases.phase_1.elapsed_time_aggregations.max') as p95_reduce_ms, "
+                "avg('search_commands{}.maxPeerDuration') as avg_max_peer_s"
             ),
         ),
         Probe(
@@ -170,8 +196,10 @@ def build_probes(marker_prefix: str) -> List[Probe]:
                 "bucket-level provenance taken from the cache manager API"
             ),
             spl=(
-                "search index=_internal component=CacheManager "
-                "| stats count by log_level, component"
+                "search index=_internal sourcetype=splunkd component=CacheManager "
+                "| eval kind=case(match(_raw, \"(?i)download\"), \"download\", "
+                "match(_raw, \"(?i)evict\"), \"evict\", true(), \"other\") "
+                "| stats count by kind, log_level"
             ),
         ),
         Probe(
@@ -180,11 +208,13 @@ def build_probes(marker_prefix: str) -> List[Probe]:
                 "search head and indexer CPU over the run, so a latency curve can be "
                 "laid against the machine's own load"
             ),
+            # By host, so a search head and its indexers are never averaged
+            # into one number that describes neither.
             spl=(
-                "search index=_introspection component=Hostwide "
+                "search index=_introspection sourcetype=splunk_resource_usage component=Hostwide "
                 "| stats avg('data.cpu_system_pct') as avg_system_cpu_pct, "
                 "avg('data.cpu_user_pct') as avg_user_cpu_pct, "
-                "max('data.cpu_user_pct') as max_user_cpu_pct"
+                "max('data.cpu_user_pct') as max_user_cpu_pct by host"
             ),
         ),
     ]
@@ -278,23 +308,32 @@ def _findings(correlation: Dict[str, Any]) -> List[str]:
         return rows[0] if rows and probe.get("available") else {}
 
     ours = first_row("our_searches")
-    if ours.get("searches"):
+    if ours.get("searches") is not None:
         counted = int(float(ours["searches"] or 0))
         p95 = _number(ours.get("p95_run_time_s"))
         tail = f", p95 run time {p95}s" if p95 != "unknown" else ""
         if counted:
             findings.append(
-                f"the cluster's audit trail has at least {counted} of this run's "
-                f"searches{tail}. This is a floor rather than a total: audit records "
-                "keep arriving for a minute or two after a run, and correlation happens "
-                "immediately, so use the aggregate probes below for analysis"
+                f"the cluster's audit trail has {counted} completed searches from this "
+                f"run{tail}. A floor rather than a total: audit records keep arriving for "
+                "a minute or two after a run and correlation happens immediately"
             )
         else:
-            findings.append(
-                "the cluster's audit trail has none of this run's searches yet. Audit "
-                "records go through the indexing pipeline, so on a busy indexer they can "
-                "take longer to appear than the settle delay allows"
-            )
+            pages = first_row("our_page_loads")
+            if pages.get("page_loads") and int(float(pages["page_loads"] or 0)):
+                findings.append(
+                    f"this was a browser run: {int(float(pages['page_loads']))} dashboard "
+                    f"loads carry the run marker in the web access log (p95 "
+                    f"{_number(pages.get('p95_spent_ms'))}ms server side). The searches a "
+                    "page fires are Splunk Web's own and carry no marker, so they appear "
+                    "under the aggregate probes only"
+                )
+            else:
+                findings.append(
+                    "the cluster's audit trail has none of this run's searches yet. Audit "
+                    "records go through the indexing pipeline, so on a busy indexer they can "
+                    "take longer to appear than the settle delay allows"
+                )
 
     scheduler = probes.get("scheduler") or {}
     if scheduler.get("available"):
@@ -313,19 +352,28 @@ def _findings(correlation: Dict[str, Any]) -> List[str]:
     telemetry = first_row("search_telemetry")
     if telemetry.get("avg_indexer_ms"):
         findings.append(
-            f"mean indexer-side elapsed time {_number(telemetry.get('avg_indexer_ms'))}ms: "
-            "compare with client latency to see whether the time went to the indexers or "
-            "to the search head"
+            f"mean indexer-side (map phase) elapsed time {_number(telemetry.get('avg_indexer_ms'))}ms "
+            f"against {_number(telemetry.get('avg_reduce_ms'))}ms on the search head: compare "
+            "with client latency to see where the time went"
+        )
+    elif telemetry.get("avg_reduce_ms"):
+        findings.append(
+            f"search telemetry reports only a search-head phase (mean "
+            f"{_number(telemetry.get('avg_reduce_ms'))}ms): there was no distributed map "
+            "phase, which is what a single instance looks like"
         )
 
-    resources = first_row("resource_usage")
-    if resources.get("max_user_cpu_pct"):
-        peak = float(resources["max_user_cpu_pct"])
-        findings.append(f"peak user CPU on the target was {peak:.0f}%")
+    resources_probe = probes.get("resource_usage") or {}
+    for row in (resources_probe.get("rows") or []) if resources_probe.get("available") else []:
+        if not row.get("max_user_cpu_pct"):
+            continue
+        peak = float(row["max_user_cpu_pct"])
+        host = row.get("host") or "the target"
+        findings.append(f"peak user CPU on {host} was {peak:.0f}%")
         if peak > 90:
             findings.append(
-                "the target was CPU bound at peak, so latency past that point describes "
-                "a saturated machine rather than a search-tier characteristic"
+                f"{host} was CPU bound at peak, so latency past that point describes a "
+                "saturated machine rather than a search-tier characteristic"
             )
 
     if not findings:

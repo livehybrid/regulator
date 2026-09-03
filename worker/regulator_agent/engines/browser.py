@@ -43,6 +43,7 @@ cohort for the experience measurement, not a thousand browsers.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import logging
 import re
 import time
@@ -68,8 +69,11 @@ log = logging.getLogger("regulator.browser")
 # classic and the Studio data layers go through it, which is why matching here
 # is deliberately broad rather than pinned to one framework's exact URL.
 _SEARCH_XHR = re.compile(r"/splunkd/__raw/services(NS/[^/]+/[^/]+)?/search/(v2/)?jobs")
-_SID_IN_BODY = re.compile(r'"sid"\s*:\s*"([^"]+)"')
 _SID_IN_PATH = re.compile(r"/jobs/([^/?]+)")
+_IS_DONE_TRUE = re.compile(r'"isDone"\s*:\s*(true|"1"|1)\b')
+
+# How many of a page's jobs to read back for the server-side join.
+MAX_JOBS_TO_JOIN = 8
 
 # A dashboard that has not painted anything after this long is not going to.
 DEFAULT_STEP_TIMEOUT_S = 120.0
@@ -208,6 +212,20 @@ class BrowserEngine:
         # browser-only run against a target whose management port is firewalled
         # should still produce page timings rather than refusing to start.
 
+    @property
+    def client(self) -> SplunkClient:
+        """The splunkd client, for the cache and correlation code around a run.
+
+        The same attribute the API engine exposes, because the entrypoint reads
+        cache state and correlates through ``engine.client`` for whichever
+        engine the scenario chose. Without this every browser run died with an
+        AttributeError after lint and before the first page load, which no test
+        caught because every browser test drove the engine directly rather than
+        through the entrypoint. The client starts itself on first use.
+        """
+        self._client_started = True
+        return self._client
+
     async def _ensure_client(self) -> SplunkClient:
         """Start the splunkd client on first use, not at launch.
 
@@ -306,76 +324,27 @@ class BrowserEngine:
 
     async def execute(self, ctx: StepContext) -> StepRecord:
         record = ctx.blank_record()
-        began = time.perf_counter()
+        record.spl_hash = hashlib.sha256(
+            f"{ctx.step.app}/{ctx.step.dashboard}".encode("utf-8")
+        ).hexdigest()[:16]
 
         try:
             entry = await self._context_for(ctx.vu_id)
-            first_visit = entry.iterations == 0
-            entry.iterations += 1
-
-            sids: List[str] = []
-            xhr_count = 0
-            static_bytes = 0
-            js_errors = 0
-
             page = entry.page
 
-            def on_response(response: Any) -> None:
-                nonlocal xhr_count, static_bytes
-                url = response.url
-                if _SEARCH_XHR.search(url):
-                    xhr_count += 1
-                    found = _SID_IN_PATH.search(url)
-                    if found and found.group(1) not in sids:
-                        sids.append(found.group(1))
-                elif any(url.endswith(ext) for ext in (".js", ".css", ".woff2", ".png", ".svg")):
-                    try:
-                        static_bytes += int(response.headers.get("content-length", 0) or 0)
-                    except (TypeError, ValueError):
-                        pass
+            # Login is outside the measured window. A real user logs in once
+            # a day; measuring it inside the first iteration's service time
+            # made iteration zero of every virtual user the slowest of the run
+            # for a reason that had nothing to do with the dashboard.
+            if not entry.logged_in:
+                await self._login(page)
+                entry.logged_in = True
 
-            def on_page_error(_error: Any) -> None:
-                nonlocal js_errors
-                js_errors += 1
+            first_visit = entry.iterations == 0
+            entry.iterations += 1
+            record.params = {**record.params, "first_visit": first_visit}
 
-            page.on("response", on_response)
-            page.on("pageerror", on_page_error)
-
-            try:
-                if not entry.logged_in:
-                    await self._login(page)
-                    entry.logged_in = True
-
-                url = self._dashboard_url(ctx)
-                await page.goto(url, wait_until="domcontentloaded", timeout=DEFAULT_STEP_TIMEOUT_S * 1000)
-
-                first_panel_ms, panels = await self._wait_for_panels(page, ctx)
-                timings = await self._page_timings(page)
-                timings.apply(record)
-
-                record.first_panel_ms = first_panel_ms
-                record.ttfr_ms = first_panel_ms
-                record.panels = panels
-                record.xhr_count = xhr_count
-                record.static_bytes = static_bytes or None
-                record.js_errors = js_errors
-                record.sids = list(sids) or None
-                record.params = {**record.params, "first_visit": first_visit}
-
-                # Join back to the server's own accounting for whichever search
-                # the page ran. This is what makes a browser number and an API
-                # number comparable rather than merely adjacent.
-                if sids:
-                    await self._attach_job_stats(record, sids[0])
-
-                record.ok = js_errors == 0
-                if js_errors:
-                    record.error_class = ERROR_CLIENT
-                    record.error_detail = f"{js_errors} JavaScript error(s) on the page"
-            finally:
-                page.remove_listener("response", on_response)
-                page.remove_listener("pageerror", on_page_error)
-
+            await self._load_dashboard(ctx, entry, record)
         except asyncio.CancelledError:
             raise
         except BrowserUnavailable:
@@ -388,9 +357,117 @@ class BrowserEngine:
                 # Credentials being rejected is unrecoverable and would
                 # otherwise produce thousands of identical failures.
                 raise
-
-        record.service_time_ms = (time.perf_counter() - began) * 1000.0
         return record
+
+    async def _load_dashboard(self, ctx: StepContext, entry: _Context, record: StepRecord) -> None:
+        """One dashboard load, timed from the request to the data on screen."""
+        page = entry.page
+        sids: List[str] = []
+        done_sids: set[str] = set()
+        xhr_count = 0
+        static_bytes = 0
+        js_errors = 0
+        pending_bodies: List[asyncio.Task[None]] = []
+
+        async def read_status(response: Any, sid: str) -> None:
+            # The page polls each job it started; the poll bodies say when a
+            # job is done. Reading them means "a panel has data" can be
+            # required to coincide with "its search finished", which is what
+            # keeps a wrapper Studio renders before any data arrives from
+            # counting as a painted panel.
+            try:
+                body = await response.text()
+            except Exception:  # noqa: BLE001
+                return
+            if _IS_DONE_TRUE.search(body):
+                done_sids.add(sid)
+
+        def on_response(response: Any) -> None:
+            nonlocal xhr_count, static_bytes
+            url = response.url
+            if _SEARCH_XHR.search(url):
+                xhr_count += 1
+                found = _SID_IN_PATH.search(url)
+                if found:
+                    sid = found.group(1)
+                    if sid not in sids:
+                        sids.append(sid)
+                    if response.request.method == "GET":
+                        pending_bodies.append(asyncio.ensure_future(read_status(response, sid)))
+            elif any(ext in url for ext in (".js", ".css", ".woff2", ".png", ".svg")):
+                try:
+                    static_bytes += int(response.headers.get("content-length", 0) or 0)
+                except (TypeError, ValueError):
+                    pass
+
+        def on_page_error(_error: Any) -> None:
+            nonlocal js_errors
+            js_errors += 1
+
+        page.on("response", on_response)
+        page.on("pageerror", on_page_error)
+        began = time.perf_counter()
+        try:
+            url = self._dashboard_url(ctx)
+            await page.goto(url, wait_until="domcontentloaded", timeout=DEFAULT_STEP_TIMEOUT_S * 1000)
+
+            if "/account/login" in page.url:
+                # Splunk Web's session aged out mid-run (server.conf
+                # sessionTimeout, an hour by default). Log in again once and
+                # retry, rather than measuring a login page as a very fast
+                # dashboard for the rest of the soak.
+                entry.logged_in = False
+                await self._login(page)
+                entry.logged_in = True
+                began = time.perf_counter()
+                await page.goto(url, wait_until="domcontentloaded", timeout=DEFAULT_STEP_TIMEOUT_S * 1000)
+                record.params = {**record.params, "relogin": True}
+
+            first_panel_ms, panels, settled_ms = await self._wait_for_panels(
+                page, ctx, began, sids, done_sids
+            )
+            timings = await self._page_timings(page)
+            timings.apply(record)
+
+            record.first_panel_ms = first_panel_ms
+            record.ttfr_ms = first_panel_ms
+            record.panels = panels
+            record.xhr_count = xhr_count
+            record.static_bytes = static_bytes or None
+            record.js_errors = js_errors
+            record.sids = list(sids) or None
+            if settled_ms is not None:
+                record.params = {**record.params, "settled_ms": settled_ms}
+
+            if first_panel_ms is None:
+                # Nothing painted inside the timeout. That is the failure a
+                # dashboard has, and filing it as a 120 second success hid
+                # expired sessions, missing views and errored panels alike.
+                record.ok = False
+                record.error_class = ERROR_TIMEOUT
+                record.error_detail = (
+                    f"no panel showed data within {DEFAULT_STEP_TIMEOUT_S:.0f}s "
+                    f"({xhr_count} search requests seen, {js_errors} JavaScript errors)"
+                )
+            else:
+                # JavaScript errors are recorded, not fatal: Splunk Web throws
+                # a benign one or two on most pages (telemetry beacons, a
+                # third-party app's bundle), and failing every step on them
+                # aborted runs that were measuring perfectly well.
+                record.ok = True
+
+            # Join back to the server's own accounting. The slowest job the
+            # page ran is the one that decided when it settled, so that is
+            # the one whose statistics describe the load.
+            if sids:
+                await self._attach_job_stats(record, sids, ctx)
+        finally:
+            page.remove_listener("response", on_response)
+            page.remove_listener("pageerror", on_page_error)
+            for task in pending_bodies:
+                if not task.done():
+                    task.cancel()
+        record.service_time_ms = (time.perf_counter() - began) * 1000.0
 
     # ------------------------------------------------------------------
 
@@ -438,10 +515,22 @@ class BrowserEngine:
             wait_until="domcontentloaded",
             timeout=DEFAULT_STEP_TIMEOUT_S * 1000,
         )
-        await page.fill("input[name='username']", target.username)
-        await page.fill("input[name='password']", target.password)
-        await page.click("input[type='submit'], button[type='submit']")
-        await page.wait_for_load_state("domcontentloaded")
+        await page.locator("input[name='username']").first.fill(target.username)
+        await page.locator("input[name='password']").first.fill(target.password)
+        # Wait for the URL to leave the login page rather than for the load
+        # state of the document that is still the login form. Under load the
+        # form post takes long enough that reading page.url straight after
+        # the click reported a rejected login that was merely slow.
+        await page.locator("input[type='submit'], button[type='submit'], button").first.click()
+        try:
+            await page.wait_for_url(
+                lambda url: "/account/login" not in url,
+                timeout=DEFAULT_STEP_TIMEOUT_S * 1000,
+            )
+        except Exception as exc:  # noqa: BLE001 - still on the login page
+            raise PermissionError(
+                f"Splunk Web did not leave the login page: {str(exc)[:120]}"
+            ) from exc
         if "/account/login" in page.url:
             raise PermissionError("Splunk Web rejected the load-test credentials")
 
@@ -453,47 +542,89 @@ class BrowserEngine:
         whatever the dashboard's saved default happens to be.
         """
         target = self._config.target
-        query = urlencode(
-            {
-                "earliest": f"{ctx.window.earliest:.0f}",
-                "latest": f"{ctx.window.latest:.0f}",
-                # Lands in the access log and in _audit, so a page load can be
-                # reconciled against the target's own record of it.
-                "_reg": ctx.marker,
-            }
-        )
-        return f"{target.web_url}/en-GB/app/{ctx.step.app}/{ctx.step.dashboard}?{query}"
+        earliest = ctx.window.earliest_rel or f"{ctx.window.earliest:.0f}"
+        latest = ctx.window.latest_rel or f"{ctx.window.latest:.0f}"
+        params: Dict[str, str] = {
+            # A dashboard whose time input has no token reads these.
+            "earliest": earliest,
+            "latest": latest,
+            # Lands in the web access log, so a page load can be reconciled
+            # against the target's own record of it.
+            "_reg": ctx.marker,
+        }
+        if ctx.step.time_token:
+            # A named time input reads form.<token>.earliest and ignores the
+            # bare parameters, which is how every browser step ran the
+            # dashboard's saved default for a while.
+            params[f"form.{ctx.step.time_token}.earliest"] = earliest
+            params[f"form.{ctx.step.time_token}.latest"] = latest
+        for name, value in ctx.params.items():
+            if name in ("first_visit", "relogin", "settled_ms"):
+                continue
+            params[f"form.{name}"] = str(value)
+        return f"{target.web_url}/en-GB/app/{ctx.step.app}/{ctx.step.dashboard}?{urlencode(params)}"
 
-    async def _wait_for_panels(self, page: Any, ctx: StepContext) -> Tuple[Optional[float], int]:
-        """Wait for what the operator asked for, and time it.
+    async def _wait_for_panels(
+        self,
+        page: Any,
+        ctx: StepContext,
+        began: float,
+        sids: List[str],
+        done_sids: set[str],
+    ) -> Tuple[Optional[float], int, Optional[float]]:
+        """Wait for what the operator asked for, and time it from the request.
 
         ``first_result`` is the number that maps to perceived responsiveness:
-        when did anything appear. ``all_panels`` is when the page settled. They
-        are different questions and a dashboard can be good at one and bad at
-        the other, so the scenario chooses.
+        when did anything appear. ``all_panels`` is when the page settled.
+        They are different questions and a dashboard can be good at one and
+        bad at the other, so the scenario chooses and both are recorded.
+
+        "Anything appeared" means a data selector is visible AND, when the
+        page has started searches, at least one of them has finished. Studio
+        renders its visualisation wrappers before any data arrives, so the
+        selector alone fired at layout time and measured React mounting.
         """
-        began = time.perf_counter()
         selector = ", ".join(PANEL_READY_SELECTORS)
-        try:
-            await page.wait_for_selector(
-                selector, timeout=DEFAULT_STEP_TIMEOUT_S * 1000, state="visible"
-            )
-        except Exception:  # noqa: BLE001 - no panel is a result, not a crash
-            return None, 0
+        deadline = began + DEFAULT_STEP_TIMEOUT_S
+        first_panel_ms: Optional[float] = None
+        panels = 0
 
-        first_panel_ms = (time.perf_counter() - began) * 1000.0
-
-        if ctx.step.wait_for == "all_panels":
+        while time.perf_counter() < deadline:
             try:
-                await page.wait_for_load_state("networkidle", timeout=DEFAULT_STEP_TIMEOUT_S * 1000)
-            except Exception:  # noqa: BLE001 - a busy dashboard may never idle
-                log.debug("the page never reached network idle", exc_info=True)
+                visible = await page.eval_on_selector_all(
+                    selector,
+                    "els => els.filter(e => e.offsetParent !== null || e.getClientRects().length).length",
+                )
+            except Exception:  # noqa: BLE001 - a navigation mid-query
+                visible = 0
+            searches_seen = bool(sids)
+            if visible and (not searches_seen or done_sids):
+                first_panel_ms = (time.perf_counter() - began) * 1000.0
+                panels = int(visible or 0)
+                break
+            await asyncio.sleep(0.1)
 
-        try:
-            panels = await page.eval_on_selector_all(selector, "els => els.length")
-        except Exception:  # noqa: BLE001
-            panels = 0
-        return first_panel_ms, int(panels or 0)
+        if first_panel_ms is None:
+            return None, 0, None
+
+        settled_ms: Optional[float] = None
+        if ctx.step.wait_for == "all_panels":
+            # Settled means every search the page started has finished. The
+            # network never goes idle on a real Splunk page (it polls its own
+            # health and messages), so networkidle was a 120 s timeout that
+            # got swallowed and added to service time without being recorded.
+            while time.perf_counter() < deadline:
+                if sids and all(sid in done_sids for sid in sids):
+                    break
+                if not sids:
+                    break
+                await asyncio.sleep(0.2)
+            settled_ms = (time.perf_counter() - began) * 1000.0
+            try:
+                panels = int(await page.eval_on_selector_all(selector, "els => els.length") or 0)
+            except Exception:  # noqa: BLE001
+                pass
+        return first_panel_ms, panels, settled_ms
 
     async def _page_timings(self, page: Any) -> PageTimings:
         try:
@@ -509,30 +640,72 @@ class BrowserEngine:
             lcp_ms=raw.get("lcp_ms"),
         )
 
-    async def _attach_job_stats(self, record: StepRecord, sid: str) -> None:
-        """The server's half, for a search the page ran rather than we did."""
+    async def _attach_job_stats(self, record: StepRecord, sids: List[str], ctx: StepContext) -> None:
+        """The server's half, for the searches the page ran rather than we did.
+
+        Reads up to a handful of the page's jobs and keeps the slowest, since
+        that is the one that decided when the page settled. Also checks the
+        job's own time range against the window the URL asked for, which is
+        the only proof available that the dashboard honoured the pin.
+        """
         try:
             client = await self._ensure_client()
-            job = await client.job_status(sid)
-        except Exception:  # noqa: BLE001 - the job may already have aged out, and
-            # enrichment failing must never turn a good page measurement into a
-            # failed step.
+        except Exception as exc:  # noqa: BLE001 - enrichment never fails a page measurement
+            record.params = {**record.params, "job_stats": f"unavailable: {str(exc)[:120]}"}
             return
-        record.sid = sid
-        record.run_duration_s = job.run_duration_s
-        record.scan_count = job.scan_count
-        record.event_count = job.event_count
-        record.result_count = job.result_count
-        record.dispatch_state = job.dispatch_state
+        slowest = None
+        pinned: Optional[bool] = None
+        for sid in sids[:MAX_JOBS_TO_JOIN]:
+            try:
+                job = await client.job_status(sid)
+            except Exception:  # noqa: BLE001 - the job may already have aged out
+                continue
+            if slowest is None or (job.run_duration_s or 0) > (slowest.run_duration_s or 0):
+                slowest = job
+            if pinned is None and job.earliest_time and not ctx.window.is_relative:
+                pinned = _within(job.earliest_time, ctx.window.earliest, 120.0)
+        if slowest is None:
+            record.params = {**record.params, "job_stats": "unavailable"}
+            return
+        record.sid = slowest.sid
+        record.run_duration_s = slowest.run_duration_s
+        record.scan_count = slowest.scan_count
+        record.event_count = slowest.event_count
+        record.result_count = slowest.result_count
+        record.dispatch_state = slowest.dispatch_state
+        if pinned is not None:
+            record.params = {**record.params, "time_pinned": pinned}
+            if not pinned:
+                record.partial = True
+                record.messages = [
+                    "the dashboard's searches did not use the time range the URL asked for: "
+                    "set time_token to the dashboard's time input token"
+                ]
 
     @staticmethod
     def _classify(exc: Exception) -> str:
         name = type(exc).__name__.lower()
         text = str(exc).lower()
-        if isinstance(exc, PermissionError) or "credential" in text or "unauthor" in text:
+        if isinstance(exc, PermissionError):
             return ERROR_AUTH
         if "timeout" in name or "timeout" in text:
             return ERROR_TIMEOUT
-        if "5" == text[:1] and "server" in text:
+        if re.search(r"\b5\d\d\b", text) or "net::err_" in text:
             return ERROR_SERVER
         return ERROR_CLIENT
+
+
+def _within(iso: str, epoch: float, tolerance_s: float) -> bool:
+    """Whether an ISO-8601 time from splunkd is within tolerance of an epoch."""
+    import datetime as _dt
+
+    try:
+        text = iso.strip()
+        if text.endswith("Z"):
+            text = text[:-1] + "+00:00"
+        moment = _dt.datetime.fromisoformat(text)
+    except ValueError:
+        return True
+    if moment.tzinfo is None:
+        moment = moment.replace(tzinfo=_dt.timezone.utc)
+    return abs(moment.timestamp() - epoch) <= tolerance_s

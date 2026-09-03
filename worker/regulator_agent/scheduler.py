@@ -72,8 +72,11 @@ from .params import (
     apply_cache_bust,
     cache_bust_marker,
     persona_for_vu,
+    rng_for,
     think_time_for,
+    weighted_pick,
 )
+from .savedsearches import Cron, parse_cron
 from .results import (
     OUTCOME_ABORTED,
     OUTCOME_COMPLETED,
@@ -86,6 +89,8 @@ from .results import (
 )
 from .scenario import LoadModel, Persona, RampStage, Scenario, Step
 from .timepolicy import resolve_window
+
+import datetime as _dt
 
 log = logging.getLogger("regulator.scheduler")
 
@@ -105,8 +110,9 @@ MIN_SAMPLES_FOR_GUARD = 20
 # cope, which is both unrealistic and unkind.
 MAX_CATCHUP_S = 30.0
 
-# How long in-flight work is allowed to finish after a stop is requested.
-DRAIN_BUDGET_S = 30.0
+# How long in-flight work is allowed to finish after a stop is requested, when
+# the configuration does not say. Config.drain_budget_s normally decides.
+DRAIN_BUDGET_S = 60.0
 
 
 class Ramp:
@@ -142,6 +148,24 @@ class Ramp:
             current = final_target
         self._final = current
 
+    @staticmethod
+    def scaled(stages: Sequence[RampStage], declared: float, wanted: float) -> List[RampStage]:
+        """The same ramp shape, climbing to a different plateau.
+
+        An override of the virtual-user count used to drop the ramp entirely,
+        so REG_VUS=400 against a scenario that climbed gently to 50 created
+        four hundred users in the first quarter second, which is the
+        instantaneous ramp the class docstring warns about. Scaling every
+        target by the same factor keeps the shape and the timing.
+        """
+        if not stages or declared <= 0 or wanted == declared:
+            return list(stages)
+        factor = wanted / declared
+        return [
+            RampStage(to=(stage.to * factor if stage.to is not None else None), over_s=stage.over_s, hold_s=stage.hold_s)
+            for stage in stages
+        ]
+
     @property
     def duration_s(self) -> float:
         return sum(leg[0] for leg in self._legs)
@@ -172,6 +196,9 @@ class _Iteration:
     persona: Persona
     iteration: int
     intended_start: float  # monotonic
+    # Schedule model: exactly one step fires per iteration, after a skew.
+    only_step: Optional[Step] = None
+    delay_s: float = 0.0
 
 
 class Scheduler:
@@ -194,6 +221,11 @@ class Scheduler:
         self.stats = stats or RunStats(run_id=config.run_id, slot=config.slot)
         self.emitters: List[Any] = list(emitters or [])
         self.capabilities = capabilities
+        # One seed for every draw in the run: parameters, persona assignment,
+        # think time, jitter. The resolver already honours an override, and
+        # the rest used the scenario's own seed, so REG_SEED changed half the
+        # workload and the summary recorded none of it.
+        self.seed = resolver.seed
 
         self.load = self._effective_load()
         self.duration_s = self._effective_duration()
@@ -203,15 +235,22 @@ class Scheduler:
             if self.load.model == "closed"
             else float(self.load.arrival_rate_per_min),
         )
+        self._crons: Dict[str, Cron] = {}
+        if self.load.model == "schedule":
+            for step in scenario.steps:
+                if step.cron:
+                    self._crons[step.id] = parse_cron(step.cron)
+        self._arrivals_shed = 0
+        self._arrivals_skipped = 0
 
         self._stop = asyncio.Event()
         self._fatal: Optional[BaseException] = None
         self._abort_reason: Optional[str] = None
         self._invalid_reason: Optional[str] = None
         self._vu_tasks: Dict[int, asyncio.Task[None]] = {}
+        self._retiring: set[int] = set()
         self._open_tasks: set[asyncio.Task[None]] = set()
         self._peak_vus = 0
-        self._arrivals_missed = 0
         self._t0_monotonic = 0.0
         self._t0_wall = 0.0
 
@@ -232,27 +271,51 @@ class Scheduler:
         rate = self.config.arrival_rate_per_min
         pacing = self.config.pacing_s
 
+        if load.model == "schedule":
+            # The schedule is the load. Overrides that mean nothing here are
+            # ignored rather than silently changing the model.
+            return load
         if rate:
+            # The scenario's ramp climbs to its own rate; scale it to the
+            # requested one rather than keeping legs that top out at the old
+            # plateau (which made the override silently ignored) or dropping
+            # them (which makes the override an instantaneous step).
+            ramp = (
+                Ramp.scaled(load.ramp, load.arrival_rate_per_min, rate)
+                if load.model == "open"
+                else []
+            )
             return LoadModel(
                 model="open",
                 virtual_users=load.virtual_users,
                 arrival_rate_per_min=rate,
                 pacing_s=0.0,
-                ramp=load.ramp if load.model == "open" else [],
+                ramp=ramp,
                 duration_s=load.duration_s,
+                arrivals=load.arrivals,
             )
         if vus or pacing:
+            wanted = vus or load.virtual_users
+            ramp = load.ramp
+            if load.model == "closed" and vus is not None and vus != load.virtual_users:
+                ramp = Ramp.scaled(load.ramp, float(load.virtual_users), float(vus))
+                if load.ramp:
+                    log.info(
+                        "virtual users overridden to %d: the scenario's ramp is scaled from "
+                        "its declared %d so the shape and timing are kept",
+                        vus,
+                        load.virtual_users,
+                    )
+            elif load.model != "closed":
+                ramp = []
             return LoadModel(
                 model="closed",
-                virtual_users=vus or load.virtual_users,
+                virtual_users=wanted,
                 arrival_rate_per_min=0.0,
                 pacing_s=pacing if pacing is not None else load.pacing_s,
-                # A ramp declared for a different virtual-user count would
-                # climb to the wrong plateau, so an override drops it unless
-                # the target matches. Being explicit beats a ramp that quietly
-                # tops out at a tenth of what was asked for.
-                ramp=load.ramp if (vus is None or vus == load.virtual_users) else [],
+                ramp=ramp,
                 duration_s=load.duration_s,
+                arrivals=load.arrivals,
             )
         return load
 
@@ -305,6 +368,8 @@ class Scheduler:
         try:
             if self.load.model == "closed":
                 await self._run_closed()
+            elif self.load.model == "schedule":
+                await self._run_schedule()
             else:
                 await self._run_open()
         except asyncio.CancelledError:
@@ -343,12 +408,17 @@ class Scheduler:
             self._peak_vus = max(self._peak_vus, len(self._vu_tasks))
 
             # Shrink. Cancelling mid-iteration would discard work already paid
-            # for and skew the record, so retirement is co-operative: the task
-            # is asked to finish its current iteration and stop.
-            while len(self._vu_tasks) > target:
-                vu_id, task = next(iter(sorted(self._vu_tasks.items(), reverse=True)))
-                self._vu_tasks.pop(vu_id, None)
-                task.cancel()
+            # for and skew the record (the slowest iterations are the ones most
+            # likely to be in flight), so retirement is co-operative: the
+            # virtual user is asked to finish its current iteration and stop.
+            # The previous version of this loop called task.cancel() under a
+            # comment saying exactly this, which is how a ramp-down came to
+            # drop a length-biased sample of the slowest searches.
+            active = [vu for vu in self._vu_tasks if vu not in self._retiring]
+            while len(active) > target:
+                vu_id = max(active)
+                self._retiring.add(vu_id)
+                active.remove(vu_id)
 
             try:
                 await asyncio.wait_for(self._stop.wait(), timeout=TICK_S)
@@ -374,10 +444,22 @@ class Scheduler:
         The schedule is computed from the ramp and never adjusted for how long
         work is taking. That is the entire point: if the target stalls, the
         arrivals keep coming and the queue is visible in the numbers.
+
+        Arrivals are Poisson by default: the gap to the next one is drawn from
+        an exponential distribution with the current rate's mean, from a
+        seeded stream so the sequence is reproducible. Evenly spaced arrivals
+        never burst, and bursts are what queue, so a uniform generator finds
+        an optimistic saturation point. ``load.arrivals: uniform`` is there
+        for when that is the question.
         """
         vu_id = self.config.slot * 1_000_000
         iteration = 0
         next_arrival = self._t0_monotonic
+        # While the ramp is at zero there is no schedule to be late against.
+        # Holding next_arrival at t0 through a zero-rate leg then reported
+        # the whole leg as loop lag on the first real arrival, and blamed a
+        # healthy worker for it.
+        idle = True
 
         while not self._stop.is_set():
             now = time.perf_counter()
@@ -387,9 +469,14 @@ class Scheduler:
 
             rate_per_min = max(0.0, self.ramp.target_at(elapsed))
             if rate_per_min <= 0:
+                idle = True
                 await asyncio.sleep(TICK_S)
+                self._check_guards()
                 continue
-            interval = 60.0 / rate_per_min
+            if idle:
+                next_arrival = now
+                idle = False
+            mean_interval = 60.0 / rate_per_min
 
             if now < next_arrival:
                 await asyncio.sleep(min(next_arrival - now, TICK_S))
@@ -399,19 +486,19 @@ class Scheduler:
             # An arrival issued after it was due, while there was capacity to
             # issue it, is the generator failing to keep time. Shedding because
             # max_in_flight is reached is a different thing and is counted
-            # separately as a missed arrival.
+            # separately.
             if len(self._open_tasks) < self.config.max_in_flight:
                 self.stats.record_loop_lag((now - next_arrival) * 1000.0)
 
             if len(self._open_tasks) >= self.config.max_in_flight:
                 # Shedding rather than blocking. Blocking here would reintroduce
                 # exactly the coordinated omission the open model exists to
-                # avoid, so the arrival is counted as missed and the schedule
-                # carries on. A run with missed arrivals is marked invalid,
+                # avoid, so the arrival is counted as shed and the schedule
+                # carries on. A run with shed arrivals is marked invalid,
                 # because the generator, not the target, set the ceiling.
-                self._arrivals_missed += 1
+                self._arrivals_shed += 1
             else:
-                persona = persona_for_vu(self.scenario.personas, vu_id, self.scenario.seed)
+                persona = persona_for_vu(self.scenario.personas, vu_id, self.seed)
                 job = _Iteration(
                     vu_id=vu_id,
                     persona=persona,
@@ -425,19 +512,98 @@ class Scheduler:
 
             vu_id += 1
             iteration += 1
-            next_arrival += interval
+            if self.load.arrivals == "poisson":
+                gap = rng_for(self.seed, "arrival", iteration).expovariate(1.0 / mean_interval)
+            else:
+                gap = mean_interval
+            next_arrival += gap
             # If we have fallen far behind the schedule, re-anchor rather than
             # firing a burst of overdue arrivals at a target that is already
             # struggling.
             if next_arrival < now - MAX_CATCHUP_S:
-                skipped = int((now - next_arrival) / interval)
-                self._arrivals_missed += skipped
+                skipped = int((now - next_arrival) / mean_interval)
+                self._arrivals_skipped += skipped
                 next_arrival = now
+            self._check_guards()
+
+    async def _run_schedule(self) -> None:
+        """Fire each step at its own cron times, as Splunk's scheduler would.
+
+        The scheduler is the workload here: a saved search that runs every
+        five minutes fires every five minutes, the ones on the hour all fire
+        together, and that burst is the thing worth measuring, because it is
+        where a real cluster queues. Splunk would skip searches over its
+        concurrency limit; Regulator dispatches them all and records the
+        queueing, since the point is to see it rather than to hide it.
+
+        The virtual clock starts at ``load.schedule_start`` when set, so the
+        09:00 burst can be replayed at midnight, and at the wall clock
+        otherwise. Each firing is an open-model arrival with its intended start
+        at the cron minute, so latency is coordinated-omission corrected.
+        """
+        start_wall = _dt.datetime.fromtimestamp(self._t0_wall)
+        virtual_origin = start_wall.replace(second=0, microsecond=0)
+        if self.load.schedule_start:
+            hours, minutes = (int(part) for part in self.load.schedule_start.split(":"))
+            virtual_origin = virtual_origin.replace(hour=hours, minute=minutes)
+        # Seconds from the wall-clock start to the first whole virtual minute.
+        first_minute_in = 60.0 - (self._t0_wall % 60.0)
+        virtual_minute = virtual_origin + _dt.timedelta(minutes=1)
+        due = self._t0_monotonic + first_minute_in
+        steps = [step for persona in self.scenario.personas for step in persona.steps if step.cron]
+        persona_of = {
+            step.id: persona for persona in self.scenario.personas for step in persona.steps
+        }
+        vu_id = self.config.slot * 1_000_000
+        iteration = 0
+
+        log.info(
+            "schedule model: %d scheduled search(es), virtual clock starts at %s",
+            len(steps),
+            virtual_origin.strftime("%H:%M"),
+        )
+
+        while not self._stop.is_set():
+            now = time.perf_counter()
+            if now - self._t0_monotonic >= self.duration_s:
+                break
+            if now < due:
+                await asyncio.sleep(min(due - now, TICK_S))
+                self._check_guards()
+                continue
+
+            self.stats.record_loop_lag((now - due) * 1000.0)
+            firing = [step for step in steps if self._crons[step.id].matches(virtual_minute)]
+            for step in firing:
+                skew = 0.0
+                if self.load.schedule_skew_s > 0:
+                    skew = rng_for(self.seed, "skew", iteration).uniform(0.0, self.load.schedule_skew_s)
+                if len(self._open_tasks) >= self.config.max_in_flight:
+                    self._arrivals_shed += 1
+                    continue
+                persona = persona_of[step.id]
+                job = _Iteration(
+                    vu_id=vu_id,
+                    persona=persona,
+                    iteration=iteration,
+                    intended_start=due + skew,
+                    only_step=step,
+                    delay_s=skew,
+                )
+                task = asyncio.create_task(self._run_iteration(job), name=f"cron-{step.id}-{iteration}")
+                self._open_tasks.add(task)
+                task.add_done_callback(self._open_tasks.discard)
+                self._peak_vus = max(self._peak_vus, len(self._open_tasks))
+                vu_id += 1
+                iteration += 1
+
+            virtual_minute += _dt.timedelta(minutes=1)
+            due += 60.0
             self._check_guards()
 
     async def _virtual_user(self, vu_id: int) -> None:
         """One simulated person, looping until the run ends."""
-        persona = persona_for_vu(self.scenario.personas, vu_id, self.scenario.seed)
+        persona = persona_for_vu(self.scenario.personas, vu_id, self.seed)
         iteration = 0
         due = time.perf_counter()
 
@@ -456,6 +622,12 @@ class Scheduler:
                 iteration += 1
                 self.stats.iterations_completed += 1
 
+                if vu_id in self._retiring:
+                    # Asked to retire during a ramp down. The iteration that
+                    # was in flight has been recorded; nothing more starts.
+                    self._retiring.discard(vu_id)
+                    return
+
                 if self.load.pacing_s > 0:
                     # Paced: the next iteration is due on the timetable,
                     # whatever this one cost. Falling behind is recorded rather
@@ -470,8 +642,8 @@ class Scheduler:
                 else:
                     think = think_time_for(
                         persona.think_time,
-                        DrawContext(self.scenario.seed, vu_id, iteration, "_think"),
-                        self.scenario.seed,
+                        DrawContext(self.seed, vu_id, iteration, "_think"),
+                        self.seed,
                     )
                     if think > 0:
                         await self._sleep_or_stop(think)
@@ -480,10 +652,29 @@ class Scheduler:
             # Co-operative retirement during a ramp down. Not an error.
             return
 
+    def _steps_for(self, job: _Iteration) -> List[Step]:
+        """Which steps this iteration runs.
+
+        A sequenced persona walks every step in order. A sampled persona
+        draws one step by weight, from a derived seed so the same iteration
+        draws the same step in the next run. The schedule model names the
+        step outright.
+        """
+        if job.only_step is not None:
+            return [job.only_step]
+        persona = job.persona
+        if persona.walk == "sample" and persona.steps:
+            weights = [step.weight if step.weight > 0 else 1.0 for step in persona.steps]
+            rng = rng_for(self.seed, "walk", job.vu_id, job.iteration)
+            return [weighted_pick(list(persona.steps), weights, rng)]
+        return list(persona.steps)
+
     async def _run_iteration(self, job: _Iteration) -> None:
         """Execute every step of one iteration, in order."""
+        if job.delay_s > 0:
+            await self._sleep_or_stop(job.delay_s)
         intended = job.intended_start
-        for step in job.persona.steps:
+        for step in self._steps_for(job):
             if self._stop.is_set():
                 return
             record = await self._run_step(job, step, intended)
@@ -498,7 +689,7 @@ class Scheduler:
         self, job: _Iteration, step: Step, intended_start: float
     ) -> Optional[StepRecord]:
         draw = DrawContext(
-            scenario_seed=self.scenario.seed,
+            scenario_seed=self.seed,
             vu_id=job.vu_id,
             iteration=job.iteration,
             step_id=step.id,
@@ -508,8 +699,12 @@ class Scheduler:
 
         source_text = step.spl if step.type == "search" else (step.dashboard or "")
         rendered, params = self.resolver.render(source_text or "", draw)
-        if step.type == "search" and self.config.cache_bust:
+        if step.type == "search" and self.config.cache_bust and step.dispatch != "saved":
+            # A saved search dispatched by name runs the target's own copy of
+            # the SPL, so there is nothing to append the marker to.
             rendered = apply_cache_bust(rendered, marker)
+        if step.saved:
+            params = {**params, "saved": step.saved, "dispatch": step.dispatch}
 
         ctx = StepContext(
             spl_template=step.spl or "",
@@ -530,6 +725,23 @@ class Scheduler:
         try:
             record = await self.engine.execute(ctx)
         except asyncio.CancelledError:
+            # The drain budget ran out with this search still in flight. The
+            # engine parked its record on the context; file it as a cancelled
+            # failure carrying the time it had accrued, so the tail of the run
+            # is reported as a floor rather than quietly discarded.
+            if ctx.outcome:
+                abandoned = ctx.outcome[0]
+                abandoned.intended_start = self._t0_wall + (intended_start - self._t0_monotonic)
+                abandoned.started_at = self._t0_wall + (began - self._t0_monotonic)
+                abandoned.late_by_ms = max(0.0, (began - intended_start) * 1000.0)
+                abandoned.co_corrected = self.load.co_corrected
+                abandoned.latency_ms = abandoned.service_time_ms
+                self.stats.record(abandoned)
+                for emitter in self.emitters:
+                    try:
+                        emitter.emit(abandoned)
+                    except Exception:  # noqa: BLE001
+                        pass
             raise
         except BaseException as exc:  # noqa: BLE001 - an engine that raises is fatal by contract
             self._fatal = exc
@@ -650,8 +862,9 @@ class Scheduler:
         pending = [t for t in list(self._vu_tasks.values()) + list(self._open_tasks) if not t.done()]
         if not pending:
             return
-        log.info("draining %d in-flight tasks (budget %.0fs)", len(pending), DRAIN_BUDGET_S)
-        done, still_pending = await asyncio.wait(pending, timeout=DRAIN_BUDGET_S)
+        budget = float(getattr(self.config, "drain_budget_s", DRAIN_BUDGET_S) or DRAIN_BUDGET_S)
+        log.info("draining %d in-flight tasks (budget %.0fs)", len(pending), budget)
+        done, still_pending = await asyncio.wait(pending, timeout=budget)
         for task in still_pending:
             task.cancel()
         if still_pending:
@@ -661,11 +874,17 @@ class Scheduler:
     def _summarise(self) -> RunSummary:
         ended = time.time()
 
-        if self._arrivals_missed and not self._invalid_reason:
+        if self._arrivals_shed and not self._invalid_reason:
             self._invalid_reason = (
-                f"{self._arrivals_missed} scheduled arrivals were never issued because the "
+                f"{self._arrivals_shed} scheduled arrivals were never issued because the "
                 f"worker hit its in-flight ceiling of {self.config.max_in_flight}: the "
                 f"generator set the ceiling, not the target"
+            )
+        if self._arrivals_skipped and not self._invalid_reason:
+            self._invalid_reason = (
+                f"{self._arrivals_skipped} scheduled arrivals were skipped because the "
+                f"generator fell more than {MAX_CATCHUP_S:.0f}s behind its own timetable and "
+                "re-anchored rather than burst: this worker could not keep time"
             )
 
         if self._fatal is not None:
@@ -678,9 +897,24 @@ class Scheduler:
             outcome = OUTCOME_COMPLETED
 
         snapshot = self.stats.snapshot()
-        snapshot["arrivals_missed"] = self._arrivals_missed
+        snapshot["arrivals_missed"] = self._arrivals_shed + self._arrivals_skipped
+        snapshot["arrivals_shed"] = self._arrivals_shed
+        snapshot["arrivals_skipped"] = self._arrivals_skipped
         if self.capabilities is not None:
             snapshot["target"] = self.capabilities.to_dict()
+
+        configured: Dict[str, Any] = {"model": self.load.model}
+        if self.load.model == "closed":
+            configured["virtual_users"] = self.load.virtual_users
+            configured["pacing_s"] = self.load.pacing_s
+        elif self.load.model == "open":
+            configured["arrival_rate_per_min"] = self.load.arrival_rate_per_min
+            configured["arrivals"] = self.load.arrivals
+        else:
+            configured["scheduled_steps"] = len(self._crons)
+            configured["schedule_start"] = self.load.schedule_start
+        configured["ramp_stages"] = len(self.load.ramp)
+        configured["duration_s"] = self.duration_s
 
         return RunSummary(
             run_id=self.config.run_id,
@@ -701,5 +935,7 @@ class Scheduler:
             stats=snapshot,
             abort_reason=self._abort_reason,
             scenario_seed=self.scenario.seed,
+            effective_seed=self.seed,
+            configured_load=configured,
             agent_version=__version__,
         )

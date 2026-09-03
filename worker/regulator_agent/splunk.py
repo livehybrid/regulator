@@ -113,6 +113,12 @@ class JobStatus:
     result_count: Optional[int] = None
     result_preview_count: Optional[int] = None
     messages: List[str] = field(default_factory=list)
+    # The range the job actually ran with, as ISO-8601 strings from splunkd.
+    # Recorded so a dashboard load can prove whether the time range the URL
+    # asked for was the one the page's searches used.
+    earliest_time: Optional[str] = None
+    latest_time: Optional[str] = None
+    search: Optional[str] = None
 
     @property
     def is_terminal(self) -> bool:
@@ -508,6 +514,14 @@ class SplunkClient:
             payload, _ = await self._json(
                 "GET", path, params={"count": "0", **(params or {})}, context=context
             )
+        except SplunkAuthError:
+            # _request turns a 401 or 403 into SplunkAuthError before _json
+            # can raise SplunkHttpError, so catching only the latter left the
+            # documented tolerance dead: a least-privileged account that got
+            # 403 on /services/search/distributed/peers killed the whole
+            # target report instead of losing one section of it. On an
+            # optional endpoint, "you may not read this" is an answer.
+            return []
         except SplunkHttpError as exc:
             if exc.status in (401, 403, 404, 503):
                 return []
@@ -645,6 +659,69 @@ class SplunkClient:
             raise SplunkError(f"dispatch returned no sid: {response.text[:200]!r}")
         return sid, dispatch_ms, response.status_code
 
+    # ------------------------------------------------------------------
+    # Saved searches
+    # ------------------------------------------------------------------
+    async def saved_searches(
+        self, app: Optional[str] = None, owner: str = "-"
+    ) -> List[Dict[str, Any]]:
+        """Every saved search visible to this account, optionally for one app.
+
+        Returned as raw REST entries (``name``, ``content``, ``acl``) so the
+        savedsearches module can turn them into the conf format without this
+        client knowing what a saved search is.
+        """
+        ns_app = quote(app, safe="") if app else "-"
+        path = f"/servicesNS/{quote(owner, safe='')}/{ns_app}/saved/searches"
+        payload, _ = await self._json(
+            "GET", path, params={"count": "0"}, context="saved searches"
+        )
+        entries = (payload or {}).get("entry") or []
+        return [entry for entry in entries if isinstance(entry, dict)]
+
+    async def dispatch_saved(
+        self,
+        name: str,
+        app: str,
+        window: TimeWindow,
+        *,
+        owner: str = "nobody",
+    ) -> Tuple[str, float, int]:
+        """Dispatch a saved search by name, as its scheduler would.
+
+        Returns ``(sid, dispatch_ms, http_status)`` like :meth:`create_job`.
+        The search runs with everything the stanza declares (its app context,
+        its dispatch settings, its knowledge objects), which is the most
+        faithful way to replay a workload that already exists on the target.
+        Alert actions are never triggered: a load test that emailed somebody
+        four hundred times would be remembered for the wrong reasons.
+        """
+        path = (
+            f"/servicesNS/{quote(owner, safe='')}/{quote(app, safe='')}/saved/searches/"
+            f"{quote(name, safe='')}/dispatch"
+        )
+        form: Dict[str, Any] = {"trigger_actions": "0"}
+        form.update({f"dispatch.{k}": v for k, v in window.as_args().items()})
+        started = time.perf_counter()
+        response = await self._request("POST", path, data=form, context="dispatch saved search")
+        dispatch_ms = (time.perf_counter() - started) * 1000.0
+        if response.status_code >= 400:
+            raise SplunkHttpError(response.status_code, response.text, context=f"dispatch {name}")
+        try:
+            payload = response.json()
+        except ValueError as exc:
+            raise SplunkError(
+                f"dispatch of {name!r} returned a body that is not JSON: {response.text[:200]!r}"
+            ) from exc
+        sid = ""
+        if isinstance(payload, dict):
+            sid = str(payload.get("sid") or "").strip() or str(
+                _first_content(payload).get("sid") or ""
+            ).strip()
+        if not sid:
+            raise SplunkError(f"dispatch of {name!r} returned no sid: {response.text[:200]!r}")
+        return sid, dispatch_ms, response.status_code
+
     async def job_status(self, sid: str) -> JobStatus:
         """One poll of a job's REST record."""
         payload, _ = await self._json(
@@ -664,6 +741,9 @@ class SplunkClient:
             result_count=_as_int(content.get("resultCount")),
             result_preview_count=_as_int(content.get("resultPreviewCount")),
             messages=_payload_messages(content),
+            earliest_time=(str(content["earliestTime"]) if content.get("earliestTime") else None),
+            latest_time=(str(content["latestTime"]) if content.get("latestTime") else None),
+            search=(str(content["search"]) if content.get("search") else None),
         )
 
     async def _fetch(

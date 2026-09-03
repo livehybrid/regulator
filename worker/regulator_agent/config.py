@@ -21,6 +21,7 @@ place there:
 from __future__ import annotations
 
 import os
+import time
 from dataclasses import dataclass, field
 from typing import Mapping, Optional
 
@@ -218,9 +219,29 @@ class Config:
 
     # Output.
     output_path: Optional[str]
+    summary_path: Optional[str]
     log_level: str
     metrics_port: int
     builtin_scenarios_dir: Optional[str]
+
+    # Run behaviour that used to be read straight from os.environ at the point
+    # of use, which meant a typo surfaced after the load had been generated
+    # rather than at boot.
+    lint_strict: bool = True
+    # How long in-flight searches may finish after the run ends before they
+    # are abandoned. Abandoned work is recorded as a cancelled failure with
+    # the time it had accrued, never silently dropped.
+    drain_budget_s: float = 60.0
+    # How long to wait for the target's own logging to catch up before asking
+    # it about the run.
+    sut_settle_s: float = 8.0
+    # Discovered or configured indexer management URIs, for SmartStore cache
+    # state on a distributed target. Empty means discover from the search
+    # peers, with the target's own credential.
+    indexer_urls: tuple[str, ...] = ()
+    indexer_token: Optional[str] = field(default=None, repr=False)
+    indexer_username: Optional[str] = None
+    indexer_password: Optional[str] = field(default=None, repr=False)
 
     @property
     def self_instrumented(self) -> bool:
@@ -332,7 +353,13 @@ def load_config(env: Optional[Mapping[str, str]] = None) -> Config:
         arrival_rate_per_min=arrival_rate,
         pacing_s=_number(env, "REG_PACING_S", 0.0, minimum=0.0) or None,
         seed=seed,
-        run_id=_get(env, "REG_RUN_LABEL", "local") or "local",
+        # The default carries the start time so two default-configured runs
+        # never emit byte-identical cache-busting markers for the same
+        # (virtual user, iteration, step): with a pinned time policy that
+        # made the second run's searches identical strings served straight
+        # from the dispatch cache, which is the exact hole the marker exists
+        # to close.
+        run_id=_get(env, "REG_RUN_LABEL") or f"local-{int(time.time())}",
         slot=_integer(env, "REG_SLOT", 0, minimum=0),
         total_workers=_integer(env, "REG_TOTAL_WORKERS", 1, minimum=1),
         max_in_flight=_integer(env, "REG_MAX_IN_FLIGHT", 512, minimum=1),
@@ -350,7 +377,19 @@ def load_config(env: Optional[Mapping[str, str]] = None) -> Config:
             if part.strip()
         ),
         output_path=_get(env, "REG_OUTPUT"),
+        summary_path=_get(env, "REG_SUMMARY_PATH"),
         log_level=log_level,
         metrics_port=_integer(env, "REG_METRICS_PORT", 0, minimum=0),
         builtin_scenarios_dir=_get(env, "REG_BUILTIN_SCENARIOS_DIR"),
+        lint_strict=_boolean(env, "REG_LINT_STRICT", True),
+        drain_budget_s=_number(env, "REG_DRAIN_BUDGET_S", 60.0, minimum=1.0),
+        sut_settle_s=_number(env, "REG_SUT_SETTLE_S", 8.0, minimum=0.0),
+        indexer_urls=tuple(
+            _url(env, "REG_INDEXER_URLS", part.strip()) or ""
+            for part in (_get(env, "REG_INDEXER_URLS", "") or "").split(",")
+            if part.strip()
+        ),
+        indexer_token=_get(env, "REG_INDEXER_TOKEN"),
+        indexer_username=_get(env, "REG_INDEXER_USERNAME"),
+        indexer_password=_get(env, "REG_INDEXER_PASSWORD"),
     )

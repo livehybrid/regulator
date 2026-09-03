@@ -408,8 +408,11 @@ def test_an_environment_override_replaces_the_scenario_virtual_users(env):
 
     assert scheduler.load.virtual_users == 6
     # The scenario's ramp climbed to 2, which would cap an override of 6 at a
-    # third of what was asked for. Dropping it is the honest behaviour.
-    assert scheduler.load.ramp == []
+    # third of what was asked for. Dropping it made the override an
+    # instantaneous step, the very thing a ramp exists to avoid, so the ramp
+    # is scaled: same shape, same timing, new plateau.
+    assert [stage.to for stage in scheduler.load.ramp] == [6.0]
+    assert scheduler.ramp.final_target == 6.0
 
 
 def test_an_arrival_rate_override_switches_the_model_to_open(env):

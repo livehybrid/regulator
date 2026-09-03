@@ -474,7 +474,15 @@ def test_strict_spl_rejects_a_bad_dispatch(make_server):
         body={"search": "| tstats count where index=main"},
     )[0] == 201
 
-    lax = make_server()
+    # Strict is the default now, because splunkd is: a bare term 400s.
+    assert call(
+        strict,
+        "POST",
+        "/services/search/v2/jobs",
+        body={"search": "stats count by host"},
+    )[0] == 400
+
+    lax = make_server(strict_spl=False)
     assert call(
         lax,
         "POST",

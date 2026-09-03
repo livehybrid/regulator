@@ -272,12 +272,37 @@ def test_is_advice_distinguishes_the_two_kinds():
 # ------------------------------------------------------ the shipped library
 
 
-@pytest.mark.parametrize("name", ["smoke", "search-classes", "soc-analyst-morning"])
-def test_every_shipped_scenario_lints_clean(name):
-    """The library ships in the image, so a broken one is a broken release."""
-    from pathlib import Path
+from pathlib import Path as _Path
 
-    root = Path(__file__).resolve().parents[2] / "scenarios" / name
-    scenario = load_scenario(root)
+_LIBRARY = _Path(__file__).resolve().parents[2] / "scenarios"
+_SHIPPED = sorted(child.name for child in _LIBRARY.iterdir() if (child / "scenario.yaml").is_file())
+
+
+@pytest.mark.parametrize("name", _SHIPPED)
+def test_every_shipped_scenario_lints_clean(name):
+    """The library ships in the image, so a broken one is a broken release.
+
+    Every directory, discovered rather than listed, so a new scenario cannot
+    ship unlinted because nobody added it here.
+    """
+    scenario = load_scenario(_LIBRARY / name)
     problems = blocking(lint(scenario))
     assert problems == [], f"{name}: {problems}"
+    if scenario.searches is not None:
+        # A scenario built on a savedsearches.conf must actually select
+        # something, otherwise it runs nothing and reports a valid, empty run.
+        assert scenario.saved_selected, f"{name}: no saved searches were selected"
+        assert all(step.spl for step in scenario.steps if step.type == "search")
+
+
+def test_the_library_covers_every_stoker_pack():
+    """One scenario per Stoker pack, so a fill has a matching benchmark."""
+    packs = {
+        "web-access", "apigw", "aws-cloudtrail", "aws-s3-access", "aws-elb-alb",
+        "splunk-tutorial-web", "splunk-tutorial-secure", "splunk-tutorial-vendor-sales",
+        "flatline", "attack-replay", "host-infra-metrics", "api-service-red-metrics",
+        "k8s-workload-metrics", "database-metrics", "message-queue-metrics",
+        "network-interface-metrics", "web-store-metrics",
+    }
+    shipped = {name[len("pack-"):] for name in _SHIPPED if name.startswith("pack-")}
+    assert packs <= shipped, sorted(packs - shipped)

@@ -95,8 +95,17 @@ async def _sourcetypes(client: SplunkClient, notes: List[str]) -> List[Dict[str,
     return census
 
 
-async def target_report(client: SplunkClient) -> Dict[str, Any]:
-    """Everything Regulator can discover about a target, as plain JSON."""
+async def target_report(
+    client: SplunkClient,
+    scenarios: Optional[List[Dict[str, Any]]] = None,
+    **where: Any,
+) -> Dict[str, Any]:
+    """Everything Regulator can discover about a target, as plain JSON.
+
+    ``scenarios`` is the scenario library as summaries (name plus
+    corpus.sourcetypes), so the report can say which of them this cluster
+    actually holds data for. ``where`` locates the indexers for the cache.
+    """
     report: Dict[str, Any] = {
         "generated_at": time.time(),
         "target_url": client.target.url,
@@ -240,7 +249,7 @@ async def target_report(client: SplunkClient) -> Dict[str, Any]:
     # the same search is a different piece of work depending on what is already
     # local. How full that cache is decides whether a wide search evicts
     # somebody else's buckets while it runs.
-    cache = await cache_state(client)
+    cache = await cache_state(client, **where)
     report["smartstore_cache"] = cache.to_dict()
     if cache.available:
         fill = cache.fill_pct
@@ -270,8 +279,37 @@ async def target_report(client: SplunkClient) -> Dict[str, Any]:
             "covering the corpus"
         )
 
+    report["scenario_fit"] = _scenario_fit(report, scenarios or [])
     report["recommended_scenario"] = _recommend(report)
     return report
+
+
+def _scenario_fit(report: Dict[str, Any], scenarios: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Which scenarios this cluster holds data for, from the sourcetype census.
+
+    A scenario that names sourcetypes the census does not show searches
+    nothing and reports a magnificent cluster, so the fit is worked out
+    before anyone chooses. Scenarios that declare no sourcetypes are listed
+    as unknown rather than guessed at.
+    """
+    present = {str(row.get("sourcetype")) for row in report.get("sourcetypes") or []}
+    fit: List[Dict[str, Any]] = []
+    for scenario in scenarios:
+        wanted = [st for st in (scenario.get("sourcetypes") or []) if st]
+        if not wanted:
+            fit.append({"name": scenario.get("name"), "fit": "unknown", "missing": []})
+            continue
+        missing = [st for st in wanted if st not in present]
+        fit.append(
+            {
+                "name": scenario.get("name"),
+                "fit": "full" if not missing else ("partial" if len(missing) < len(wanted) else "none"),
+                "missing": missing,
+            }
+        )
+    order = {"full": 0, "partial": 1, "unknown": 2, "none": 3}
+    fit.sort(key=lambda f: (order.get(f["fit"], 9), str(f["name"])))
+    return fit
 
 
 def _recommend(report: Dict[str, Any]) -> str:
@@ -284,6 +322,22 @@ def _recommend(report: Dict[str, Any]) -> str:
     if not with_data:
         return (
             "smoke: nothing else has a corpus. Fill with Stoker, then search-classes"
+        )
+    fits = [f["name"] for f in report.get("scenario_fit", []) if f.get("fit") == "full"]
+    partial = [f["name"] for f in report.get("scenario_fit", []) if f.get("fit") == "partial"]
+    if fits:
+        names = ", ".join(str(n) for n in fits[:4])
+        suffix = (
+            "; read it as a harness check rather than a sizing exercise, a single instance "
+            "has no distributed search to measure"
+            if not report.get("search_peers")
+            else ""
+        )
+        return f"the census matches {names}{suffix}"
+    if partial:
+        return (
+            f"no scenario has its whole corpus here; {', '.join(str(n) for n in partial[:3])} "
+            "partly. Fill with Stoker, or import the cluster's own saved searches"
         )
     if not report.get("search_peers"):
         return (
@@ -347,6 +401,13 @@ def render(report: Dict[str, Any]) -> str:
             + (f", {cache['fill_pct']:.0f}% full" if cache.get("fill_pct") is not None else "")
             + f", policy {cache.get('eviction_policy') or 'unknown'}",
         ]
+
+    fits = report.get("scenario_fit") or []
+    if fits:
+        lines += ["", "scenario fit against the census:"]
+        for entry in fits[:12]:
+            missing = f"  missing {', '.join(entry['missing'])}" if entry.get("missing") else ""
+            lines.append(f"  {str(entry['name'])[:28]:<28} {entry['fit']:<8}{missing}")
 
     if report.get("notes"):
         lines += ["", "notes:"]

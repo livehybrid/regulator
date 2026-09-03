@@ -30,10 +30,42 @@ from regulator_agent.timepolicy import TimeWindow
 # the suite fail on an upgrade that changed nothing we care about.
 
 
+class FakeRequest:
+    def __init__(self, method: str) -> None:
+        self.method = method
+
+
 class FakeResponse:
-    def __init__(self, url: str, headers: Optional[Dict[str, str]] = None) -> None:
+    def __init__(
+        self,
+        url: str,
+        headers: Optional[Dict[str, str]] = None,
+        body: str = "",
+        method: str = "GET",
+    ) -> None:
         self.url = url
         self.headers = headers or {}
+        self._body = body
+        self.request = FakeRequest(method)
+
+    async def text(self) -> str:
+        return self._body
+
+
+class FakeLocator:
+    def __init__(self, page: "FakePage", selector: str) -> None:
+        self._page = page
+        self.selector = selector
+
+    @property
+    def first(self) -> "FakeLocator":
+        return self
+
+    async def fill(self, value: str) -> None:
+        self._page.filled[self.selector] = value
+
+    async def click(self) -> None:
+        await self._page.click(self.selector)
 
 
 class FakePage:
@@ -78,6 +110,9 @@ class FakePage:
         if "/account/login" not in url:
             self._emit()
 
+    def locator(self, selector: str) -> FakeLocator:
+        return FakeLocator(self, selector)
+
     async def fill(self, selector: str, value: str) -> None:
         self.filled[selector] = value
 
@@ -86,15 +121,17 @@ class FakePage:
         if not self.login_fails:
             self.url = f"{self.owner.web_url}/en-GB/app/search/home"
 
+    async def wait_for_url(self, predicate: Any, **_k: Any) -> None:
+        if self.login_fails or not predicate(self.url):
+            raise TimeoutError("still on the login page")
+
     async def wait_for_load_state(self, *_a: Any, **_k: Any) -> None:
         return None
 
-    async def wait_for_selector(self, *_a: Any, **_k: Any) -> None:
-        if self.panel_timeout:
-            raise TimeoutError("no panel appeared")
-
     async def eval_on_selector_all(self, *_a: Any, **_k: Any) -> int:
-        return self.panels_found
+        # The engine polls this for visible panels; a page that never paints
+        # answers zero until the engine's own deadline expires.
+        return 0 if self.panel_timeout else self.panels_found
 
     async def evaluate(self, *_a: Any, **_k: Any) -> Dict[str, Any]:
         return dict(self.timings)
@@ -329,9 +366,29 @@ def test_the_dashboard_url_pins_the_step_time_window(env):
     assert "earliest=1756800000" in url
     assert "latest=1756886400" in url
     assert "regulator_sut/triage_overview" in url
-    # The marker reaches the access log and _audit, so a page load can be
-    # reconciled against the target's own record of it.
+    # The marker reaches the web access log, so a page load can be reconciled
+    # against the target's own record of it.
     assert "_reg=reg%3Abtest" in url or "_reg=reg:btest" in url
+
+
+def test_a_named_time_input_is_pinned_through_its_form_token(env):
+    """Splunk Web ignores the bare earliest for a named time input.
+
+    The shipped dashboards use token="range", so every browser step ran their
+    saved default until the URL also carried form.range.earliest.
+    """
+    browser = FakeBrowser(WEB_URL)
+    engine = make_engine(env, browser)
+    step = Step(
+        id="open", type="dashboard", engine="browser", app="regulator_sut",
+        dashboard="triage_overview", time_token="range",
+    )
+
+    drive(engine, [context_for(step)])
+
+    url = [u for u in browser.contexts[0].pages[0].goto_urls if "/app/" in u][0]
+    assert "form.range.earliest=1756800000" in url
+    assert "form.range.latest=1756886400" in url
 
 
 def test_search_xhrs_are_captured_with_their_sids(env):
@@ -345,8 +402,14 @@ def test_search_xhrs_are_captured_with_their_sids(env):
         try:
             entry = await engine._context_for(1)
             entry.page.responses_to_emit = [
-                FakeResponse(f"{WEB_URL}/en-GB/splunkd/__raw/services/search/v2/jobs/SID-111"),
-                FakeResponse(f"{WEB_URL}/en-GB/splunkd/__raw/services/search/v2/jobs/SID-222"),
+                FakeResponse(
+                    f"{WEB_URL}/en-GB/splunkd/__raw/services/search/v2/jobs/SID-111",
+                    body='{"entry":[{"content":{"isDone":true}}]}',
+                ),
+                FakeResponse(
+                    f"{WEB_URL}/en-GB/splunkd/__raw/services/search/v2/jobs/SID-222",
+                    body='{"entry":[{"content":{"isDone":true}}]}',
+                ),
                 FakeResponse(f"{WEB_URL}/static/app/search/bundle.js", {"content-length": "9000"}),
             ]
             return await engine.execute(context_for(step))
@@ -357,6 +420,42 @@ def test_search_xhrs_are_captured_with_their_sids(env):
     assert record.sids == ["SID-111", "SID-222"]
     assert record.xhr_count == 2
     assert record.static_bytes == 9000
+    assert record.ok is True
+
+
+def test_a_painted_wrapper_does_not_count_until_a_search_has_finished(env):
+    """Studio renders its visualisation wrappers before any data arrives.
+
+    A selector alone fired at layout time and measured React mounting. With
+    searches in flight and none finished, the engine keeps waiting.
+    """
+    browser = FakeBrowser(WEB_URL)
+    engine = make_engine(env, browser)
+    import regulator_agent.engines.browser as mod
+
+    original = mod.DEFAULT_STEP_TIMEOUT_S
+    mod.DEFAULT_STEP_TIMEOUT_S = 0.5
+    try:
+        async def go():
+            await engine.start()
+            try:
+                entry = await engine._context_for(1)
+                entry.page.responses_to_emit = [
+                    FakeResponse(
+                        f"{WEB_URL}/en-GB/splunkd/__raw/services/search/v2/jobs/SID-slow",
+                        body='{"entry":[{"content":{"isDone":false}}]}',
+                    ),
+                ]
+                return await engine.execute(context_for(dashboard_step()))
+            finally:
+                await engine.close()
+
+        record = run_async(go())
+    finally:
+        mod.DEFAULT_STEP_TIMEOUT_S = original
+    assert record.ok is False
+    assert record.error_class == ERROR_TIMEOUT
+    assert record.first_panel_ms is None
 
 
 def test_a_namespaced_search_xhr_is_also_recognised(env):
@@ -370,7 +469,8 @@ def test_a_namespaced_search_xhr_is_also_recognised(env):
             entry = await engine._context_for(1)
             entry.page.responses_to_emit = [
                 FakeResponse(
-                    f"{WEB_URL}/en-GB/splunkd/__raw/servicesNS/admin/search/search/jobs/SID-NS"
+                    f"{WEB_URL}/en-GB/splunkd/__raw/servicesNS/admin/search/search/jobs/SID-NS",
+                    body='{"isDone":"1"}',
                 )
             ]
             return await engine.execute(context_for(dashboard_step()))
@@ -380,28 +480,44 @@ def test_a_namespaced_search_xhr_is_also_recognised(env):
     assert run_async(go()).sids == ["SID-NS"]
 
 
-def test_a_dashboard_that_never_paints_is_a_result_not_a_crash(env):
+def test_a_dashboard_that_never_paints_is_a_failed_step_not_a_crash(env):
+    """No panel inside the timeout is the failure a dashboard has.
+
+    Filing it as a 120 second success hid expired sessions, missing views and
+    errored panels alike, and the error-rate guard could not see any of it.
+    """
     browser = FakeBrowser(WEB_URL)
     engine = make_engine(env, browser)
+    import regulator_agent.engines.browser as mod
 
-    async def go():
-        await engine.start()
-        try:
-            entry = await engine._context_for(1)
-            entry.page.panel_timeout = True
-            return await engine.execute(context_for(dashboard_step()))
-        finally:
-            await engine.close()
+    original = mod.DEFAULT_STEP_TIMEOUT_S
+    mod.DEFAULT_STEP_TIMEOUT_S = 0.4
+    try:
+        async def go():
+            await engine.start()
+            try:
+                entry = await engine._context_for(1)
+                entry.page.panel_timeout = True
+                return await engine.execute(context_for(dashboard_step()))
+            finally:
+                await engine.close()
 
-    record = run_async(go())
+        record = run_async(go())
+    finally:
+        mod.DEFAULT_STEP_TIMEOUT_S = original
     assert record.first_panel_ms is None
     assert record.panels == 0
-    # Still a completed measurement: the page loaded, nothing rendered.
+    assert record.ok is False
+    assert record.error_class == ERROR_TIMEOUT
     assert record.service_time_ms > 0
 
 
-def test_javascript_errors_fail_the_step_and_are_counted(env):
-    """A dashboard that throws is broken even if it renders quickly."""
+def test_javascript_errors_are_counted_but_do_not_fail_a_painted_step(env):
+    """Splunk Web throws a benign error or two on most pages.
+
+    Failing every step on them aborted runs that were measuring perfectly
+    well, so the count is recorded and the panel decides the outcome.
+    """
     browser = FakeBrowser(WEB_URL)
     engine = make_engine(env, browser)
 
@@ -415,9 +531,36 @@ def test_javascript_errors_fail_the_step_and_are_counted(env):
             await engine.close()
 
     record = run_async(go())
-    assert record.ok is False
+    assert record.ok is True
     assert record.js_errors == 2
-    assert record.error_class == ERROR_CLIENT
+
+
+def test_the_login_is_outside_the_measured_window(env):
+    """A real user logs in once a day; iteration zero must not carry it."""
+    browser = FakeBrowser(WEB_URL)
+    engine = make_engine(env, browser)
+
+    async def go():
+        await engine.start()
+        try:
+            entry = await engine._context_for(1)
+            original_goto = entry.page.goto
+
+            async def slow_login_goto(url, **kwargs):
+                if "/account/login" in url:
+                    import asyncio
+
+                    await asyncio.sleep(0.3)
+                await original_goto(url, **kwargs)
+
+            entry.page.goto = slow_login_goto
+            return await engine.execute(context_for(dashboard_step()))
+        finally:
+            await engine.close()
+
+    record = run_async(go())
+    assert record.ok is True
+    assert record.service_time_ms < 250
 
 
 def test_chromium_is_launched_with_the_shared_memory_workaround(env):
@@ -496,30 +639,32 @@ def test_failures_are_classified(exc, expected):
     assert BrowserEngine._classify(exc) == expected
 
 
-def test_all_panels_waits_for_the_page_to_settle(env):
+def test_all_panels_records_when_every_search_finished(env):
     """first_result and all_panels are different questions.
 
     A dashboard can paint one panel instantly and take a minute to finish, and
-    the scenario chooses which of those it is measuring.
+    the scenario chooses which of those it is measuring. all_panels used to
+    wait for network idle, which a real Splunk page never reaches, and stored
+    nothing; now it records the settle time as its own figure.
     """
     browser = FakeBrowser(WEB_URL)
     engine = make_engine(env, browser)
-    settled: List[str] = []
 
     async def go():
         await engine.start()
         try:
             entry = await engine._context_for(1)
-            original = entry.page.wait_for_load_state
-
-            async def spy(*args, **kwargs):
-                settled.append(args[0] if args else kwargs.get("state", ""))
-                return await original(*args, **kwargs)
-
-            entry.page.wait_for_load_state = spy
-            await engine.execute(context_for(dashboard_step(wait_for="all_panels")))
+            entry.page.responses_to_emit = [
+                FakeResponse(
+                    f"{WEB_URL}/en-GB/splunkd/__raw/services/search/v2/jobs/SID-1",
+                    body='{"isDone":true}',
+                ),
+            ]
+            return await engine.execute(context_for(dashboard_step(wait_for="all_panels")))
         finally:
             await engine.close()
 
-    run_async(go())
-    assert "networkidle" in settled
+    record = run_async(go())
+    assert record.ok is True
+    assert "settled_ms" in record.params
+    assert record.params["settled_ms"] >= record.first_panel_ms

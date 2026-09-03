@@ -37,6 +37,7 @@ from ..config import Config
 from ..params import DrawContext, ParameterResolver
 from ..results import (
     ERROR_AUTH,
+    ERROR_CANCELLED,
     ERROR_CLIENT,
     ERROR_PARSE,
     ERROR_QUOTA,
@@ -55,6 +56,13 @@ from ..splunk import (
 )
 from ..timepolicy import TimeWindow
 from .base import StepContext, TargetCapabilities
+
+ADVICE = "advice: "
+
+
+def _quote_spl(value: str) -> str:
+    return '"' + value.replace("\\", "\\\\").replace('"', '\\"') + '"'
+
 
 # What a placeholder becomes when a scenario is linted against the live parser.
 # It has to be a legal bare token in every position a parameter can appear
@@ -245,7 +253,7 @@ class ApiEngine:
 
         for persona in scenario.personas:
             for step in persona.steps:
-                if step.type != "search" or not step.spl:
+                if step.type != "search" or not step.spl or step.dispatch == "saved":
                     continue
                 draw = DrawContext(
                     scenario_seed=scenario.seed,
@@ -277,8 +285,101 @@ class ApiEngine:
             problems.extend(
                 await self._check_index(scenario.corpus.metric_index, "corpus.metric_index")
             )
+        problems.extend(await self._check_sourcetypes(scenario))
+        problems.extend(await self._check_saved_dispatch(scenario))
 
         problems.extend(await self._check_dispatch())
+        return problems
+
+    async def _check_sourcetypes(self, scenario: Scenario) -> List[str]:
+        """Confirm each declared sourcetype has events in the scenario's window.
+
+        The index existing is necessary and not sufficient: an index that
+        holds none of the sourcetypes a scenario searches returns nothing in
+        milliseconds and reads as a magnificent cluster. One tstats over the
+        accelerated metadata answers it for every sourcetype at once.
+        """
+        wanted = [st for st in scenario.corpus.sourcetypes if st]
+        if not wanted:
+            return []
+        window_s = max(scenario.time_policy.window_s or 0.0, 3600.0)
+        now = time.time()
+        window = TimeWindow(earliest=now - window_s * 2, latest=now)
+        indexes = [scenario.corpus.index] + (
+            [scenario.corpus.metric_index] if scenario.corpus.metric_index else []
+        )
+        index_clause = " OR ".join(f"index={_quote_spl(i)}" for i in indexes if i)
+        spl = f"| tstats count where ({index_clause}) by sourcetype"
+        try:
+            rows, _ = await self._client.oneshot(spl, window, count=500)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001 - inconclusive, say so
+            return [
+                f"{ADVICE}could not census the sourcetypes ({exc}); the corpus was not "
+                "confirmed before the run"
+            ]
+        present = {str(row.get("sourcetype", "")) for row in rows}
+        missing = [st for st in wanted if st not in present]
+        if not missing:
+            return []
+        span_h = window.span_s / 3600.0
+        if scenario.corpus.metric_index:
+            metric_missing = await self._check_metrics(scenario, missing, window)
+            missing = [st for st in missing if st not in metric_missing]
+            if not missing:
+                return []
+        return [
+            f"corpus.sourcetypes: no events for {', '.join(repr(m) for m in missing)} in "
+            f"the last {span_h:.0f}h of {', '.join(indexes)}. Every search against them "
+            "would return nothing in milliseconds and the report would look like a very "
+            "fast cluster. Fill with Stoker first, or fix the scenario's corpus"
+        ]
+
+    async def _check_metrics(self, scenario: Scenario, wanted: List[str], window: TimeWindow) -> List[str]:
+        """Metric sourcetypes do not appear in an event tstats: ask mcatalog."""
+        spl = (
+            f"| mcatalog values(metric_name) as metric_name where "
+            f"index={_quote_spl(scenario.corpus.metric_index or '')} by sourcetype"
+        )
+        try:
+            rows, _ = await self._client.oneshot(spl, window, count=500)
+        except asyncio.CancelledError:
+            raise
+        except Exception:  # noqa: BLE001
+            return []
+        present = {str(row.get("sourcetype", "")) for row in rows}
+        return [st for st in wanted if st in present]
+
+    async def _check_saved_dispatch(self, scenario: Scenario) -> List[str]:
+        """A step dispatched by name needs the saved search to exist on the target."""
+        problems: List[str] = []
+        seen: set[tuple[str, str]] = set()
+        for persona in scenario.personas:
+            for step in persona.steps:
+                if step.dispatch != "saved" or not step.saved:
+                    continue
+                key = (step.app or "", step.saved)
+                if key in seen:
+                    continue
+                seen.add(key)
+                try:
+                    entries = await self._client.saved_searches(app=step.app)
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:  # noqa: BLE001
+                    problems.append(
+                        f"persona {persona.name} step {step.id}: could not list saved "
+                        f"searches in app {step.app!r} ({exc})"
+                    )
+                    continue
+                names = {str(entry.get("name")) for entry in entries}
+                if step.saved not in names:
+                    problems.append(
+                        f"persona {persona.name} step {step.id}: no saved search named "
+                        f"{step.saved!r} in app {step.app!r} on the target, so dispatch: saved "
+                        "cannot run it. Use dispatch: spl to run the copy in the scenario"
+                    )
         return problems
 
     async def _check_index(self, name: str, where: str) -> List[str]:
@@ -373,19 +474,29 @@ class ApiEngine:
     async def execute(self, ctx: StepContext) -> StepRecord:
         """Execute one step. Returns a record for every outcome bar a dead target."""
         record = ctx.blank_record()
-        record.spl_hash = spl_hash(ctx.spl_template or ctx.spl)
+        record.spl_hash = spl_hash(
+            ctx.spl_template or ctx.spl or f"saved:{ctx.step.app}/{ctx.step.saved}"
+        )
         started = time.perf_counter()
-        sid: Optional[str] = None
 
         try:
             if ctx.step.exec_mode in ("oneshot", "export"):
                 await self._execute_oneshot(ctx, record)
             else:
-                sid = await self._execute_job(ctx, record)
+                await self._execute_job(ctx, record)
         except asyncio.CancelledError:
-            # Never swallowed. The scheduler cancels virtual users to end a run
+            # Never swallowed: the scheduler cancels virtual users to end a run
             # or to abort one, and an engine that catches this turns a clean
-            # shutdown into a hang.
+            # shutdown into a hang. The record is still completed so the
+            # scheduler can file the abandoned search with the time it had
+            # accrued, and the job is still deleted below so the target is not
+            # left running work nobody is waiting for.
+            record.ok = False
+            record.error_class = ERROR_CANCELLED
+            record.error_detail = "the run ended while this search was still in flight"
+            record.service_time_ms = (time.perf_counter() - started) * 1000.0
+            ctx.outcome.append(record)
+            await self._tidy(record)
             raise
         except SplunkAuthError as exc:
             record.ok = False
@@ -394,6 +505,8 @@ class ApiEngine:
             # The one failure that is re-raised. Credentials do not fix
             # themselves, so continuing would produce thousands of identical
             # meaningless records and, on a real stack, an account lockout.
+            record.service_time_ms = (time.perf_counter() - started) * 1000.0
+            await self._tidy(record)
             raise
         except SplunkTimeout as exc:
             record.ok = False
@@ -412,21 +525,32 @@ class ApiEngine:
             record.ok = False
             record.error_class = ERROR_CLIENT
             record.error_detail = f"{type(exc).__name__}: {exc}"
-        finally:
-            # Service time is stamped before the tidy-up, because deleting the
-            # job artefact is Regulator's housekeeping and not part of what the
-            # simulated user waited for.
-            record.service_time_ms = (time.perf_counter() - started) * 1000.0
-            if sid and self._config.delete_jobs:
-                try:
-                    await self._client.delete_job(sid)
-                except Exception:  # noqa: BLE001
-                    # A failed delete leaks one artefact on the search head. It
-                    # must never change the outcome of the measurement, and it
-                    # must never mask the real error that got us here.
-                    pass
 
+        # Service time is stamped before the tidy-up, because deleting the job
+        # artefact is Regulator's housekeeping and not part of what the
+        # simulated user waited for.
+        record.service_time_ms = (time.perf_counter() - started) * 1000.0
+        await self._tidy(record)
         return record
+
+    async def _tidy(self, record: StepRecord) -> None:
+        """Delete the job artefact, whatever happened to the poll.
+
+        Keyed on ``record.sid`` rather than a local variable, because the sid
+        exists from the moment the dispatch returns and a poll that then times
+        out or fails must still clean up: a search head at its ceiling that
+        makes two hundred polls time out would otherwise keep two hundred
+        searches running with no client waiting, so the applied load quietly
+        exceeded the configured load at exactly the moment the target could
+        least afford it. A failed delete leaks one artefact and never changes
+        the outcome of the measurement.
+        """
+        if not record.sid or not self._config.delete_jobs:
+            return
+        try:
+            await asyncio.shield(self._client.delete_job(record.sid))
+        except Exception:  # noqa: BLE001
+            pass
 
     async def _execute_oneshot(self, ctx: StepContext, record: StepRecord) -> None:
         """The cheap path: one blocking call, no job artefact, no server half.
@@ -438,28 +562,45 @@ class ApiEngine:
         """
         count = ctx.step.result_count if ctx.step.result_count > 0 else 100
         rows, byte_count = await self._client.oneshot(ctx.spl, ctx.window, count=count)
-        record.http_status = 200
+        # 204 with no body is how splunkd answers a oneshot with no results.
+        record.http_status = 200 if byte_count else 204
         record.result_bytes = byte_count
         record.result_count = len(rows)
         # scan_count, event_count, run_duration_s and dispatch_state stay None:
         # there is no job record to read them from, which is precisely why lint
         # warns about these exec modes.
 
-    async def _execute_job(self, ctx: StepContext, record: StepRecord) -> str:
+    async def _execute_job(self, ctx: StepContext, record: StepRecord) -> None:
         """The measured path: dispatch, poll to completion, read results."""
-        sid, dispatch_ms, status = await self._client.create_job(
-            ctx.spl,
-            ctx.window,
-            exec_mode=ctx.step.exec_mode,
-        )
+        # Time to first result is measured from the moment the user asked,
+        # which includes the dispatch. Starting the clock after the POST
+        # returned understated TTFR by exactly the number that climbs first
+        # under admission pressure, which is the number it exists to show.
+        started = time.perf_counter()
+        if ctx.step.dispatch == "saved" and ctx.step.saved:
+            sid, dispatch_ms, status = await self._client.dispatch_saved(
+                ctx.step.saved,
+                ctx.step.app or self._config.target.app,
+                ctx.window,
+                owner=self._config.target.owner,
+            )
+        else:
+            sid, dispatch_ms, status = await self._client.create_job(
+                ctx.spl,
+                ctx.window,
+                exec_mode=ctx.step.exec_mode,
+                # A server-side net under the client-side timeout: if this worker
+                # dies or gives up, splunkd cancels the job itself rather than
+                # running it to completion for nobody.
+                auto_cancel_s=int(self._config.read_timeout_s) + 60,
+            )
         record.sid = sid
         record.dispatch_ms = dispatch_ms
         record.http_status = status
 
-        started = time.perf_counter()
         interval_s = max(0.001, self._config.poll_initial_ms / 1000.0)
         max_interval_s = max(interval_s, self._config.poll_max_ms / 1000.0)
-        last_observed = started
+        last_observed = time.perf_counter()
         queued_ms = 0.0
 
         while True:
@@ -495,6 +636,8 @@ class ApiEngine:
                 record.scan_count = job.scan_count
                 record.event_count = job.event_count
                 record.result_count = job.result_count
+                if job.messages:
+                    record.messages = list(job.messages)
 
                 if job.is_failed:
                     record.ok = False
@@ -502,7 +645,13 @@ class ApiEngine:
                     record.error_detail = (
                         "; ".join(job.messages) or "the job ended FAILED with no message"
                     )
-                    return sid
+                    return
+
+                # DONE is not the same as complete. A peer that dropped out,
+                # an early finalization or a truncation limit all produce a
+                # fast, small, successful-looking job that did less than it
+                # was asked. splunkd says so in the messages, with HTTP 200.
+                record.partial = bool(job.is_finalized) or _looks_partial(job.messages)
 
                 if ctx.step.result_count > 0:
                     fetch_started = time.perf_counter()
@@ -518,12 +667,39 @@ class ApiEngine:
                     record.result_bytes = byte_count
                     if record.result_count is None:
                         record.result_count = len(rows)
-                return sid
+                return
 
             # Back off gently. Polling hard is a real cost on the target: a
             # thousand virtual users at 100 ms is ten thousand REST calls a
             # second into the same splunkd the test is trying to measure.
             interval_s = min(interval_s * 1.5, max_interval_s)
+
+
+# Fragments of splunkd job messages that mean the job finished without doing
+# all of its work. Lower-cased substring matches, because the exact wording
+# has drifted between releases while the vocabulary has not.
+_PARTIAL_MARKERS = (
+    "might be incomplete",
+    "may be incomplete",
+    "results are incomplete",
+    "unable to distribute",
+    "peer",
+    "truncat",
+    "was finalized",
+    "auto-finalized",
+    "exceeded",
+    "limit",
+)
+
+
+def _looks_partial(messages: List[str]) -> bool:
+    for message in messages or []:
+        lowered = message.lower()
+        if lowered.startswith("info:") or lowered.startswith("debug:"):
+            continue
+        if any(marker in lowered for marker in _PARTIAL_MARKERS):
+            return True
+    return False
 
 
 def _classify_http(exc: SplunkHttpError) -> str:

@@ -10,4 +10,9 @@
 #   pip install -r worker/requirements.txt -r worker/requirements-browser.txt
 #   playwright install chromium
 
-playwright>=1.44,<2
+# Pinned to the exact version of the base image in worker/Dockerfile.browser
+# (mcr.microsoft.com/playwright/python:v1.55.0-noble). The browsers are baked
+# into that image at one revision, and a newer pip package expects a newer
+# revision: the image then builds green and every container dies at launch
+# with "Executable doesn't exist". Bump both together, never one.
+playwright==1.55.0

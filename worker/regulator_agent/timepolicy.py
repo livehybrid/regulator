@@ -45,19 +45,35 @@ class TimeWindow:
 
     earliest: float
     latest: float
+    # Set for a relative policy: the modifiers are dispatched verbatim and the
+    # epochs above are this worker's evaluation of them, kept for the record
+    # so span and window stay meaningful.
+    earliest_rel: Optional[str] = None
+    latest_rel: Optional[str] = None
 
     @property
     def span_s(self) -> float:
         return self.latest - self.earliest
 
+    @property
+    def is_relative(self) -> bool:
+        return self.earliest_rel is not None
+
     def as_args(self) -> dict[str, str]:
         """The form fields splunkd wants on a job dispatch."""
+        if self.is_relative:
+            return {
+                "earliest_time": self.earliest_rel or "0",
+                "latest_time": self.latest_rel or "now",
+            }
         return {
             "earliest_time": f"{self.earliest:.0f}",
             "latest_time": f"{self.latest:.0f}",
         }
 
     def describe(self) -> str:
+        if self.is_relative:
+            return f"{self.earliest_rel}..{self.latest_rel} (~{self.span_s / 3600.0:.2f}h)"
         return f"{self.earliest:.0f}-{self.latest:.0f} ({self.span_s / 3600.0:.2f}h)"
 
 
@@ -86,10 +102,30 @@ def resolve_window(
 
     wall = time.time() if now is None else now
 
-    offset = 0.0
+    if policy.mode == "relative":
+        # Splunk evaluates these itself. Our own evaluation is only for the
+        # record, so a reader can see roughly what was searched.
+        import datetime as _dt
+
+        from .savedsearches import RelativeTimeError, evaluate_relative
+
+        reference = _dt.datetime.fromtimestamp(wall, tz=_dt.timezone.utc)
+        try:
+            start = evaluate_relative(policy.earliest_rel or "0", reference).timestamp()
+            end = evaluate_relative(policy.latest_rel or "now", reference).timestamp()
+        except RelativeTimeError:
+            start, end = 0.0, wall
+        return TimeWindow(
+            earliest=start,
+            latest=end,
+            earliest_rel=policy.earliest_rel or "0",
+            latest_rel=policy.latest_rel or "now",
+        )
+
+    offset = float(policy.offset_s or 0.0)
     if policy.jitter_s > 0:
         rng = rng_for("timewindow", ctx.scenario_seed, ctx.vu_id, ctx.iteration, ctx.step_id)
-        offset = rng.uniform(0.0, policy.jitter_s)
+        offset += rng.uniform(0.0, policy.jitter_s)
 
     latest = wall - offset
     if policy.align_s > 0:
@@ -97,6 +133,9 @@ def resolve_window(
         # data that does not exist yet, which costs nothing but makes the
         # reported span misleading.
         latest = (latest // policy.align_s) * policy.align_s
+    else:
+        # No alignment asked for: still never round up into the future.
+        latest = float(int(latest))
 
     # Derived from the aligned end, and NOT aligned again. Flooring both ends
     # independently made the span longer than the configured window whenever

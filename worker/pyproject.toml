@@ -6,13 +6,12 @@ build-backend = "setuptools.build_meta"
 name = "regulator-agent"
 version = "0.1.0"
 description = "Regulator worker agent: paced concurrent Splunk search load over the splunkd REST API"
-readme = { text = "Regulator worker agent. The buildable contract lives in docs/WORKER-CONTRACT.md at the repository root. The container image copies source directly; this file exists for metadata, editable installs and pytest configuration.", content-type = "text/markdown" }
+readme = { text = "Regulator worker agent. The README at the repository root is the contract. The container image copies source directly; this file exists for metadata, editable installs and pytest configuration.", content-type = "text/markdown" }
 requires-python = ">=3.11"
 license = { text = "Apache-2.0" }
 dependencies = [
     "httpx[http2]",
     "PyYAML",
-    "hdrhistogram",
 ]
 
 [project.optional-dependencies]

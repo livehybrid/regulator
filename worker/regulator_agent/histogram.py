@@ -172,8 +172,27 @@ class LatencyHistogram:
     def percentile_ms(self, p: float) -> float:
         return self.percentile_us(p) / 1000.0
 
-    def summary(self) -> Dict[str, float]:
-        """The standard reporting shape, all in milliseconds."""
+    def summary(self) -> Dict[str, Optional[float]]:
+        """The standard reporting shape, all in milliseconds.
+
+        An empty histogram reports ``None`` for every statistic rather than
+        zero. This is not pedantry. A step whose searches all failed has an
+        empty latency histogram, and reporting its p95 as 0.0 ms made it pass
+        every latency gate as a 100% improvement, with the comparison table
+        printing ``2000ms -> 0ms``. ``None`` cannot pass a gate, cannot be
+        averaged into anything, and renders as a dash rather than a number.
+        """
+        if self._count == 0:
+            return {
+                "count": 0.0,
+                "mean_ms": None,
+                "min_ms": None,
+                "p50_ms": None,
+                "p90_ms": None,
+                "p95_ms": None,
+                "p99_ms": None,
+                "max_ms": None,
+            }
         return {
             "count": float(self._count),
             "mean_ms": round(self.mean_ms, 3),

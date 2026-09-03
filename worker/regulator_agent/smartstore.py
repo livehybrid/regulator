@@ -51,9 +51,16 @@ import urllib.parse
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Sequence, Set
 
+from .config import TargetConfig
 from .splunk import SplunkClient, SplunkError
 
 log = logging.getLogger("regulator.smartstore")
+
+# cacheman is one entry per bucket and a large estate has tens of thousands.
+# Paged, so a single response is never hundreds of megabytes of JSON built
+# synchronously by an instance that has just finished a load test.
+CACHEMAN_PAGE = 5000
+PEERS_PATH = "/services/search/distributed/peers"
 
 CACHEMAN_PATH = "/services/admin/cacheman"
 CACHEMAN_CONFIG_PATH = "/services/configs/conf-server/cachemanager"
@@ -120,6 +127,10 @@ class CacheState:
     eviction_policy: Optional[str] = None
     hotlist_recency_secs: Optional[int] = None
     per_index: Dict[str, IndexCache] = field(default_factory=dict)
+    # Which indexers answered, and which did not and why. The cache lives on
+    # the indexers, and on a distributed target the search head has none.
+    peers: Dict[str, Dict[str, Any]] = field(default_factory=dict)
+    notes: List[str] = field(default_factory=list)
     # WHICH buckets are local, not just how many. Counting alone reports a
     # cache that downloaded 3000 buckets and evicted 3000 to make room as
     # "warm, nothing was downloaded", which is the exact opposite of the truth
@@ -161,6 +172,8 @@ class CacheState:
             "fill_pct": round(self.fill_pct, 2) if self.fill_pct is not None else None,
             "eviction_policy": self.eviction_policy,
             "hotlist_recency_secs": self.hotlist_recency_secs,
+            "peers": dict(self.peers),
+            "notes": list(self.notes),
             "per_index": {
                 name: {
                     "local_buckets": i.local_buckets,
@@ -220,50 +233,183 @@ class CacheDelta:
         }
 
 
-async def cache_state(client: SplunkClient) -> CacheState:
-    """Read the cache manager. Never raises: absence is an answer."""
+@dataclass
+class Indexer:
+    """One place a cache lives, and a client that can reach it."""
+
+    name: str
+    client: SplunkClient
+    owned: bool  # whether we opened it and must close it
+
+
+async def _cacheman_entries(client: SplunkClient) -> List[Dict[str, Any]]:
+    """Every bucket the cache manager knows about, a page at a time."""
+    entries: List[Dict[str, Any]] = []
+    offset = 0
+    while True:
+        page = await client.entries(
+            CACHEMAN_PATH,
+            "smartstore cache",
+            params={"count": str(CACHEMAN_PAGE), "offset": str(offset)},
+        )
+        entries.extend(page)
+        if len(page) < CACHEMAN_PAGE:
+            return entries
+        offset += CACHEMAN_PAGE
+
+
+async def discover_indexers(
+    client: SplunkClient,
+    *,
+    indexer_urls: Sequence[str] = (),
+    indexer_token: Optional[str] = None,
+    indexer_username: Optional[str] = None,
+    indexer_password: Optional[str] = None,
+) -> tuple[List[Indexer], List[str]]:
+    """Where the cache is.
+
+    The cache manager is per indexer. Against a single instance that is the
+    target itself. Against a search head, it is the search peers: either the
+    ones named in configuration, or the ones the search head lists, reached
+    with the indexer credential if one was given and the target's own if
+    not. Reading cacheman on the search head of a distributed deployment
+    reported "no SmartStore" for every real cluster, which is the case the
+    whole module exists for.
+    """
+    notes: List[str] = []
+    target = client.target
+    urls = list(indexer_urls)
+    if not urls:
+        try:
+            peers = await client.entries(PEERS_PATH, "search peers")
+        except SplunkError as exc:
+            peers = []
+            notes.append(f"could not list search peers: {exc}")
+        for peer in peers:
+            if str(peer.get("disabled", "")).lower() in ("1", "true"):
+                continue
+            name = str(peer.get("name") or "")
+            if not name:
+                continue
+            scheme = "https" if target.url.startswith("https") else "http"
+            urls.append(f"{scheme}://{name}")
+    if not urls:
+        return [Indexer(name=target.url, client=client, owned=False)], notes
+
+    credential = dict(
+        token=indexer_token or target.token,
+        username=indexer_username or target.username,
+        password=indexer_password or target.password,
+    )
+    if not indexer_token and not (indexer_username and indexer_password):
+        notes.append(
+            "reaching the indexers with the search head's own credential: set the "
+            "indexer credential on the target if that is not valid on the peers"
+        )
+    indexers: List[Indexer] = []
+    for url in urls:
+        try:
+            config = TargetConfig(
+                url=url,
+                verify_tls=target.verify_tls,
+                api_version=target.api_version,
+                **credential,
+            )
+        except Exception as exc:  # noqa: BLE001 - a bad peer URL is a note
+            notes.append(f"{url}: {exc}")
+            continue
+        indexers.append(Indexer(name=url, client=SplunkClient(config), owned=True))
+    return indexers, notes
+
+
+async def _close(indexers: Sequence[Indexer]) -> None:
+    for indexer in indexers:
+        if indexer.owned:
+            try:
+                await indexer.client.close()
+            except Exception:  # noqa: BLE001
+                pass
+
+
+async def cache_state(client: SplunkClient, **where: Any) -> CacheState:
+    """Read the cache manager on every indexer. Never raises: absence is an answer.
+
+    ``where`` is the indexer location and credential, as keyword arguments
+    matching :func:`discover_indexers`.
+    """
     state = CacheState()
-
+    indexers, notes = await discover_indexers(client, **where)
+    state.notes.extend(notes)
+    answered = 0
     try:
-        entries = await client.entries(CACHEMAN_PATH, "smartstore cache")
-    except SplunkError as exc:
-        state.reason = f"the cache manager was not readable: {exc}"
-        return state
+        for indexer in indexers:
+            try:
+                entries = await _cacheman_entries(indexer.client)
+            except SplunkError as exc:
+                state.peers[indexer.name] = {"available": False, "reason": str(exc)[:200]}
+                continue
+            except Exception as exc:  # noqa: BLE001 - an unreachable peer is a note
+                state.peers[indexer.name] = {"available": False, "reason": str(exc)[:200]}
+                continue
+            if not entries:
+                state.peers[indexer.name] = {
+                    "available": False,
+                    "reason": "no cache manager entries: this instance is not using SmartStore, "
+                    "or the account cannot read /services/admin/cacheman",
+                }
+                continue
+            answered += 1
+            local = 0
+            local_bytes = 0
+            for entry in entries:
+                bucket = entry.get("cm:bucket") or {}
+                bid = entry.get("name") or ""
+                # Namespaced per indexer: a replicated bucket exists on
+                # several peers and its cache state differs on each.
+                name = f"{indexer.name}|{bid}" if len(indexers) > 1 else bid
+                index = _index_of(bid)
+                size = _int(bucket.get("estimated_size")) or _int(bucket.get("journal_size"))
+                per = state.per_index.setdefault(index, IndexCache(index=index))
+                per.total_bytes += size
+                state.total_bytes += size
+                if str(bucket.get("status", "")).lower() == STATUS_LOCAL:
+                    state.local_buckets += 1
+                    state.local_bytes += size
+                    state.local_ids.add(name)
+                    state.local_bytes_by_id[name] = size
+                    per.local_buckets += 1
+                    per.local_bytes += size
+                    local += 1
+                    local_bytes += size
+                else:
+                    state.remote_buckets += 1
+                    per.remote_buckets += 1
+            state.peers[indexer.name] = {
+                "available": True,
+                "buckets": len(entries),
+                "local_buckets": local,
+                "local_bytes": local_bytes,
+            }
+            if state.max_cache_size_mb is None:
+                config = await _cache_config(indexer.client)
+                state.max_cache_size_mb = config.get("max_cache_size")
+                state.eviction_policy = config.get("eviction_policy")
+                state.hotlist_recency_secs = config.get("hotlist_recency_secs")
+    finally:
+        await _close(indexers)
 
-    if not entries:
-        # Either not SmartStore, or an account without the capability. Both
-        # mean the same thing here: no cache picture, say so rather than
-        # reporting zeroes that look like an empty cache.
-        state.reason = (
+    if not answered:
+        reasons = {p.get("reason", "") for p in state.peers.values()}
+        state.reason = "; ".join(sorted(r for r in reasons if r)) or (
             "no cache manager entries: this instance is not using SmartStore, or the "
             "account cannot read /services/admin/cacheman"
         )
         return state
-
     state.available = True
-    for entry in entries:
-        bucket = entry.get("cm:bucket") or {}
-        name = entry.get("name") or ""
-        index = _index_of(name)
-        size = _int(bucket.get("estimated_size")) or _int(bucket.get("journal_size"))
-        per = state.per_index.setdefault(index, IndexCache(index=index))
-        per.total_bytes += size
-        state.total_bytes += size
-        if str(bucket.get("status", "")).lower() == STATUS_LOCAL:
-            state.local_buckets += 1
-            state.local_bytes += size
-            state.local_ids.add(name)
-            state.local_bytes_by_id[name] = size
-            per.local_buckets += 1
-            per.local_bytes += size
-        else:
-            state.remote_buckets += 1
-            per.remote_buckets += 1
-
-    config = await _cache_config(client)
-    state.max_cache_size_mb = config.get("max_cache_size")
-    state.eviction_policy = config.get("eviction_policy")
-    state.hotlist_recency_secs = config.get("hotlist_recency_secs")
+    if state.max_cache_size_mb is not None and len(indexers) > 1:
+        # max_cache_size is per indexer; the fill figure below is against the
+        # estate's total, so scale it by the peers that answered.
+        state.max_cache_size_mb = state.max_cache_size_mb * answered
     return state
 
 
@@ -329,6 +475,11 @@ def delta(before: CacheState, after: CacheState) -> CacheDelta:
 @dataclass
 class EvictionResult:
     attempted: int = 0
+    # Buckets that were local before and are remote after, which is the only
+    # proof an eviction happened: the cache manager answers 200 to a request
+    # it then declines (a live reader, the hotlist), so the accepted count
+    # alone was a fiction.
+    confirmed: int = 0
     evicted: int = 0
     failed: int = 0
     bytes_evicted: int = 0
@@ -338,6 +489,7 @@ class EvictionResult:
         return {
             "attempted": self.attempted,
             "evicted": self.evicted,
+            "confirmed": self.confirmed,
             "failed": self.failed,
             "bytes_evicted": self.bytes_evicted,
             # Only the first few: a cache with thousands of buckets failing the
@@ -350,6 +502,7 @@ async def evict_all(
     client: SplunkClient,
     indexes: Optional[Sequence[str]] = None,
     concurrency: int = EVICT_CONCURRENCY,
+    **where: Any,
 ) -> EvictionResult:
     """Evict every locally cached bucket, optionally only for named indexes.
 
@@ -361,63 +514,93 @@ async def evict_all(
     preferred over evicting everything. On a shared cluster the rest of the
     cache belongs to other people's dashboards, and flushing it to measure your
     own cold path makes their afternoon slow for no benefit to your result.
+
+    Runs on every indexer, and confirms by reading the cache back: the
+    cache manager answers 200 to an eviction it then declines, so the count
+    of accepted requests is reported alongside the count of buckets that
+    actually left.
     """
     result = EvictionResult()
     wanted = {i.lower() for i in indexes} if indexes else None
-
-    try:
-        entries = await client.entries(CACHEMAN_PATH, "smartstore cache")
-    except SplunkError as exc:
-        result.errors.append(f"could not list the cache: {exc}")
-        return result
-
-    targets: List[tuple[str, int]] = []
-    for entry in entries:
-        bucket = entry.get("cm:bucket") or {}
-        if str(bucket.get("status", "")).lower() != STATUS_LOCAL:
-            continue
-        name = entry.get("name") or ""
-        if wanted is not None and _index_of(name).lower() not in wanted:
-            continue
-        size = _int(bucket.get("estimated_size")) or _int(bucket.get("journal_size"))
-        targets.append((name, size))
-
-    if not targets:
-        log.info("nothing to evict: no locally cached buckets matched")
-        return result
-
-    log.warning(
-        "EVICTING %d cached bucket(s) (%.1f GB) from %s. The next searches will "
-        "re-download what they need from object storage, which is the point of a "
-        "cold-cache run and is not free",
-        len(targets),
-        sum(size for _, size in targets) / 1e9,
-        ", ".join(sorted(wanted)) if wanted else "every index",
-    )
-
+    indexers, notes = await discover_indexers(client, **where)
+    result.errors.extend(notes)
     semaphore = asyncio.Semaphore(max(1, concurrency))
 
-    async def evict_one(bucket_id: str, size: int) -> None:
-        async with semaphore:
-            encoded = urllib.parse.quote(bucket_id, safe="")
+    try:
+        for indexer in indexers:
             try:
-                await client.post_action(f"{CACHEMAN_PATH}/{encoded}/evict", "evict bucket")
-            except SplunkError as exc:
-                result.failed += 1
-                if len(result.errors) < 20:
-                    result.errors.append(f"{bucket_id}: {exc}")
-            else:
-                result.evicted += 1
-                result.bytes_evicted += size
+                entries = await _cacheman_entries(indexer.client)
+            except Exception as exc:  # noqa: BLE001
+                result.errors.append(f"{indexer.name}: could not list the cache: {exc}")
+                continue
 
-    result.attempted = len(targets)
-    await asyncio.gather(*(evict_one(bid, size) for bid, size in targets))
+            targets: List[tuple[str, int]] = []
+            for entry in entries:
+                bucket = entry.get("cm:bucket") or {}
+                if str(bucket.get("status", "")).lower() != STATUS_LOCAL:
+                    continue
+                name = entry.get("name") or ""
+                if wanted is not None and _index_of(name).lower() not in wanted:
+                    continue
+                size = _int(bucket.get("estimated_size")) or _int(bucket.get("journal_size"))
+                targets.append((name, size))
+            if not targets:
+                continue
+
+            log.warning(
+                "EVICTING %d cached bucket(s) (%.1f GB) from %s on %s. The next searches "
+                "will re-download what they need from object storage, which is the point "
+                "of a cold-cache run and is not free",
+                len(targets),
+                sum(size for _, size in targets) / 1e9,
+                ", ".join(sorted(wanted)) if wanted else "every index",
+                indexer.name,
+            )
+
+            async def evict_one(bucket_id: str, size: int, peer: SplunkClient = indexer.client) -> None:
+                async with semaphore:
+                    encoded = urllib.parse.quote(bucket_id, safe="")
+                    try:
+                        await peer.post_action(f"{CACHEMAN_PATH}/{encoded}/evict", "evict bucket")
+                    except SplunkError as exc:
+                        result.failed += 1
+                        if len(result.errors) < 20:
+                            result.errors.append(f"{bucket_id}: {exc}")
+                    else:
+                        result.evicted += 1
+                        result.bytes_evicted += size
+
+            result.attempted += len(targets)
+            await asyncio.gather(*(evict_one(bid, size) for bid, size in targets))
+
+            # Confirm. A 200 means the request was accepted, not that the
+            # bucket left: a live reader or the hotlist keeps it.
+            try:
+                after = await _cacheman_entries(indexer.client)
+            except Exception:  # noqa: BLE001 - unconfirmed is reported as such
+                continue
+            still_local = {
+                entry.get("name")
+                for entry in after
+                if str((entry.get("cm:bucket") or {}).get("status", "")).lower() == STATUS_LOCAL
+            }
+            result.confirmed += sum(1 for bid, _ in targets if bid not in still_local)
+    finally:
+        await _close(indexers)
+
     log.warning(
-        "eviction finished: %d evicted, %d failed, %.1f GB dropped",
+        "eviction finished: %d accepted, %d confirmed gone, %d failed, %.1f GB requested",
         result.evicted,
+        result.confirmed,
         result.failed,
         result.bytes_evicted / 1e9,
     )
+    if result.evicted and result.confirmed < result.evicted:
+        result.errors.append(
+            f"{result.evicted - result.confirmed} bucket(s) were accepted for eviction and "
+            "are still local: a search is reading them or they are inside the hotlist "
+            "window, which is correct cache-manager behaviour rather than a fault"
+        )
     return result
 
 

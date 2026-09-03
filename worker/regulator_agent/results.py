@@ -112,6 +112,14 @@ class StepRecord:
     http_status: Optional[int] = None
     error_class: Optional[str] = None
     error_detail: Optional[str] = None
+    # A job can finish DONE and still not have done the work asked of it: a
+    # peer dropped out ("results might be incomplete"), the job was finalized
+    # early, or a limit truncated it. splunkd says so in the job's messages
+    # and answers HTTP 200 regardless. Those are the most misleading records a
+    # capacity test can produce, because the search is fast precisely because
+    # it did less, so they are flagged rather than filed as clean successes.
+    partial: bool = False
+    messages: Optional[List[str]] = None
 
     # Browser half, populated by the Phase 2 engine and left null by the API
     # engine. Declared here rather than in a subclass so one record shape
@@ -192,9 +200,12 @@ class StepStats:
     result_count_total: int = 0
     run_duration_total_s: float = 0.0
     errors_by_class: Dict[str, int] = field(default_factory=dict)
+    partial: int = 0
 
     def add(self, record: StepRecord) -> None:
         self.executions += 1
+        if record.partial:
+            self.partial += 1
         # Only successful executions feed the latency histograms.
         #
         # A search head at its admission ceiling refuses work in the time of one
@@ -213,22 +224,33 @@ class StepStats:
                 self.ttfr.record_ms(record.ttfr_ms)
         else:
             self.failure_latency.record_ms(record.service_time_ms)
-        if record.scan_count:
-            self.scan_count_total += record.scan_count
-        if record.result_count:
-            self.result_count_total += record.result_count
-        if record.run_duration_s:
-            self.run_duration_total_s += record.run_duration_s
+        # Server-side totals come from successful jobs only. A refused or
+        # timed-out dispatch has no scan count worth adding, and a failed job
+        # that scanned half an index before dying would otherwise inflate the
+        # per-search scan figure the comparison relies on.
+        if record.ok:
+            if record.scan_count:
+                self.scan_count_total += record.scan_count
+            if record.result_count:
+                self.result_count_total += record.result_count
+            if record.run_duration_s:
+                self.run_duration_total_s += record.run_duration_s
         if not record.ok:
             self.errors += 1
             cls = record.error_class or ERROR_CLIENT
             self.errors_by_class[cls] = self.errors_by_class.get(cls, 0) + 1
+
+    @property
+    def successes(self) -> int:
+        return self.executions - self.errors
 
     def summary(self) -> Dict[str, Any]:
         return {
             "step_id": self.step_id,
             "class": self.step_class,
             "executions": self.executions,
+            "successes": self.successes,
+            "partial": self.partial,
             "errors": self.errors,
             "error_rate_pct": round(100.0 * self.errors / self.executions, 3) if self.executions else 0.0,
             "errors_by_class": dict(self.errors_by_class),
@@ -238,6 +260,12 @@ class StepStats:
             "dispatch": self.dispatch.summary(),
             "ttfr": self.ttfr.summary(),
             "scan_count_total": self.scan_count_total,
+            # Per successful search, so two runs of different length or speed
+            # can be compared on how much work each search did rather than on
+            # how many searches the run managed to fit in.
+            "scan_count_per_search": (
+                round(self.scan_count_total / self.successes, 1) if self.successes else None
+            ),
             "result_count_total": self.result_count_total,
             "mean_events_per_s": (
                 round(self.scan_count_total / self.run_duration_total_s, 1)
@@ -290,6 +318,16 @@ class RunStats:
         # is looking for, so it is counted rather than treated as an error.
         self.queued_executions = 0
         self.queued = LatencyHistogram()
+        # Executions that could have reported queueing at all: a search
+        # dispatched as a job and polled to completion. Failures, oneshots and
+        # dashboard loads never set queued_ms, so counting them in the
+        # denominator understates the queueing rate exactly when it matters.
+        self.job_executions = 0
+        self.partial = 0
+        # Work that was still in flight when the run ended and had to be
+        # abandoned. Recorded as failures with the time they had accrued, and
+        # counted here so the summary can say the tail is a floor.
+        self.abandoned = 0
 
     def record(self, record: StepRecord) -> None:
         stats = self.steps.get(record.step_id)
@@ -299,6 +337,12 @@ class RunStats:
         stats.add(record)
 
         self.executions += 1
+        if record.partial:
+            self.partial += 1
+        if record.error_class == ERROR_CANCELLED:
+            self.abandoned += 1
+        if record.ok and record.sid and record.step_type == "search":
+            self.job_executions += 1
         if record.ok:
             self.overall_latency.record_ms(record.latency_ms)
         else:
@@ -347,10 +391,13 @@ class RunStats:
             "slot": self.slot,
             "elapsed_s": round(self.elapsed_s, 2),
             "executions": self.executions,
+            "successes": self.executions - self.errors,
             "iterations_completed": self.iterations_completed,
             "errors": self.errors,
             "error_rate_pct": round(self.error_rate_pct, 3),
             "errors_by_class": dict(self.errors_by_class),
+            "partial": self.partial,
+            "abandoned": self.abandoned,
             "in_flight": self.in_flight,
             "peak_in_flight": self.peak_in_flight,
             "throughput_per_s": (
@@ -360,9 +407,12 @@ class RunStats:
             "failure_latency": self.failure_latency.summary(),
             "queueing": {
                 "searches_queued": self.queued_executions,
+                # Over the searches that could have queued, not over every
+                # execution: see job_executions above.
+                "job_executions": self.job_executions,
                 "queued_pct": (
-                    round(100.0 * self.queued_executions / self.executions, 2)
-                    if self.executions
+                    round(100.0 * self.queued_executions / self.job_executions, 2)
+                    if self.job_executions
                     else 0.0
                 ),
                 "queued_ms": self.queued.summary(),
@@ -417,6 +467,18 @@ class RunSummary:
     sut: Optional[Dict[str, Any]] = None
     abort_reason: Optional[str] = None
     scenario_seed: int = 0
+    # The seed the draws actually used. An override (REG_SEED) changes every
+    # draw, and reporting only the scenario's own seed let two runs with
+    # different overrides compare as the same workload.
+    effective_seed: int = 0
+    # Content address of the scenario files, so "same scenario name" and
+    # "same test" can be told apart.
+    scenario_digest: Optional[str] = None
+    # What was asked for, as distinct from what happened: virtual users or
+    # arrival rate, pacing, arrival process. peak_virtual_users is an outcome
+    # in the open model and comparing outcomes as if they were settings
+    # produced spurious "different concurrency" warnings.
+    configured_load: Dict[str, Any] = field(default_factory=dict)
     agent_version: str = ""
 
     def to_dict(self) -> Dict[str, Any]:
