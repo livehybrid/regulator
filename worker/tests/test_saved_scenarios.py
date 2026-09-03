@@ -107,6 +107,23 @@ def test_a_persona_is_built_from_the_file_weighted_by_cron(tmp_path):
     assert not [line for line in lint(scenario) if not is_advice(line)]
 
 
+def test_one_odd_stanza_does_not_block_the_rest(tmp_path):
+    """A customer app always has one. It is left out with the reason, not fatal."""
+    odd = CONF + """
+[Backwards window]
+search = index=main | head 1
+dispatch.earliest_time = now
+dispatch.latest_time = -1h
+cron_schedule = */5 * * * *
+enableSched = 1
+"""
+    scenario = load_scenario(write(tmp_path, base_scenario(), conf=odd, name="odd"))
+    assert "Backwards window" in scenario.saved_skipped
+    assert "Backwards window" not in scenario.saved_selected
+    assert [line for line in lint(scenario) if not is_advice(line)] == []
+    assert any("could not be replayed" in line for line in lint(scenario) if is_advice(line))
+
+
 def test_the_dispatch_range_becomes_the_step_time_range(tmp_path):
     scenario = load_scenario(write(tmp_path, base_scenario()))
     by_id = {step.id: step for step in scenario.personas[0].steps}

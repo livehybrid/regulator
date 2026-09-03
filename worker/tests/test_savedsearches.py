@@ -225,6 +225,8 @@ def test_a_dispatch_range_becomes_a_rolling_window():
     assert ending_at_midnight.window_s == 7 * 86400
     assert ending_at_midnight.offset_s == pytest.approx(14 * 3600 + 37 * 60 + 22)
     assert ss.derive_window("0", "now").all_time is True
+    # Seen in the wild: dispatch.latest_time = 0. It cannot mean the epoch.
+    assert ss.derive_window("-5m", "0", NOW).window_s == 300
     with pytest.raises(ss.RelativeTimeError):
         ss.derive_window("now", "-1h", NOW)
 

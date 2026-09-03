@@ -710,12 +710,13 @@ def _policy_from_saved(
     search: ss.SavedSearch, base: TimePolicy, mode: str
 ) -> tuple[Optional[TimePolicy], Optional[str]]:
     """A step time policy from a stanza's dispatch times, or a problem."""
+    latest = search.latest if search.latest not in ("", "0") else "now"
     if mode == "as_saved":
         return (
             TimePolicy(
                 mode="relative",
                 earliest_rel=search.earliest or "0",
-                latest_rel=search.latest or "now",
+                latest_rel=latest,
                 window_s=0.0,
             ),
             None,
@@ -728,7 +729,7 @@ def _policy_from_saved(
         # An all-time search has no window to roll. Pass it through as saved,
         # which is the only honest thing to do with it, and say so.
         return (
-            TimePolicy(mode="relative", earliest_rel="0", latest_rel=search.latest or "now"),
+            TimePolicy(mode="relative", earliest_rel="0", latest_rel=latest),
             None,
         )
     return (
@@ -834,6 +835,7 @@ def bind_saved_searches(scenario: Scenario) -> Scenario:
         allow_realtime=scenario.searches.allow_realtime,
     )
     selected_names = [search.name for search in selection.chosen]
+    skipped_late: Dict[str, str] = {}
 
     personas: List[Persona] = []
     for persona in scenario.personas:
@@ -882,7 +884,10 @@ def bind_saved_searches(scenario: Scenario) -> Scenario:
                     search, template, scenario.searches, scenario.time_policy, taken
                 )
                 if problem:
-                    problems.append(f"persona {persona.name}: {problem}")
+                    # One odd stanza in an app of forty must not block the
+                    # other thirty-nine. It is left out with the reason on
+                    # the scenario, where the web interface and lint show it.
+                    skipped_late[search.name] = problem.split(": ", 1)[-1]
                     continue
                 if persona.weight_by == "cron" and not bound.weight:
                     if search.cron:
@@ -905,11 +910,18 @@ def bind_saved_searches(scenario: Scenario) -> Scenario:
                 )
         personas.append(replace(persona, steps=steps))
 
+    if skipped_late:
+        selected_names = [name for name in selected_names if name not in skipped_late]
+        problems.append(
+            f"{ADVICE_PREFIX}{len(skipped_late)} saved search(es) were left out because their "
+            "time range could not be replayed: "
+            + "; ".join(f"{name!r}: {why}" for name, why in list(skipped_late.items())[:5])
+        )
     return replace(
         scenario,
         personas=personas,
         saved_selected=selected_names,
-        saved_skipped=dict(selection.skipped),
+        saved_skipped={**selection.skipped, **skipped_late},
         saved_problems=problems,
     )
 

@@ -626,7 +626,12 @@ def derive_window(earliest: str, latest: str, now: Optional[_dt.datetime] = None
     and stated here so nobody expects calendar precision.
     """
     reference = now or _dt.datetime(2026, 1, 15, 12, 0, 0, tzinfo=_dt.timezone.utc)
-    latest_text = (latest or "").strip() or "now"
+    latest_text = (latest or "").strip()
+    if latest_text in ("", "0"):
+        # An unset latest is now. So is 0: it is what some apps ship (seen in
+        # the wild as dispatch.latest_time = 0) and it cannot mean the epoch,
+        # which would put the window before every earliest ever written.
+        latest_text = "now"
     earliest_text = (earliest or "").strip()
     if earliest_text in ("", "0"):
         return DerivedWindow(window_s=0.0, offset_s=0.0, align_s=60.0, all_time=True)
