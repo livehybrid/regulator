@@ -30,6 +30,7 @@ corpus:
     - apigw
     - aws-s3-access
   index: main
+  sourcetypes: [aws:cloudtrail, linux_secure, stoker:apigw, aws:s3:accesslogs]
 
 parameters:
   src_ip:

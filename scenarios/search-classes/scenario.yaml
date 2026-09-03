@@ -45,6 +45,16 @@ corpus:
     - host-infra-metrics
   index: main
   metric_index: stoker_metrics
+  # Checked against the target before a run: an index that exists but holds
+  # none of these returns nothing in milliseconds and reads as a fast cluster.
+  sourcetypes:
+    - access_combined
+    - access_combined_wcookie
+    - aws:cloudtrail
+    - aws:s3:accesslogs
+    - linux_secure
+    - vendor_sales
+    - stoker:apigw
 
 parameters:
   # Drawn from the data itself at run start, so the rare search hunts for

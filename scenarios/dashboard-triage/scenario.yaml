@@ -31,18 +31,23 @@ tags: browser, dashboard, experience, playwright
 
 corpus:
   requires_packs:
+    - web-access
     - aws-cloudtrail
     - splunk-tutorial-secure
+    - splunk-tutorial-web
     - apigw
   index: main
+  sourcetypes: [access_combined, access_combined_wcookie, aws:cloudtrail, linux_secure, stoker:apigw]
 
 parameters:
-  # Kept even though the dashboards take no parameters yet: a dashboard with a
-  # token input is the normal case in the field, and the URL builder already
-  # substitutes these.
-  region:
-    type: choice
-    values: [eu-west-1, eu-west-2, us-east-1]
+  # Every parameter a dashboard step draws is passed in the URL as
+  # form.<name>, so the page's tokens are set the way a link would set them.
+  # The shipped dashboards take an index token, pinned here to the corpus so
+  # the browser channel asks the same question of the same data as the API
+  # channel.
+  index:
+    type: literal
+    value: main
 
 time_policy:
   mode: rolling
@@ -68,6 +73,10 @@ personas:
         class: accelerated
         app: regulator_sut
         dashboard: triage_overview
+        # The dashboards' time input is the `range` token. Splunk Web reads a
+        # named input from form.range.earliest and ignores the bare earliest,
+        # so without this every load ran the dashboard's saved default.
+        time_token: range
         # What the user perceives: when did anything appear. A dashboard can
         # paint one panel instantly and take a minute to finish, and this is
         # the number they would quote at you.
@@ -90,6 +99,7 @@ personas:
         class: dense
         app: regulator_sut
         dashboard: ops_overview
+        time_token: range
         # Everything settled, rather than the first thing to appear. A slow
         # tail here with a fast first_result means the dashboard feels quick
         # and is not, which is worth knowing separately.

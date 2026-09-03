@@ -26,8 +26,12 @@ cp -r splunk-app/regulator_sut $SPLUNK_HOME/etc/apps/
 $SPLUNK_HOME/bin/splunk restart
 ```
 
-The searches use `index=*` rather than naming an index, so the app works against
-whatever corpus a cluster holds. That is the right trade for a portable
-dashboard, and it does mean the panels return nothing on a cluster whose
-load-test account cannot read any index: run `--target-report` first, which says
-so before you spend a run finding out.
+The searches take their index from an `index` token, defaulting to `main`, and
+their time range from a `range` token. The browser engine pins both through the
+URL (`form.index` from the scenario's `index` parameter, `form.range.earliest`
+and `form.range.latest` from the step's window), so the browser channel asks the
+same question of the same data as the API channel. A dashboard scenario that
+points at your own dashboards should set `time_token` to that dashboard's time
+input token, or the page runs whatever range it was saved with, and the run
+record says so: a browser step whose searches did not use the pinned range is
+flagged `partial` with `time_pinned: false`.
