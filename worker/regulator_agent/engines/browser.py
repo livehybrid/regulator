@@ -70,7 +70,11 @@ log = logging.getLogger("regulator.browser")
 # is deliberately broad rather than pinned to one framework's exact URL.
 _SEARCH_XHR = re.compile(r"/splunkd/__raw/services(NS/[^/]+/[^/]+)?/search/(v2/)?jobs")
 _SID_IN_PATH = re.compile(r"/jobs/([^/?]+)")
-_IS_DONE_TRUE = re.compile(r'"isDone"\s*:\s*(true|"1"|1)\b')
+# splunkd writes isDone as true, "1" or 1 depending on release and endpoint.
+# No word boundary after the alternation: a closing quote followed by a brace
+# is not one, so "isDone":"1"} never matched and the engine waited out its
+# whole timeout on a page whose searches had long finished.
+_IS_DONE_TRUE = re.compile(r'"isDone"\s*:\s*(?:true|"1"|1)(?![0-9])')
 
 # How many of a page's jobs to read back for the server-side join.
 MAX_JOBS_TO_JOIN = 8
