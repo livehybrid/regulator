@@ -320,3 +320,25 @@ def test_a_run_id_default_carries_the_start_time(env):
     first = load_config(env())
     assert first.run_id.startswith("local-")
     assert first.run_id != "local"
+
+
+# ------------------------------------------------------------ partial flag
+
+
+@pytest.mark.parametrize(
+    "message, expected",
+    [
+        ("WARN: Unable to distribute to peer named idx3 at uri https://idx3:8089 because peer has status = Down. Results might be incomplete.", True),
+        ("WARN: Search auto-finalized after time limit (60 seconds) reached.", True),
+        ("WARN: The search you ran returned a number of results that exceeded the maximum of 500000.", True),
+        # Seen live: a slow box warning about limits.conf says nothing about the results.
+        ("WARN: Configuration initialization for /opt/splunk/etc took longer than expected (5550ms) when dispatching a search with search ID 1788460920.15309. This might be a hint that the limits.conf setting is too low.", False),
+        ("INFO: This is a slow search - please see  me", False),
+        ("INFO: No matching fields exist.", False),
+        ("INFO: Your timerange was substituted based on your search string", False),
+    ],
+)
+def test_partial_is_a_statement_about_the_results_not_the_box(message, expected):
+    from regulator_agent.engines.api import _looks_partial
+
+    assert _looks_partial([message]) is expected

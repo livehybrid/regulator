@@ -675,20 +675,29 @@ class ApiEngine:
             interval_s = min(interval_s * 1.5, max_interval_s)
 
 
-# Fragments of splunkd job messages that mean the job finished without doing
-# all of its work. Lower-cased substring matches, because the exact wording
-# has drifted between releases while the vocabulary has not.
+# Phrases in splunkd job messages that mean the job finished without doing
+# all of its work. Phrases rather than words: a live instance under load
+# warns that "configuration initialization took longer than expected ...
+# limits.conf", which mentions a limit and says nothing about the results.
+# Lower-cased substring matches on WARN and ERROR messages only.
 _PARTIAL_MARKERS = (
     "might be incomplete",
     "may be incomplete",
     "results are incomplete",
+    "incomplete results",
     "unable to distribute",
-    "peer",
-    "truncat",
-    "was finalized",
+    "peer is down",
+    "peer unreachable",
+    "peers did not participate",
+    "not responding",
+    "truncated",
     "auto-finalized",
-    "exceeded",
-    "limit",
+    "was finalized",
+    "exceeded the maximum",
+    "reached the maximum",
+    "maximum number of results",
+    "search limit reached",
+    "max_count",
 )
 
 
