@@ -23,24 +23,17 @@ metadata:
   name: regulator
   labels:
     app.kubernetes.io/name: regulator
----
-apiVersion: v1
-kind: Secret
-metadata:
-  name: regulator
-  namespace: regulator
-type: Opaque
-stringData:
-  # Encrypts every target credential at rest. Generate with:
-  #   python -c 'from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())'
-  #
-  # NOT optional in a deployment. Left unset, Regulator generates a throwaway
-  # key on every start, so every credential stored becomes undecryptable the
-  # first time the pod restarts.
-  REG_MASTER_KEY: "replace-me-with-a-generated-fernet-key"
-  # Unset means no authentication at all. This service can evict a production
-  # SmartStore cache and drive a cluster to saturation.
-  REG_ADMIN_PASSWORD: "replace-me"
+# The Secret is deliberately NOT in this file. Copy infra/k8s/secret.example.yaml
+# to infra/k8s/secret.yaml (which .gitignore excludes), generate a real Fernet
+# key, and apply that first:
+#
+#   cp infra/k8s/secret.example.yaml infra/k8s/secret.yaml
+#   python -c 'from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())'
+#   $EDITOR infra/k8s/secret.yaml
+#   kubectl apply -f infra/k8s/secret.yaml -f infra/k8s/regulator.yaml
+#
+# Applying this manifest with a placeholder key does not degrade gracefully:
+# the server treats a malformed master key as fatal, so the pod crash-loops.
 ---
 apiVersion: v1
 kind: PersistentVolumeClaim
@@ -89,14 +82,25 @@ spec:
       securityContext:
         runAsUser: 10012
         runAsGroup: 10012
+        runAsNonRoot: true
         fsGroup: 10012
         fsGroupChangePolicy: OnRootMismatch
+        seccompProfile:
+          type: RuntimeDefault
+      # Nothing here talks to the Kubernetes API, and a pod that can evict a
+      # production cache should not carry a token it never uses.
+      automountServiceAccountToken: false
       # The control plane drains in-flight runs on SIGTERM rather than
       # abandoning them mid-measurement.
-      terminationGracePeriodSeconds: 60
+      terminationGracePeriodSeconds: 120
       containers:
         - name: regulator
           image: ghcr.io/livehybrid/regulator:latest
+          imagePullPolicy: Always
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
           ports:
             - name: http
               containerPort: 8080
@@ -115,6 +119,14 @@ spec:
               value: "300"
             - name: REG_MAX_CONCURRENT_RUNS
               value: "1"
+            # Imported scenarios live on the same volume as the database.
+            - name: REG_USER_SCENARIOS_DIR
+              value: /data/scenarios
+            # Telemetry for every run launched here. Fill in, or leave unset.
+            # - name: REG_HEC_URL
+            #   value: https://hec.splunk.svc:8088
+            # - name: REG_HEC_VERIFY_TLS
+            #   value: "0"
           volumeMounts:
             - name: data
               mountPath: /data
@@ -159,3 +171,25 @@ spec:
     - name: http
       port: 8080
       targetPort: http
+---
+# Only pods labelled as the ingress path may reach the control plane. A
+# service with one shared password that can evict a production cache should
+# not be reachable from every pod in the cluster. Adjust the selector to your
+# ingress controller's namespace and labels.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: regulator
+  namespace: regulator
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: regulator
+  policyTypes: ["Ingress"]
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: ingress-nginx
+      ports:
+        - port: 8080

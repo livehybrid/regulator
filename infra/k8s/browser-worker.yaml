@@ -24,9 +24,22 @@ spec:
           effect: NoSchedule
       # Nothing here talks to the Kubernetes API.
       automountServiceAccountToken: false
+      # Restricted Pod Security Standard. Chromium runs with --no-sandbox
+      # inside its own user namespace already; nothing here needs privilege.
+      securityContext:
+        runAsNonRoot: true
+        seccompProfile:
+          type: RuntimeDefault
       containers:
         - name: worker
           image: ghcr.io/livehybrid/regulator-worker:browser
+          # The tag is mutable and republished on every push to main. Without
+          # this a node that pulled it once keeps the stale image for ever.
+          imagePullPolicy: Always
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
           env:
             - name: REG_STANDALONE
               value: "1"
@@ -40,7 +53,7 @@ spec:
               value: "0"
             # Splunk Web needs a native account: a bearer token authenticates
             # the REST API but not a web session, and SAML cannot be driven
-            # headlessly at all.
+            # headlessly at all. The Secret is in secret.example.yaml.
             - name: REG_TARGET_USERNAME
               valueFrom:
                 secretKeyRef: {name: regulator-splunk, key: username}

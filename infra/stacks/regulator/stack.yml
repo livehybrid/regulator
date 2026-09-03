@@ -1,0 +1,77 @@
+# Regulator control-plane swarm stack (deploy via deploy.py -> Portainer).
+#
+# One service. The control plane keeps its SQLite database, its imported
+# scenarios and the run history on one named volume, so it is pinned to a node
+# and the volume stays with it. Postgres arrives with the worker fleet; a
+# single-operator control plane running scenarios in-process does not need it.
+#
+# The master key is a swarm secret (file mount, never env). The admin password,
+# API tokens and telemetry HEC token are injected as env by deploy.py from this
+# directory's .env. Reach it on the LAN at the published port, and through
+# Traefik once DNS for the host exists.
+version: "3.8"
+
+services:
+  regulator:
+    image: ${REGULATOR_IMAGE:-ghcr.io/livehybrid/regulator:latest}
+    networks: [traefik_default, regulator_internal]
+    ports:
+      - "${REGULATOR_PORT:-8092}:8080"
+    volumes:
+      - regulator_data:/data
+    secrets:
+      - regulator_master_key
+    environment:
+      - REG_DATABASE_URL=sqlite:////data/regulator.db
+      - REG_MASTER_KEY_FILE=/run/secrets/regulator_master_key
+      - REG_USER_SCENARIOS_DIR=/data/scenarios
+      - REG_ADMIN_PASSWORD=${REG_ADMIN_PASSWORD}
+      - REG_API_TOKENS=${REG_API_TOKENS:-}
+      # The in-process ceiling: this container is the load generator. Size it
+      # to the node it is pinned to, not to the population you wish to model.
+      - REG_MAX_VIRTUAL_USERS=${REG_MAX_VIRTUAL_USERS:-300}
+      - REG_MAX_CONCURRENT_RUNS=${REG_MAX_CONCURRENT_RUNS:-1}
+      - REG_MAX_RUN_DURATION_S=${REG_MAX_RUN_DURATION_S:-14400}
+      # Where every run launched from the web interface ships its telemetry.
+      # Off when unset. REG_HEC_VERIFY_TLS=0 for a self-signed collector.
+      - REG_HEC_URL=${REG_HEC_URL:-}
+      - REG_HEC_TOKEN=${REG_HEC_TOKEN:-}
+      - REG_HEC_INDEX=${REG_HEC_INDEX:-}
+      - REG_HEC_VERIFY_TLS=${REG_HEC_VERIFY_TLS:-1}
+      # A target registered at boot, so a rebuilt stack is runnable at once.
+      - REG_SEED_TARGET_NAME=${REG_SEED_TARGET_NAME:-}
+      - REG_SEED_TARGET_URL=${REG_SEED_TARGET_URL:-}
+      - REG_SEED_TARGET_WEB_URL=${REG_SEED_TARGET_WEB_URL:-}
+      - REG_SEED_TARGET_TOKEN=${REG_SEED_TARGET_TOKEN:-}
+      - REG_SEED_TARGET_USERNAME=${REG_SEED_TARGET_USERNAME:-}
+      - REG_SEED_TARGET_PASSWORD=${REG_SEED_TARGET_PASSWORD:-}
+      - REG_SEED_TARGET_VERIFY_TLS=${REG_SEED_TARGET_VERIFY_TLS:-1}
+    # Long enough for an in-flight run to drain its searches rather than be
+    # killed mid-measurement.
+    stop_grace_period: 90s
+    deploy:
+      replicas: 1
+      placement: {constraints: ["node.hostname == ${REGULATOR_NODE:-hpelite}"]}
+      restart_policy: {condition: on-failure}
+      resources:
+        # Memory limited, CPU deliberately not: a throttled load generator
+        # cannot keep to its own schedule and the run is marked invalid.
+        limits: {memory: 4G}
+        reservations: {memory: 1G}
+      labels:
+        - traefik.enable=true
+        - traefik.http.routers.regulator.entrypoints=websecure
+        - traefik.http.routers.regulator.tls=true
+        - traefik.http.routers.regulator.rule=Host(`${REGULATOR_HOST:-regulator.mydomain.com}`)
+        - traefik.http.services.regulator.loadbalancer.server.port=8080
+
+secrets:
+  regulator_master_key:
+    external: true          # created by deploy.py (ensure_master_key_secret)
+
+volumes:
+  regulator_data: {}
+
+networks:
+  traefik_default: {external: true}
+  regulator_internal: {driver: overlay}

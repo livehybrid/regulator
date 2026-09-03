@@ -9,10 +9,11 @@ Stoker fills a Splunk cluster with realistic data. Regulator drives realistic
 demand against it. On a steam locomotive the stoker shovels coal into the
 firebox and the driver opens the regulator to demand work from the boiler.
 
-> **Phases 0 to 4.** The API engine, the scenario format, the standalone worker,
+> **Phases 0 to 6.** The API engine, the scenario format, the standalone worker,
 > the control plane, the web UI, the headless-browser engine, the CI regression
-> gate and server-side correlation are here and tested. The distributed worker
-> fleet is the remaining piece.
+> gate, server-side correlation, Splunk's own `savedsearches.conf` as a scenario
+> source, a scenario for every Stoker pack, and two adversarial review rounds
+> folded back in. The distributed worker fleet is the remaining piece.
 
 ---
 
@@ -87,8 +88,31 @@ eksctl create nodegroup --cluster <name> --name regulator \
   --node-labels workload=regulator --node-type m6i.2xlarge --nodes 1 \
   --taints workload=regulator:NoSchedule
 
-kubectl apply -f infra/k8s/regulator.yaml
+cp infra/k8s/secret.example.yaml infra/k8s/secret.yaml   # git-ignored
+python -c 'from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())'
+$EDITOR infra/k8s/secret.yaml                             # the key, the password, CI tokens
+kubectl apply -f infra/k8s/secret.yaml -f infra/k8s/regulator.yaml
 ```
+
+The Secret is a separate, ignored file on purpose: a placeholder key is a fatal
+boot error rather than a quiet default, and a real one must never be one
+careless `git add` away from a public repository.
+
+## Running it on Docker Swarm through Portainer
+
+The homelab path, and the same shape as Stoker's:
+
+```bash
+cd infra/stacks/regulator
+cp .env.example .env        # PORTAINER_HOST, PORTAINER_TOKEN, REG_ADMIN_PASSWORD, HEC, a seed target
+python deploy.py --dry-run
+python deploy.py            # creates or updates the stack, generates and keeps the master key
+```
+
+One service, one named volume carrying the database, the imported scenarios and
+the run history, pinned to the node you name. Every run launched from the web
+interface ships its telemetry to the HEC destination in `.env`, and the target
+named there is registered at boot so a rebuilt stack is runnable at once.
 
 Note the deployment sets **memory limits but no CPU limit**. A throttled load
 generator cannot keep to its own schedule, and the result is a run marked
@@ -120,12 +144,15 @@ FAIL: 1/2 gates met
 ```
 
 Comparison is arithmetic over two JSON documents, so it needs no target and no
-network. The gate language is deliberately small, because a gate nobody can read
-aloud in a review is a gate that will eventually be misread:
+network. With no gates it is report only, and says so: "0 of 0 gates met" used
+to read as a pass, which is how a pipeline that lost its gate arguments went
+green on a regression. The gate language is deliberately small, because a gate
+nobody can read aloud in a review is a gate that will eventually be misread:
 
 | Gate | Meaning |
 |---|---|
 | `p95 <= baseline + 15%` | The common one: no more than 15% slower |
+| `p95 <= baseline + 200ms` | An absolute allowance over the baseline. A relative threshold must name its unit: `baseline + 200` is refused, because it used to mean 200 percent while a bare `200` meant 200 milliseconds |
 | `p95 <= 5000ms` | An absolute ceiling, no baseline needed |
 | `throughput >= baseline - 10%` | Where a bigger number is better, worse means down |
 | `error_rate <= 2%` | |
@@ -144,14 +171,18 @@ Each of these would let it lie, and somebody would merge on the strength of it.
   are different work, sometimes by an order of magnitude. The comparison still
   runs, because sometimes that is exactly what you are measuring, but the
   mismatch is reported as a warning.
-- **It will not quietly compare different workloads.** A different scenario,
-  seed, concurrency, target or coordinated-omission setting is a different
-  question, and each is called out.
+- **It will not quietly compare different workloads.** A different scenario
+  file (by content digest, not name), seed, load model, configured load,
+  target or coordinated-omission setting is a different question, and each is
+  called out. A step with fewer than 20 successful samples on either side is
+  flagged, because its p95 is a coin toss.
 
 The per-step table separates the two ways a benchmark gets slower:
-`scanned more` means the candidate did more work, so the comparison was never
-valid. Latency up with scan count flat is contention or queueing, which is the
-finding you were looking for.
+`scanned more` means each of the candidate's searches did more work, so the
+comparison was never valid. Latency up with scans per search flat is contention
+or queueing, which is the finding you were looking for. Per search, not per
+run: a faster cluster fits more iterations in and scans more in total, which is
+not the same thing.
 
 ### The exit contract
 
@@ -171,7 +202,8 @@ slowdown that never happened.
 - uses: livehybrid/regulator/.github/actions/benchmark@main
   with:
     server: https://regulator.example
-    token: ${{ secrets.REGULATOR_TOKEN }}
+    token: ${{ secrets.REGULATOR_TOKEN }}     # one of the control plane's REG_API_TOKENS
+    # or: password: ${{ secrets.REGULATOR_PASSWORD }}, exchanged for a session
     target: 1
     scenario: search-classes
     virtual-users: 200
@@ -208,9 +240,14 @@ docker run --rm -p 8080:8080 -v regulator-data:/data \
 ```
 
 Add a target, and the buttons do the rest: **Test** probes it, **Report**
-describes the whole cluster, **Cache** shows what SmartStore holds locally,
-**Evict** drops it, and **Run** launches a scenario with live latency,
-throughput and queueing while it goes.
+describes the whole cluster and says which scenarios its data fits, **Cache**
+shows what SmartStore holds locally on every indexer, **Evict** drops it,
+**Saved searches** lists what the target already runs and turns it into a
+scenario, and **Run** launches a scenario with live latency, throughput and
+queueing while it goes. A finished run can be made a **baseline** and any run
+**compared** against one, with the per-step table and the gates on the page.
+The **Audit** view records who launched, stopped, evicted or imported what,
+with the caller's address.
 
 The run detail is the view that earns its place. Three things decide whether a
 result means anything, and each gets a banner that cannot be missed: a run
@@ -228,11 +265,17 @@ slips past it.
 
 | Variable | Default | Notes |
 |---|---|---|
-| `REG_ADMIN_PASSWORD` | unset | Unset means **no authentication at all**, and the server says so on every start and in `/api/auth/status`. This thing can evict a production cache |
-| `REG_MASTER_KEY` / `REG_MASTER_KEY_FILE` | generated | Encrypts target credentials at rest. Unset means a throwaway key, so everything stored becomes unreadable at the next restart |
+| `REG_ADMIN_PASSWORD` | unset | The operator password. Unset means **no authentication at all**, which the server refuses unless `REG_ALLOW_UNAUTHENTICATED=1` says a laptop on a network you control really is what this is. This thing can evict a production cache |
+| `REG_API_TOKENS` | unset | Comma-separated bearer tokens for pipelines and scripts, 16 characters or more each. As powerful as the password |
+| `REG_MASTER_KEY` / `REG_MASTER_KEY_FILE` | generated | Encrypts target credentials at rest. Unset means a throwaway key, so everything stored becomes unreadable at the next restart. An empty key file is a fatal boot error rather than a silent throwaway |
 | `REG_DATABASE_URL` | `sqlite:///./regulator.db` | |
-| `REG_MAX_VIRTUAL_USERS` | `500` | The in-process ceiling described above |
+| `REG_USER_SCENARIOS_DIR` | next to the database | Where scenarios created through the web interface or the API are written. Separate from the built-in library, so an image upgrade never overwrites yours |
+| `REG_HEC_URL` / `REG_HEC_TOKEN` / `REG_HEC_INDEX` / `REG_HEC_VERIFY_TLS` | off | Where every run launched here ships its telemetry, exactly as the worker's variables of the same name |
+| `REG_SEED_TARGET_URL` and friends | unset | A target registered or updated at boot (`_NAME`, `_WEB_URL`, `_TOKEN` or `_USERNAME` and `_PASSWORD`, `_VERIFY_TLS`). What makes a nightly-rebuilt deployment runnable with no web step |
+| `REG_MAX_VIRTUAL_USERS` | `500` | The in-process ceiling described above. The open model is held to the same ceiling of in-flight searches |
 | `REG_MAX_CONCURRENT_RUNS` | `2` | More at once would mean measuring contention between your own tests |
+| `REG_MAX_RUN_DURATION_S` | `14400` | The longest run accepted, so a mistyped duration cannot hold a slot for ever |
+| `REG_SESSION_TTL_S` | `43200` | Sessions are bound to the password as well as the key: changing the password signs everyone out |
 
 **The UI is one self-contained HTML file with no build step.** No npm, no
 node_modules in the image, no build stage in CI, nothing to go stale, and an
@@ -355,8 +398,11 @@ deployment disposable and a CI job a single `docker run`.
 | `REG_ARRIVAL_RATE_PER_MIN` | | Open model: fixed arrival rate. Mutually exclusive with `REG_VUS` |
 | `REG_PACING_S` | from the scenario | Gives each virtual user a timetable, which is what enables coordinated-omission correction in the closed model |
 | `REG_DURATION_S` | from the scenario | |
-| `REG_SEED` | from the scenario | Overriding it changes the workload, so two runs with different seeds are not comparable |
+| `REG_SEED` | from the scenario | Reseeds every draw (parameters, persona assignment, think time, jitter) and is recorded as `effective_seed`. Overriding it changes the workload, so two runs with different seeds are not comparable and the comparison says so |
 | `REG_MAX_IN_FLIGHT` | `512` | Open model shedding ceiling. Hitting it invalidates the run |
+| `REG_DRAIN_BUDGET_S` | `60` | How long in-flight searches may finish after the run ends. Anything still running is recorded as an abandoned failure with the time it had accrued, never silently dropped |
+| `REG_LINT_STRICT` | `1` | `0` downgrades blocking lint to warnings |
+| `REG_SUT_SETTLE_S` | `8` | How long to wait for the target's own logging before asking it about the run |
 
 ### Telemetry
 
@@ -420,6 +466,13 @@ most of that cache belongs to other people's dashboards.
 |---|---|---|
 | `REG_EVICT_CACHE` | `0` | Evict before the run, so it measures the cold path. Opt-in and never a default |
 | `REG_EVICT_CACHE_INDEXES` | the scenario's corpus index | Comma-separated. Also supplies the default index list for `--evict-cache` |
+| `REG_INDEXER_URLS` | the search peers | The cache lives on the indexers, and on a distributed target the search head has none. Empty means discover the search peers and reuse the target's credential on each; set it to name them outright |
+| `REG_INDEXER_TOKEN`, or `REG_INDEXER_USERNAME` and `REG_INDEXER_PASSWORD` | the target's | A credential valid on the indexers when the search head's is not |
+
+Eviction is confirmed rather than assumed. The cache manager answers 200 to a
+request it then declines (a bucket with a live reader, or one inside the
+hotlist window), so the result reports both the accepted count and the number
+of buckets that actually left, and says why they differ when they do.
 
 **One caveat worth knowing when reading a cold run.** Splunk re-localises as
 the run proceeds, so the first searches read cold and later ones increasingly
@@ -505,21 +558,119 @@ set it high or leave it out.
 | `REG_POLL_INITIAL_MS` / `REG_POLL_MAX_MS` | `250` / `1000` | Adaptive job polling. Polling hard is itself load on the target: a thousand users at 100 ms is ten thousand REST calls a second |
 | `REG_DELETE_JOBS` | `1` | Clean up artefacts on the search head. Leaving thousands behind is itself a load characteristic |
 | `REG_CACHE_BUST` | `1` | The nonce comment. Only turn it off to demonstrate what the cache is worth |
-| `REG_HTTP2`, `REG_CONNECT_TIMEOUT_S`, `REG_READ_TIMEOUT_S` | `0`, `10`, `300` | |
-| `REG_LINT_STRICT` | `1` | `0` downgrades blocking lint to warnings |
+| `REG_HTTP2`, `REG_CONNECT_TIMEOUT_S`, `REG_READ_TIMEOUT_S` | `0`, `10`, `300` | Every dispatched job also carries `auto_cancel` a minute past the read timeout, so a search this worker gives up on is cancelled by splunkd rather than run to completion for nobody |
 
 ---
 
 ## Scenarios
 
-A scenario is the payload: a directory with a `scenario.yaml`, git-syncable,
-linted before it runs. Three ship in the box.
+A scenario is the payload: a directory with a `scenario.yaml` and, for most of
+the library, a `savedsearches.conf` in Splunk's own format next to it.
+Git-syncable, linted before it runs, content-addressed so two runs of the same
+files are provably the same test. Twenty-two ship in the box.
 
 | Scenario | What it is for |
 |---|---|
 | `smoke` | Two trivial searches needing no indexed data. Proves the path works, measures nothing |
 | `search-classes` | One search per class (dense, sparse, rare, accelerated, heavy, subsearch) against Stoker-generated data, so a regression can be attributed to a component |
 | `soc-analyst-morning` | Persona-weighted SOC triage: hunters, dashboard watchers and a reporter, at realistic think times |
+| `dashboard-triage` | The browser engine opening the two shipped dashboards, with the time range and index pinned |
+| `pack-<stoker pack>` | One per Stoker pack, seventeen in all: the searches an operations or security team would schedule against that data, written against the fields the pack actually emits. Five to eight searches each, in `savedsearches.conf` form, classified in the YAML |
+| `stoker-scheduler` | Every event pack's scheduled searches in one file, fired on their own cron as Splunk's scheduler would fire them. The top-of-the-hour burst is the point |
+
+### Splunk's own format
+
+Every Splunk deployment already has its workload written down, in the
+`savedsearches.conf` files of its apps, and nobody transcribes four hundred
+searches into another format. So Regulator reads that one:
+
+```
+[Errors in the last hour]
+search = index=main sourcetype=access_combined status>=500 | stats count by uri_path
+dispatch.earliest_time = -1h
+dispatch.latest_time = now
+cron_schedule = */5 * * * *
+enableSched = 1
+```
+
+The parser is the conf grammar as splunkd reads it: stanzas, backslash line
+continuations with the newline kept, `#` only at the start of a line,
+`[default]` folded in. A search without a leading `search` keyword gets one, as
+the scheduler would give it. `dispatch.earliest_time` and `dispatch.latest_time`
+become the step's window: `-24h@h` is evaluated as Splunk evaluates it, then
+rolled with the scenario's jitter so the working set moves (or passed through
+untouched with `time_from_saved: as_saved`, which replays the schedule exactly
+and measures the page cache too, and lint says so). The cron schedule becomes
+the weight: a five-minute search carries 288 times the weight of a daily one.
+
+Three ways to use it in a scenario:
+
+```yaml
+searches:
+  file: savedsearches.conf
+  only_enabled: true            # disabled = 1 stays out
+  only_scheduled: false         # or only what has a cron
+  allow_side_effects: false     # a search ending in collect is refused unless you say so
+  classes:                      # the class of each stanza, kept out of the conf so it stays plain Splunk
+    Errors in the last hour: sparse
+
+personas:
+  - name: analyst
+    steps_from: saved           # every selected search, sampled by cron weight
+    weight_by: cron
+    walk: sample
+```
+
+```yaml
+    steps:
+      - saved: Errors in the last hour     # one stanza, as a step
+        class: sparse
+```
+
+```yaml
+      - saved: Errors in the last hour
+        dispatch: saved                    # run the TARGET's copy by name, with everything its stanza declares
+        app: search
+```
+
+The third form needs no local file at all: the search head dispatches its own
+saved search exactly as its scheduler would, alert actions never triggered. Lint
+checks the search exists on the target before the run.
+
+Every search that writes somewhere (`collect`, `outputlookup`, `sendemail` and
+their relatives) is left out with the reason recorded, because a load test
+replays a search hundreds of times and a summary-index writer replayed at two
+hundred virtual users writes two hundred copies. `allow_side_effects` turns
+that off when it really is the question.
+
+**From a target.** The web interface's **Saved searches** button lists what a
+target already runs, per app, with each search's cron, class and whether it
+would be left out and why, then exports them as a `savedsearches.conf` a Splunk
+admin would recognise and makes a scenario of them in one click. Over the API:
+`GET /api/targets/{id}/savedsearches.conf?app=…`, then
+`POST /api/scenarios` with the text.
+
+### The schedule model
+
+```yaml
+load:
+  model: schedule               # each step fires on its own cron
+  duration: 1800s
+  schedule_start: "08:55"       # the virtual clock, so the 09:00 burst lands early in the run
+```
+
+The scheduler is the workload. Every step with a cron fires at its cron minutes
+on a virtual clock, all the hourly ones together, which is where a real cluster
+queues. Splunk would skip searches over its concurrency limit; Regulator
+dispatches them all and records the queueing, since seeing it is the point.
+Each firing is an open-model arrival with its intended start at the cron minute,
+so latency is coordinated-omission corrected. The closed and open models are
+still there for population-shaped load; `arrivals: poisson` (the default) makes
+open-model arrivals burst the way a real population does, because evenly spaced
+arrivals never queue and find an optimistic saturation point.
+
+The pack library is generated from `tools/build_pack_scenarios.py`, which is
+where the searches are written; `make scenarios` regenerates it.
 
 ```yaml
 name: soc-analyst-morning
@@ -609,6 +760,14 @@ perceives), `queued_ms` (detects crossing the concurrency ceiling),
 `event_count`, `result_count`, `dispatch_state`, `is_finalized`, and the derived
 `events_per_s = scan_count / run_duration_s`.
 
+**Two flags that stop a fast number lying.** `partial` marks a job that finished
+DONE and said in its own messages that it did less than asked: a peer dropped
+out, a limit truncated it, it was finalized early, or a dashboard did not use
+the pinned time range. Its latency is real; its work was not. `cancelled` marks
+a search still in flight when the run ended and abandoned after the drain
+budget, recorded as a failure with the time it had accrued so the tail is a
+floor rather than a gap. Both are counted in the summary and shown on the run.
+
 Plus the dimensions that make it sliceable: `sid`, `spl_hash` (stable across
 cache-busting, so the same logical search aggregates), `step_class`, `persona`,
 `vu_id`, `iteration`, the resolved parameter values, and the exact time window.
@@ -648,6 +807,10 @@ engine with no Splunk anywhere.
 | `histogram.py` | Mergeable log-linear latency sketch, ~1.6% worst-case relative error, exact count, sum, min and max |
 | `results.py` | The step record, emitters, the live aggregate |
 | `hec.py` | Best-effort batched telemetry that can never take down the run |
+| `savedsearches.py` | Splunk's conf grammar, relative time modifiers, cron, side-effect detection and a conservative class guess |
+| `smartstore.py` | Cache state and eviction per indexer, discovered from the search peers, with evictions confirmed rather than assumed |
+| `sut.py` | The seven correlation probes against the cluster's own indexes |
+| `compare.py` | Baselines, per-step deltas and the gate language |
 
 ---
 
@@ -655,7 +818,9 @@ engine with no Splunk anywhere.
 
 ```bash
 make test          # worker and tools unit suites
+make server-test   # the control plane, end to end against the fake splunkd
 make smoke         # end to end against the fake splunkd
+make scenarios     # regenerate the per-pack scenario library
 make docker-build
 make docker-smoke  # the packaged image against the fake splunkd
 ```
@@ -674,8 +839,13 @@ python tools/fake_splunk.py --port 8089 --max-concurrent 6 --per-concurrent-pena
 
 Superseded runs are cancelled to save Actions minutes, but a publish is never
 interrupted: test jobs are grouped per ref with `cancel-in-progress: true`, and
-build and sign jobs are grouped per SHA and never cancelled. Because `build`
-needs `test`, a cancelled test means the stale build never starts at all.
+the publishing jobs are grouped per SHA and never cancelled. Each publishing job
+signs the digest it pushed in the same job, so nothing can land between the
+push and the signature. Because `build` needs `test`, a cancelled test means
+the stale build never starts at all. Every push and pull request also builds
+the worker and control-plane images without publishing them and smokes the
+packaged worker against the fake splunkd, so a broken Dockerfile fails the pull
+request rather than the merge.
 
 ---
 
@@ -689,7 +859,9 @@ needs `test`, a cancelled test means the stale build never starts at all.
 | **2** | **Browser engine** (done): Playwright, a persistent context per virtual user, Navigation Timing and LCP, and every search the page fires captured from the wire and joined back to its own server-side job statistics |
 | **3** | **CI and regression gates** (done): named baselines, run comparison with per-step deltas, a small gate language, and a GitHub Action |
 | **4** | **Server-side correlation and Kubernetes** (done): every run pulls back the cluster's own account of it from `_audit`, `_introspection`, the scheduler and the cache manager, and manifests deploy it onto a dedicated node group so the generator never shares a node with the system under test |
-| 5 | Distributed worker fleet: Indexed Jobs and Swarm services driven by a claim protocol, which lifts the in-process virtual-user ceiling |
+| **5** | **Adversarial review, twice** (done): measurement defects that let a failing target look good (empty histograms reading as zero, leaked jobs under saturation, dropped tails, unit-ambiguous gates, per-run scan totals), control-plane defects (unbounded durations, the open model bypassing the ceiling, zombie runs, unattributable evictions) and Splunk-facing defects (cache state read from a search head, doubled audit counts, dashboards ignoring the pinned range) fixed with regression tests |
+| **6** | **Splunk's own search format** (done): `savedsearches.conf` as a scenario source, import and export from a target, dispatch by name, the schedule load model, and a scenario for every Stoker pack |
+| 7 | Distributed worker fleet: Indexed Jobs and Swarm services driven by a claim protocol, which lifts the in-process virtual-user ceiling and lets one run mix the API and browser engines |
 
 ---
 

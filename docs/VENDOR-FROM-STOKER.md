@@ -1,8 +1,17 @@
 # Vendored from Stoker
 
-**Phase 0 status: nothing has been copied yet. Every row in the table below is
-planned, not present.** This file exists ahead of the code so that the first
-copy is recorded at the moment it happens rather than reconstructed afterwards.
+**Status: adapted, not copied.** Nothing has been lifted verbatim. Three pieces
+of the control plane follow Stoker's design closely enough to say so:
+
+| Regulator | Stoker origin | What was kept |
+|---|---|---|
+| `server/regulator_server/crypto.py` | `server/crypto.py` | Fernet at rest with a domain-separated session signer derived from the same master key |
+| `server/regulator_server/app.py` (auth middleware, exempt paths, the open-deployment warning) | `server/app.py` | the shape; the single-password model is Regulator's own |
+| `infra/stacks/regulator/deploy.py` | `infra/stacks/stoker/deploy.py` | the Portainer stack create-or-update flow and the master-key swarm secret |
+
+The distributed-execution skeleton (leases, shared T0, heartbeat commands, the
+Swarm and Kubernetes drivers) is still to come and is what the rest of this
+file describes.
 
 ## Why copy at all
 

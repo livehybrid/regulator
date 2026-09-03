@@ -8,8 +8,17 @@ inputs:
     description: Control-plane base URL, for example https://regulator.example
     required: true
   token:
-    description: A control-plane session password or API token
-    required: true
+    description: >
+      An API token from the control plane's REG_API_TOKENS, presented as a
+      bearer. Preferred for CI. Give this or password.
+    required: false
+    default: ""
+  password:
+    description: >
+      The control plane's admin password, exchanged for a session cookie
+      through the same login the web interface uses. Give this or token.
+    required: false
+    default: ""
   target:
     description: Target id to run against
     required: true
@@ -64,6 +73,7 @@ runs:
       env:
         REGULATOR_SERVER: ${{ inputs.server }}
         REGULATOR_TOKEN: ${{ inputs.token }}
+        REGULATOR_PASSWORD: ${{ inputs.password }}
         REGULATOR_TARGET: ${{ inputs.target }}
         REGULATOR_SCENARIO: ${{ inputs.scenario }}
         REGULATOR_VUS: ${{ inputs.virtual-users }}

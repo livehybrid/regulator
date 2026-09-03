@@ -4,13 +4,13 @@ Copyright 2026 Will Searle and the Regulator contributors
 This product is licensed under the Apache License, Version 2.0 (see LICENSE).
 
 Regulator vendors no third-party source. Every dependency is resolved from its
-upstream package index at build time and none of it is copied into this tree, so
-there is nothing here to attribute beyond the licences of those dependencies.
-This section is kept in place because the position is expected to change: the
-Phase 2 browser driver ships Playwright, and any code lifted wholesale from a
-sibling project (see docs/VENDOR-FROM-STOKER.md) is a vendoring event that must
-be recorded here at the time it happens, not reconstructed later.
+upstream package index at build time and none of it is copied into this tree.
+The control-plane skeleton (credential encryption at rest, the signed session
+cookie, the Portainer deploy script) follows the shape of the sibling project
+Stoker (https://github.com/livehybrid/stoker, Apache-2.0, same author); what
+was adapted from it is recorded in docs/VENDOR-FROM-STOKER.md.
 
-The open-source dependencies redistributed in the Regulator container images,
-and their licences, will be inventoried in licenses/THIRD-PARTY-LICENSES.md once
-the image set is stable.
+The container images redistribute open-source dependencies under their own
+licences: httpx, h2, PyYAML, FastAPI, Starlette, uvicorn, SQLAlchemy, pydantic,
+cryptography and itsdangerous (all BSD or MIT), and the browser image is built
+on Microsoft's Playwright image, which carries Chromium under the BSD licence.

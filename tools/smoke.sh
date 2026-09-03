@@ -72,8 +72,9 @@ ${PYTHON} "${REPO_ROOT}/tools/fake_splunk.py" \
 FAKE_PID=$!
 
 # Wait for it to answer rather than sleeping a fixed amount.
+READY=0
 for _ in $(seq 1 100); do
-    if ${PYTHON} - "${PORT}" <<'PY' 2>/dev/null; then break; fi
+    if ${PYTHON} - "${PORT}" <<'PY' 2>/dev/null; then READY=1; break; fi
 import sys, urllib.request
 port = sys.argv[1]
 urllib.request.urlopen(f"http://127.0.0.1:{port}/services/server/info?output_mode=json", timeout=1).read()
@@ -84,6 +85,7 @@ PY
     fi
     sleep 0.1
 done
+[ "${READY}" = "1" ] || fail "the fake splunkd did not become ready on port ${PORT} within 10s"
 
 SUMMARY="${WORKDIR}/summary.json"
 
@@ -108,9 +110,10 @@ local)
     ;;
 docker)
     [ -n "${IMAGE}" ] || fail "docker mode needs an image: tools/smoke.sh docker <image>"
-    # Host networking so the container reaches the fake splunkd on loopback.
-    # The scenario comes from the image's own built-in library, which is the
-    # point: it proves the library was actually packaged.
+    # Host networking so the container reaches the fake splunkd on loopback
+    # (Linux only: Docker Desktop has no host network, run the local mode
+    # there). The scenario comes from the image's own built-in library, which
+    # is the point: it proves the library was actually packaged.
     docker run --rm --network host \
         -e REG_STANDALONE=1 \
         -e REG_SCENARIO=smoke \

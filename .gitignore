@@ -19,6 +19,13 @@ ui/dist/
 # Docs build output
 site/
 
+# Deployment secrets. The example files are tracked; the real ones never are.
+infra/k8s/secret.yaml
+infra/stacks/*/.env
+*.key
+*.pem
+secrets/
+
 # Secrets and local state. The control plane keeps a Fernet key and a SQLite
 # file next to the code when run from a checkout, so both are excluded rather
 # than relying on anyone remembering at `git add` time.

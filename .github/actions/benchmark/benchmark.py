@@ -42,9 +42,44 @@ def env(name: str, default: str = "") -> str:
     return (os.environ.get(name) or default).strip()
 
 
+# The session cookie obtained by logging in with a password, when a password
+# rather than an API token was supplied. Minted once, reused for every call.
+_SESSION_COOKIE: Optional[str] = None
+
+
+def _login_if_needed() -> None:
+    """Turn a password into a session cookie, once.
+
+    Two credentials are accepted. An API token (REGULATOR_TOKEN) is presented
+    as a bearer and is the right thing for CI. A password (REGULATOR_PASSWORD)
+    is exchanged for a signed session cookie through the same login endpoint
+    the web interface uses. The original version of this action sent the raw
+    password as though it were a session cookie, which authenticated against
+    nothing, so it only ever worked on a control plane with no password at all.
+    """
+    global _SESSION_COOKIE
+    password = env("REGULATOR_PASSWORD")
+    if _SESSION_COOKIE is not None or not password:
+        return
+    server = env("REGULATOR_SERVER").rstrip("/")
+    request = urllib.request.Request(
+        server + "/api/auth/login",
+        method="POST",
+        data=json.dumps({"password": password}).encode(),
+    )
+    request.add_header("Content-Type", "application/json")
+    with urllib.request.urlopen(request, timeout=60) as response:
+        for header, value in response.getheaders():
+            if header.lower() == "set-cookie" and value.startswith("regulator_session="):
+                _SESSION_COOKIE = value.split(";", 1)[0]
+    if _SESSION_COOKIE is None:
+        fail("the control plane accepted the password but set no session cookie")
+
+
 def call(
     path: str, method: str = "GET", body: Optional[Dict[str, Any]] = None
 ) -> Any:
+    _login_if_needed()
     server = env("REGULATOR_SERVER").rstrip("/")
     request = urllib.request.Request(
         server + path,
@@ -54,10 +89,9 @@ def call(
     request.add_header("Content-Type", "application/json")
     token = env("REGULATOR_TOKEN")
     if token:
-        # Both shapes: a session cookie for a password-protected control plane,
-        # and a bearer for when token auth lands.
-        request.add_header("Cookie", f"regulator_session={token}")
         request.add_header("Authorization", f"Bearer {token}")
+    if _SESSION_COOKIE:
+        request.add_header("Cookie", _SESSION_COOKIE)
     with urllib.request.urlopen(request, timeout=60) as response:
         payload = response.read()
         return json.loads(payload) if payload else None

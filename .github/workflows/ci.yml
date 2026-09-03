@@ -161,10 +161,64 @@ jobs:
       - name: Local smoke
         run: tools/smoke.sh local
 
+  image-smoke:
+    # The smoke against the packaged artefact, on every push and pull request,
+    # without publishing anything. The local smoke cannot see a broken
+    # entrypoint, a scenario library that did not make it into the image, or
+    # an environment variable renamed on one side only; this can. The two
+    # other images are built here too, so a broken Dockerfile fails the pull
+    # request rather than the merge.
+    needs: test
+    runs-on: ubuntu-latest
+    concurrency:
+      group: ${{ github.workflow }}-test-${{ github.event.pull_request.number || github.ref }}-image
+      cancel-in-progress: true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: worker/Dockerfile
+          load: true
+          tags: regulator-worker:ci
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: server/Dockerfile
+          load: true
+          tags: regulator:ci
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Smoke the worker image
+        run: tools/smoke.sh docker regulator-worker:ci
+      - name: The control-plane image boots and answers
+        run: |
+          docker run -d --name cp -p 18080:8080 -e REG_ADMIN_PASSWORD=ci-password \
+            -e REG_MASTER_KEY="$(python3 -c 'import base64,os;print(base64.urlsafe_b64encode(os.urandom(32)).decode())')" \
+            regulator:ci
+          for i in $(seq 1 30); do
+            if curl -fsS http://127.0.0.1:18080/healthz >/dev/null 2>&1; then break; fi
+            sleep 1
+          done
+          curl -fsS http://127.0.0.1:18080/healthz
+          # Unauthenticated calls are refused, and a login works.
+          test "$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:18080/api/targets)" = "401"
+          curl -fsS -c cookies.txt -H 'Content-Type: application/json' \
+            -d '{"password":"ci-password"}' http://127.0.0.1:18080/api/auth/login
+          curl -fsS -b cookies.txt http://127.0.0.1:18080/api/scenarios | python3 -c 'import json,sys; s=json.load(sys.stdin); assert len(s) >= 20, len(s); print(len(s), "scenarios in the image")'
+          docker logs cp | tail -20
+          docker rm -f cp
+
   build:
     # Gated on the smoke as well as the unit tests: an image whose end-to-end
     # path is broken must never reach the registry, signed or otherwise.
-    needs: [test, smoke]
+    needs: [test, smoke, image-smoke]
     if: github.event_name == 'push'
     runs-on: ubuntu-latest
     concurrency:
@@ -213,6 +267,13 @@ jobs:
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
+      # Signed in the same job as the push, so nothing can land between the
+      # two: a separate sign job could be cancelled or fail on its own, leaving
+      # a digest that pulls fine and fails verification.
+      - uses: sigstore/cosign-installer@v3
+      - name: Keyless sign the pushed digest
+        run: cosign sign --yes "${IMAGE_NAME}@${{ steps.push.outputs.digest }}"
+
   browser-build:
     needs: [test, browser-test]
     if: github.event_name == 'push'
@@ -257,7 +318,7 @@ jobs:
         run: cosign sign --yes "${IMAGE_NAME}@${{ steps.push.outputs.digest }}"
 
   cp-build:
-    needs: [test, server-test, smoke]
+    needs: [test, server-test, smoke, image-smoke]
     if: github.event_name == 'push'
     runs-on: ubuntu-latest
     concurrency:
@@ -300,27 +361,3 @@ jobs:
       - uses: sigstore/cosign-installer@v3
       - name: Keyless sign the pushed digest
         run: cosign sign --yes "ghcr.io/livehybrid/regulator@${{ steps.push.outputs.digest }}"
-
-  sign:
-    needs: build
-    if: github.event_name == 'push'
-    runs-on: ubuntu-latest
-    concurrency:
-      group: ${{ github.workflow }}-build-${{ github.sha }}
-      cancel-in-progress: false
-    permissions:
-      packages: write
-      id-token: write
-    steps:
-      - uses: sigstore/cosign-installer@v3
-
-      - uses: docker/login-action@v3
-        with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-
-      # Sign the digest, never a tag: a tag can be moved to point at a different
-      # manifest after signing, a digest cannot.
-      - name: Keyless sign the pushed digest
-        run: cosign sign --yes "${IMAGE_NAME}@${{ needs.build.outputs.digest }}"
