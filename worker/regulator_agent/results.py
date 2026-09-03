@@ -244,6 +244,21 @@ class StepStats:
     def successes(self) -> int:
         return self.executions - self.errors
 
+    def histograms(self) -> Dict[str, Dict[str, Any]]:
+        """The raw histograms, for merging across a fleet.
+
+        Percentiles cannot be averaged across workers; the buckets can be
+        added. This is what a worker ships in its final report so the control
+        plane computes the fleet's percentiles once, over the merged whole.
+        """
+        return {
+            "latency": self.latency.to_dict(),
+            "service_time": self.service_time.to_dict(),
+            "dispatch": self.dispatch.to_dict(),
+            "ttfr": self.ttfr.to_dict(),
+            "failure_latency": self.failure_latency.to_dict(),
+        }
+
     def summary(self) -> Dict[str, Any]:
         return {
             "step_id": self.step_id,
@@ -385,7 +400,24 @@ class RunStats:
     def elapsed_s(self) -> float:
         return time.time() - self.started_at
 
-    def snapshot(self) -> Dict[str, Any]:
+    def histograms(self) -> Dict[str, Any]:
+        """Every histogram in the aggregate, keyed for a fleet merge."""
+        return {
+            "latency": self.overall_latency.to_dict(),
+            "failure_latency": self.failure_latency.to_dict(),
+            "queued": self.queued.to_dict(),
+            "loop_lag": self.loop_lag.to_dict(),
+            "drift": self.drift.to_dict(),
+            "steps": {step_id: stats.histograms() for step_id, stats in self.steps.items()},
+        }
+
+    def snapshot(self, include_histograms: bool = False) -> Dict[str, Any]:
+        document = self._snapshot()
+        if include_histograms:
+            document["histograms"] = self.histograms()
+        return document
+
+    def _snapshot(self) -> Dict[str, Any]:
         return {
             "run_id": self.run_id,
             "slot": self.slot,

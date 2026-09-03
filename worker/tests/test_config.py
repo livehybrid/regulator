@@ -50,10 +50,11 @@ def test_bad_values_are_fatal_and_name_the_variable(env, overrides, expected_fra
     assert expected_fragment in str(excinfo.value)
 
 
-def test_managed_mode_variables_are_rejected_until_phase_one(env):
+def test_managed_variables_never_reach_the_standalone_parser(env):
+    """A fleet member's configuration comes from its claim, not from the environment."""
     with pytest.raises(ConfigError) as excinfo:
         load_config(env(REG_STANDALONE=None, REG_RUN_ID="42", REG_CONTROL_URL="http://cp"))
-    assert "Phase 1" in str(excinfo.value)
+    assert "claim" in str(excinfo.value)
 
 
 def test_username_and_password_are_an_acceptable_alternative_to_a_token(env):

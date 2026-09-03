@@ -253,6 +253,20 @@ class RunCreate(BaseModel):
     evict_cache: bool = False
     evict_cache_indexes: List[str] = Field(default_factory=list)
     evict_all_indexes: bool = False
+    # Where the load is generated: inprocess (this control plane), swarm or
+    # k8s (worker containers). Blank means the configured default.
+    fleet: Optional[str] = None
+    # An explicit worker count; blank means one per REG_VUS_PER_WORKER users.
+    workers: Optional[int] = Field(default=None, ge=1, le=500)
+
+    @field_validator("fleet")
+    @classmethod
+    def _known_fleet(cls, value: Optional[str]) -> Optional[str]:
+        if value is None or value == "":
+            return None
+        if value not in ("inprocess", "swarm", "k8s"):
+            raise ValueError("fleet must be inprocess, swarm or k8s")
+        return value
 
     @field_validator("scenario")
     @classmethod
@@ -302,6 +316,9 @@ class RunOut(BaseModel):
     duration_s: Optional[float]
     seed: Optional[int] = None
     scenario_digest: Optional[str] = None
+    fleet: str = "inprocess"
+    workers: int = 1
+    fleet_state: Optional[str] = None
     created_at: float
     started_at: Optional[float]
     ended_at: Optional[float]

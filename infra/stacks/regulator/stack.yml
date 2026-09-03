@@ -14,7 +14,11 @@ version: "3.8"
 services:
   regulator:
     image: ${REGULATOR_IMAGE:-ghcr.io/livehybrid/regulator:latest}
-    networks: [traefik_default, regulator_internal]
+    networks:
+      - traefik_default
+      # Named so the workers the control plane launches can be attached to
+      # it: the stack prefixes it as regulator_regulator_internal.
+      - regulator_internal
     ports:
       - "${REGULATOR_PORT:-8092}:8080"
     volumes:
@@ -46,6 +50,20 @@ services:
       - REG_SEED_TARGET_USERNAME=${REG_SEED_TARGET_USERNAME:-}
       - REG_SEED_TARGET_PASSWORD=${REG_SEED_TARGET_PASSWORD:-}
       - REG_SEED_TARGET_VERIFY_TLS=${REG_SEED_TARGET_VERIFY_TLS:-1}
+      # The swarm fleet. Workers are launched as services on the network
+      # below and reach this control plane by its service name, so no LAN
+      # address is needed. The constraint keeps them off the node that runs
+      # the Splunk under test.
+      - PORTAINER_HOST=${PORTAINER_HOST}
+      - PORTAINER_TOKEN=${PORTAINER_TOKEN}
+      - PORTAINER_ENDPOINT=${PORTAINER_ENDPOINT:-6}
+      - REG_DEFAULT_FLEET=${REG_DEFAULT_FLEET:-swarm}
+      - REG_SWARM_NETWORK=regulator_regulator_internal
+      - REG_SWARM_CONSTRAINTS=${REG_SWARM_CONSTRAINTS:-node.hostname != macdev}
+      - REG_WORKER_IMAGE=${REG_WORKER_IMAGE:-ghcr.io/livehybrid/regulator-worker:latest}
+      - REG_BROWSER_WORKER_IMAGE=${REG_BROWSER_WORKER_IMAGE:-ghcr.io/livehybrid/regulator-worker:browser}
+      - REG_VUS_PER_WORKER=${REG_VUS_PER_WORKER:-200}
+      - REG_PUBLIC_BASE_URL=${REG_PUBLIC_BASE_URL:-http://regulator:8080}
     # Long enough for an in-flight run to drain its searches rather than be
     # killed mid-measurement.
     stop_grace_period: 90s

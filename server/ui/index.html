@@ -319,8 +319,8 @@ function healthPill(t){
   return '<span class="pill ' + cls + '" title="' + esc(t.health_detail || "") + '">' + esc(h) + "</span>";
 }
 function statePill(s){
-  const cls = s === "completed" ? "ok" : s === "running" ? "info" : s === "pending" ? "idle"
-    : s === "stopped" ? "warn" : "bad";
+  const cls = (s === "completed" || s === "done" || s === "ready") ? "ok" : (s === "running" || s === "claimed") ? "info" : (s === "pending" || s === "free") ? "idle"
+    : (s === "stopped" || s === "lost") ? "warn" : "bad";
   const dot = s === "running" ? '<span class="dot run"></span>' : "";
   return '<span class="pill ' + cls + '">' + dot + esc(s || "unknown") + "</span>";
 }
@@ -768,6 +768,10 @@ async function openLaunch(scenarioName){
   if (!state.scenarios.length) { toast("This server has no scenarios registered, so there is nothing to run"); return; }
   const chosen = state.scenarios.find(x => x.name === scenarioName);
   if (chosen && chosen.runnable_here === false) { toast(chosen.not_runnable_reason); return; }
+  let fleets = [];
+  try { fleets = (await api("/fleets")) || []; } catch (e) { if (e.status !== 401) toast(e.message); }
+  const fOpts = fleets.map(f => '<option value="' + esc(f.kind) + '"' + (f.available ? "" : " disabled") + (f.default && f.available ? " selected" : "") + ">" +
+    esc(f.kind) + (f.available ? "" : " (unavailable)") + ": " + esc(f.detail) + "</option>").join("");
   const tOpts = state.targets.map(t => '<option value="' + esc(t.id) + '">' + esc(t.name) + " (" + esc(t.mgmt_url) + ")</option>").join("");
   const sOpts = state.scenarios.map(s => '<option value="' + esc(s.name) + '"' +
     (s.name === scenarioName ? " selected" : "") + (s.runnable_here === false ? " disabled" : "") + ">" + esc(s.name) +
@@ -784,6 +788,8 @@ async function openLaunch(scenarioName){
       '<label class="f"><span>Pacing in seconds per iteration</span><input type="number" id="lqPace" min="0" step="0.1"></label>' +
       '<label class="f"><span>Arrival rate per minute (open model)</span><input type="number" id="lqRate" min="0" step="1"></label>' +
       '<label class="f"><span>Seed (blank keeps the scenario\'s, so runs stay comparable)</span><input type="number" id="lqSeed" min="1"></label>' +
+      '<label class="f"><span>Fleet</span><select id="lqFleet">' + fOpts + "</select></label>" +
+      '<label class="f"><span>Workers (blank sizes the fleet from the users per worker)</span><input type="number" id="lqWorkers" min="1"></label>' +
       "</div>" +
       '<p class="note">Pacing decides what the latency numbers mean: with pacing, iterations are scheduled against the wall clock and the run reports coordinated-omission-corrected latency, without it each user waits for its own response so the figures are service times.</p>' +
       '<label class="chk"><input type="checkbox" id="lqEvict"> Evict the SmartStore cache first (measures the cold path)</label>' +
@@ -824,7 +830,8 @@ async function submitLaunch(btn){
     if (v !== "") body[key] = asFloat ? parseFloat(v) : parseInt(v, 10);
   };
   opt("lqVu", "virtual_users"); opt("lqDur", "duration_s", true);
-  opt("lqPace", "pacing_s", true); opt("lqRate", "arrival_rate_per_min", true); opt("lqSeed", "seed");
+  opt("lqPace", "pacing_s", true); opt("lqRate", "arrival_rate_per_min", true); opt("lqSeed", "seed"); opt("lqWorkers", "workers");
+  const fleetSel = $("#lqFleet"); if (fleetSel && fleetSel.value) body.fleet = fleetSel.value;
   const label = ($("#lqLabel").value || "").trim();
   if (label) body.label = label;
   if ($("#lqEvict").checked) {
@@ -999,6 +1006,7 @@ function drawRun(r){
       ". Virtual users are not concurrent searches: a user idles between iterations, so the in-flight figure is the one to compare against the ceiling.</div>") +
     '<div class="chart"><h3 style="margin-top:0">Latency over the run</h3>' + chartSvg(live) + "</div>" +
     (classRows ? '<div class="panel" style="padding:0"><table><thead><tr><th>Class</th><th class="num">Steps</th><th class="num">Execs</th><th class="num">Err %</th><th class="num">Worst p95</th></tr></thead><tbody>' + classRows + "</tbody></table></div>" : "") +
+    workersSection(r, st, sm) +
     '<div id="compareBox"></div>' +
     sutSection(sm.sut) +
     "<h3>Steps, worst p95 first</h3>" +
@@ -1088,6 +1096,31 @@ async function viewAudit(){
     "</td><td>" + (num(e.target_id) ? "" : "target " + esc(e.target_id)) + "</td><td class='small'>" + esc(e.detail || "") + "</td></tr>").join("");
   $("#auBody").innerHTML = rows ? '<div class="panel scroll" style="padding:0"><table><thead><tr><th>When</th><th>Action</th><th>Actor</th><th>From</th><th>Target</th><th>Detail</th></tr></thead><tbody>' + rows + "</tbody></table></div>"
     : '<div class="panel"><p class="muted">Nothing recorded yet.</p></div>';
+}
+// A fleet run's workers: who holds which slot, what it has done, when it last
+// spoke. A slot that went quiet is the first thing to look at when a fleet run
+// is marked invalid.
+function workersSection(r, st, sm){
+  if (!r.fleet || r.fleet === "inprocess") return "";
+  const live = st.workers || [];
+  const finalRows = (sm.workers || []);
+  const rows = (live.length ? live : finalRows).map(w =>
+    "<tr><td class='num'>" + esc(w.slot) + "</td><td class='mono'>" + esc(w.engine || "") + "</td><td>" + statePill(w.state || w.outcome || "") +
+    "</td><td class='mono'>" + esc(w.holder || "") + "</td><td class='num'>" + fmtInt(w.executions) + "</td><td class='num'>" + fmtInt(w.errors) +
+    "</td><td class='num'>" + fmtMs(w.p95_ms) + "</td><td>" + (w.last_heartbeat_at ? fmtWhen(w.last_heartbeat_at) : "") +
+    (w.restarts ? ' <span class="pill warn">' + esc(w.restarts) + " restart(s)</span>" : "") + "</td></tr>").join("");
+  const note = st.latency_note ? '<p class="muted small">' + esc(st.latency_note) + "</p>" : "";
+  return '<div class="panel"><h3 style="margin-top:0">Workers (' + esc(r.fleet) + (r.fleet_state ? ", " + esc(r.fleet_state) : "") + ")</h3>" + note +
+    (rows ? '<div class="scroll"><table><thead><tr><th class="num">Slot</th><th>Engine</th><th>State</th><th>Holder</th><th class="num">Execs</th><th class="num">Errors</th><th class="num">p95</th><th>Last heartbeat</th></tr></thead><tbody>' + rows + "</tbody></table></div>"
+      : '<p class="muted">No worker has claimed a slot yet.</p>') +
+    '<div class="btns" style="margin-top:8px"><button class="btn" data-act="fleet-logs" data-id="' + esc(r.id) + '">Worker logs</button></div></div>';
+}
+async function actFleetLogs(btn, id){
+  await busy(btn, async () => {
+    const r = await api("/runs/" + encodeURIComponent(id) + "/logs?tail=300");
+    const chunks = (r.chunks || []).map(c => "<h3>" + esc(c.group) + " (" + esc(c.kind) + " " + esc(c.id) + ")</h3><pre class='mono small' style='white-space:pre-wrap;max-height:320px;overflow:auto;background:var(--bg);padding:8px;border:1px solid var(--line);border-radius:4px'>" + esc(c.text || "(nothing)") + "</pre>").join("");
+    dialog({ title: "Worker logs for run " + id, wide: true, html: chunks || "<p class='muted'>No logs were available.</p>" });
+  });
 }
 // What the cluster itself said about the run. This is the half no client-side
 // timing can produce: whether the time went to the indexers, whether somebody
@@ -1252,6 +1285,7 @@ const actions = {
   "promote": (b, el) => actPromote(b, el.dataset.id),
   "compare": (b, el) => actCompare(b, el.dataset.id),
   "copy-summary": b => copyLastJson(b),
+  "fleet-logs": (b, el) => actFleetLogs(b, el.dataset.id),
   "delete-baseline": async (b, el) => {
     await busy(b, async () => { await api("/baselines/" + encodeURIComponent(el.dataset.label), { method: "DELETE" }); toast("Baseline deleted", "ok"); render(); });
   },

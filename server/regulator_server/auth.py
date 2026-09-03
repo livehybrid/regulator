@@ -31,6 +31,8 @@ EXEMPT_PREFIXES = (
     "/api/auth/login",
     "/api/auth/logout",
     "/api/auth/status",
+    # Workers authenticate with the per-run token, checked by the route.
+    "/api/agent",
     "/healthz",
 )
 

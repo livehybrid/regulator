@@ -28,7 +28,9 @@ from .config import get_settings
 from .crypto import encrypt
 from .db import init_engine, session_scope
 from .models import Target
+from .routes import agent as agent_routes
 from .routes import baselines as baselines_routes
+from .routes import fleets as fleets_routes
 from .routes import runs as runs_routes
 from .routes import scenarios as scenarios_routes
 from .routes import targets as targets_routes
@@ -68,6 +70,13 @@ def create_app() -> FastAPI:
     init_engine()
     auth.warn_if_open()
     manager.reconcile_at_boot()
+    if get_settings().fleet.swarm_available or get_settings().fleet.k8s_available:
+        from .fleet import reconcile_fleets_at_boot
+
+        try:
+            reconcile_fleets_at_boot()
+        except Exception:  # noqa: BLE001 - a backend hiccup must not stop the boot
+            log.warning("could not sweep stray worker groups", exc_info=True)
     _seed_target_from_env()
     user_scenarios_dir().mkdir(parents=True, exist_ok=True)
 
@@ -147,6 +156,8 @@ def create_app() -> FastAPI:
     app.include_router(runs_routes.router)
     app.include_router(baselines_routes.router)
     app.include_router(scenarios_routes.router)
+    app.include_router(fleets_routes.router)
+    app.include_router(agent_routes.router)
 
     # ------------------------------------------------------------------- ui
 

@@ -9,11 +9,12 @@ Stoker fills a Splunk cluster with realistic data. Regulator drives realistic
 demand against it. On a steam locomotive the stoker shovels coal into the
 firebox and the driver opens the regulator to demand work from the boiler.
 
-> **Phases 0 to 6.** The API engine, the scenario format, the standalone worker,
+> **Phases 0 to 7.** The API engine, the scenario format, the standalone worker,
 > the control plane, the web UI, the headless-browser engine, the CI regression
 > gate, server-side correlation, Splunk's own `savedsearches.conf` as a scenario
-> source, a scenario for every Stoker pack, and two adversarial review rounds
-> folded back in. The distributed worker fleet is the remaining piece.
+> source, a scenario for every Stoker pack, two adversarial review rounds
+> folded back in, and a worker fleet on Docker Swarm and Kubernetes that lifts
+> the in-process ceiling and lets one run mix API and browser cohorts.
 
 ---
 
@@ -256,12 +257,67 @@ where **queueing** was observed (amber, and worded as the finding it is rather
 than an error), and the **cache provenance** when part of what was measured was
 object storage rather than the search tier.
 
-The control plane runs scenarios **in its own process**. That is the same idea
-as Stoker's in-process driver: the tool works with no container orchestration at
-all, and it is honest about the limit, because past a few hundred virtual users
-the server becomes the constraint. There is a configurable ceiling that refuses
-the run and explains why, and the generator-drift guard catches anything that
-slips past it.
+The control plane can run a scenario **in its own process**, which works with
+no container orchestration at all and is honest about its limit: past a few
+hundred virtual users the server becomes the constraint, a configurable ceiling
+refuses the run and explains why, and the generator-drift guard catches anything
+that slips past it. Past that, a **fleet** generates the load.
+
+## The worker fleet
+
+A fleet run launches worker containers, on Docker Swarm through Portainer or on
+Kubernetes as an Indexed Job, and this control plane owns their identity. The
+protocol is Stoker's, where it has been through real multi-node runs:
+
+1. **Claim.** Each worker presents the run's own bearer token and takes the
+   lowest free slot (or the one Kubernetes hinted through its completion
+   index). The claim response carries everything a standalone worker would
+   have read from its environment: the target and its credential, the
+   scenario's files, this slot's share of the load, where telemetry goes.
+   Nothing sensitive is projected into a container's environment.
+2. **Ready.** The worker starts its engine, validates the scenario against the
+   target and resolves parameters. When every slot is ready the control plane
+   sets **one shared T0**, so the fleet starts together despite unsynchronised
+   container starts. A straggler past the provisioning timeout is declared
+   lost and the run proceeds without it, marked as not the configured load.
+3. **Heartbeat.** Every couple of seconds, carrying the live aggregate for the
+   run page. The response is the command channel: `release` with T0, `stop`,
+   or `superseded` when the lease has been reissued to a replacement. An
+   acknowledged heartbeat is the lease renewal; a lease that stops being
+   renewed is lost and its share is not waited for.
+4. **Final.** The run summary with the **raw histograms**. The control plane
+   merges buckets and computes the fleet's percentiles once, over the whole,
+   because averaging p95 across workers is meaningless. Cache provenance and
+   the cluster's own account of the run are then taken by the control plane,
+   which holds the target credential, exactly as for an in-process run.
+
+Shares are dealt out by the load model: virtual users as evenly as the worker
+count allows (with each worker's ramp scaled to its share), an arrival rate
+divided, and the schedule model's cron steps dealt round the workers by slot
+so each fires exactly once. A mixed scenario becomes two groups on two images,
+the API cohort and the browser cohort, with the users split by persona weight.
+Slot-disjoint virtual-user ids keep every record attributable.
+
+Workers reach the control plane by **service name**: on Swarm they join the
+stack's own overlay network, on Kubernetes they use the Service. No LAN address
+is needed on either side; `REG_PUBLIC_BASE_URL` overrides it when workers live
+elsewhere. The Swarm driver pins the worker image to its registry digest before
+launching, because swarm does not re-pull a floating tag a node already holds.
+
+| Variable | Default | Notes |
+|---|---|---|
+| `REG_DEFAULT_FLEET` | `inprocess` | `swarm` or `k8s`. The launch dialog offers whichever fleets are configured |
+| `REG_VUS_PER_WORKER` / `REG_BROWSER_CONTEXTS_PER_WORKER` | `200` / `10` | Fleet sizing; an explicit worker count on the run overrides it |
+| `REG_WORKER_IMAGE` / `REG_BROWSER_WORKER_IMAGE` | the ghcr images | |
+| `REG_PUBLIC_BASE_URL` | the service name | Where workers reach this control plane |
+| `PORTAINER_HOST` / `PORTAINER_TOKEN` / `PORTAINER_ENDPOINT` | | The Swarm fleet. The same key the stack is deployed with |
+| `REG_SWARM_NETWORK` / `REG_SWARM_CONSTRAINTS` | the stack's network / none | Keep workers off the node that runs the Splunk under test: `node.hostname != macdev` |
+| `REG_K8S_NAMESPACE` / `REG_K8S_NODE_SELECTOR` / `REG_K8S_IN_CLUSTER` / `REG_KUBECONFIG` | `regulator` / none / auto / auto | The Kubernetes fleet. In-cluster uses the pod's service account and the Role in `infra/k8s/regulator.yaml` |
+| `REG_HEARTBEAT_S` / `REG_LEASE_S` / `REG_PROVISION_TIMEOUT_S` | `2` / `20` / `180` | The protocol's clocks |
+
+A fleet member is the same image as a standalone worker. Given `REG_RUN_ID`,
+`REG_CONTROL_URL` and `REG_RUN_JWT` it claims instead of reading its target from
+the environment; everything downstream of the claim is the standalone code.
 
 | Variable | Default | Notes |
 |---|---|---|
@@ -808,6 +864,8 @@ engine with no Splunk anywhere.
 | `results.py` | The step record, emitters, the live aggregate |
 | `hec.py` | Best-effort batched telemetry that can never take down the run |
 | `savedsearches.py` | Splunk's conf grammar, relative time modifiers, cron, side-effect detection and a conservative class guess |
+| `managed.py` | A fleet member: claim, ready, heartbeat, final |
+| `server/…/fleet.py`, `drivers/` | Planning shares, the lease protocol, merging, and the Swarm, Kubernetes and fake drivers |
 | `smartstore.py` | Cache state and eviction per indexer, discovered from the search peers, with evictions confirmed rather than assumed |
 | `sut.py` | The seven correlation probes against the cluster's own indexes |
 | `compare.py` | Baselines, per-step deltas and the gate language |
@@ -861,7 +919,7 @@ request rather than the merge.
 | **4** | **Server-side correlation and Kubernetes** (done): every run pulls back the cluster's own account of it from `_audit`, `_introspection`, the scheduler and the cache manager, and manifests deploy it onto a dedicated node group so the generator never shares a node with the system under test |
 | **5** | **Adversarial review, twice** (done): measurement defects that let a failing target look good (empty histograms reading as zero, leaked jobs under saturation, dropped tails, unit-ambiguous gates, per-run scan totals), control-plane defects (unbounded durations, the open model bypassing the ceiling, zombie runs, unattributable evictions) and Splunk-facing defects (cache state read from a search head, doubled audit counts, dashboards ignoring the pinned range) fixed with regression tests |
 | **6** | **Splunk's own search format** (done): `savedsearches.conf` as a scenario source, import and export from a target, dispatch by name, the schedule load model, and a scenario for every Stoker pack |
-| 7 | Distributed worker fleet: Indexed Jobs and Swarm services driven by a claim protocol, which lifts the in-process virtual-user ceiling and lets one run mix the API and browser engines |
+| **7** | **The worker fleet** (done): Swarm services through Portainer and Kubernetes Indexed Jobs driven by Stoker's claim protocol (fenced leases, a shared T0, heartbeats as the command channel, finals merged from raw histograms), proven with real worker processes over a real socket in the test suite |
 
 ---
 

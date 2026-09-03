@@ -39,7 +39,7 @@ from pathlib import Path
 from typing import Any, List, Optional
 
 from .compare import GateError, compare_runs
-from .config import Config, ConfigError, load_config
+from .config import Config, ConfigError, load_config, load_managed_boot
 from .engines import BrowserUnavailable, get_engine
 from .hec import HecEmitter
 from .params import ParameterResolver
@@ -723,6 +723,27 @@ def main(argv: Optional[List[str]] = None) -> int:
         return _do_compare(args)
 
     env = dict(os.environ)
+
+    # A fleet member: the control plane tells it everything else.
+    try:
+        boot = load_managed_boot(env)
+    except ConfigError as exc:
+        _setup_logging("INFO")
+        log.error("configuration: %s", exc)
+        return EXIT_FAILED
+    if boot is not None:
+        _setup_logging((env.get("REG_LOG_LEVEL") or "INFO").upper())
+        from .managed import run_managed
+
+        started = time.time()
+        try:
+            code = asyncio.run(run_managed(boot))
+        except KeyboardInterrupt:
+            log.warning("interrupted")
+            return EXIT_GUARD_RAIL
+        log.info("finished in %.1fs with exit code %d", time.time() - started, code)
+        return code
+
     if (args.target_report or args.probe_only or args.evict_cache) and not env.get(
         "REG_SCENARIO"
     ):

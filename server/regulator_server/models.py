@@ -13,7 +13,7 @@ processes need to agree about the same run.
 from __future__ import annotations
 
 import time
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 from sqlalchemy import JSON, Boolean, Float, ForeignKey, Integer, String, Text
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
@@ -107,6 +107,66 @@ class Run(Base):
     # proven to have been the same test.
     seed: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
     scenario_digest: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
+
+    # Where the load is generated. ``inprocess`` runs in this process; the
+    # other fleets launch worker containers that claim slots and report back.
+    fleet: Mapped[str] = mapped_column(String(16), default="inprocess")
+    # The worker count. Unset means "size the fleet from the users per
+    # worker"; the planner writes the total back once it has decided.
+    workers: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    # The driver's handle(s) on what it created, so a stray fleet can be found
+    # and destroyed after a restart. A list: a mixed scenario is two groups.
+    driver_refs_json: Mapped[Optional[List[Dict[str, Any]]]] = mapped_column(JSON, nullable=True)
+    # The shared start instant, set when every worker is ready.
+    t0: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    # provisioning -> releasing -> running -> draining, for a fleet run.
+    fleet_state: Mapped[Optional[str]] = mapped_column(String(16), nullable=True)
+    leases: Mapped[list["WorkerLease"]] = relationship(
+        back_populates="run", cascade="all, delete-orphan", passive_deletes=True
+    )
+
+
+class WorkerLease(Base):
+    """One slot of a fleet run, and who holds it.
+
+    Identity is the lease id, not the container: a worker that restarts claims
+    a fresh lease and the old one is fenced, so a stale process that comes
+    back from the dead cannot fold its numbers into a slot somebody else now
+    holds. Adapted from Stoker, where this was learned in production.
+    """
+
+    __tablename__ = "worker_leases"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    run_id: Mapped[int] = mapped_column(ForeignKey("runs.id", ondelete="CASCADE"))
+    slot: Mapped[int] = mapped_column(Integer)
+    # Which engine this slot runs, and which worker group (image) it belongs to.
+    engine: Mapped[str] = mapped_column(String(16), default="api")
+    lease_id: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
+    holder: Mapped[Optional[str]] = mapped_column(String(128), nullable=True)
+    # free, claimed, ready, running, done, lost
+    state: Mapped[str] = mapped_column(String(16), default="free")
+    # This slot's share of the load: virtual users, arrival rate, and the
+    # scenario it runs (a mixed scenario is split by engine).
+    share_json: Mapped[Optional[Dict[str, Any]]] = mapped_column(JSON, nullable=True)
+    last_heartbeat_at: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    claimed_at: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    restarts: Mapped[int] = mapped_column(Integer, default=0)
+    # The latest live aggregate the worker reported, and its final summary.
+    stats_json: Mapped[Optional[Dict[str, Any]]] = mapped_column(JSON, nullable=True)
+    summary_json: Mapped[Optional[Dict[str, Any]]] = mapped_column(JSON, nullable=True)
+    log_tail_json: Mapped[Optional[List[str]]] = mapped_column(JSON, nullable=True)
+
+    run: Mapped[Run] = relationship(back_populates="leases")
+
+
+LEASE_FREE = "free"
+LEASE_CLAIMED = "claimed"
+LEASE_READY = "ready"
+LEASE_RUNNING = "running"
+LEASE_DONE = "done"
+LEASE_LOST = "lost"
+LIVE_LEASE_STATES = (LEASE_CLAIMED, LEASE_READY, LEASE_RUNNING)
 
 
 class AuditEvent(Base):

@@ -242,6 +242,10 @@ class Scheduler:
                     self._crons[step.id] = parse_cron(step.cron)
         self._arrivals_shed = 0
         self._arrivals_skipped = 0
+        # A fleet member ships its raw histograms in the summary so the
+        # control plane can merge them; a standalone run has no one to merge
+        # with and keeps the summary small.
+        self.wire_histograms = bool(config.total_workers > 1)
 
         self._stop = asyncio.Event()
         self._fatal: Optional[BaseException] = None
@@ -351,7 +355,19 @@ class Scheduler:
     # The run
     # ------------------------------------------------------------------
 
-    async def run(self) -> RunSummary:
+    async def run(self, start_at: Optional[float] = None) -> RunSummary:
+        """Run the scenario. ``start_at`` is a wall-clock instant to begin at.
+
+        A fleet's workers are released with one shared T0 so they start
+        together despite unsynchronised container start times; a worker that
+        started generating when it happened to boot would measure a ramp
+        nobody asked for. A T0 already in the past starts immediately.
+        """
+        if start_at is not None:
+            delay = start_at - time.time()
+            if delay > 0:
+                log.info("waiting %.1fs for the fleet's shared start", delay)
+                await self._sleep_or_stop(delay)
         self._t0_monotonic = time.perf_counter()
         self._t0_wall = time.time()
         self.stats.started_at = self._t0_wall
@@ -551,6 +567,11 @@ class Scheduler:
         virtual_minute = virtual_origin + _dt.timedelta(minutes=1)
         due = self._t0_monotonic + first_minute_in
         steps = [step for persona in self.scenario.personas for step in persona.steps if step.cron]
+        # In a fleet each cron fires exactly once across the workers: the
+        # scheduled steps are dealt out by slot.
+        total = max(1, int(self.config.total_workers))
+        if total > 1:
+            steps = [step for index, step in enumerate(steps) if index % total == self.config.slot % total]
         persona_of = {
             step.id: persona for persona in self.scenario.personas for step in persona.steps
         }
@@ -896,7 +917,7 @@ class Scheduler:
         else:
             outcome = OUTCOME_COMPLETED
 
-        snapshot = self.stats.snapshot()
+        snapshot = self.stats.snapshot(include_histograms=self.wire_histograms)
         snapshot["arrivals_missed"] = self._arrivals_shed + self._arrivals_skipped
         snapshot["arrivals_shed"] = self._arrivals_shed
         snapshot["arrivals_skipped"] = self._arrivals_skipped
@@ -915,6 +936,8 @@ class Scheduler:
             configured["schedule_start"] = self.load.schedule_start
         configured["ramp_stages"] = len(self.load.ramp)
         configured["duration_s"] = self.duration_s
+        configured["slot"] = self.config.slot
+        configured["total_workers"] = self.config.total_workers
 
         return RunSummary(
             run_id=self.config.run_id,

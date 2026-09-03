@@ -18,7 +18,7 @@ import os
 import secrets
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Mapping, Optional
+from typing import Dict, Mapping, Optional
 
 from cryptography.fernet import Fernet
 
@@ -99,6 +99,55 @@ class SeedTarget:
 
 
 @dataclass(frozen=True)
+class FleetSettings:
+    """How worker containers are launched and reached.
+
+    A fleet is available when its backend is configured: Swarm needs Portainer,
+    Kubernetes needs a kubeconfig or an in-cluster service account. In-process
+    is always there. Workers reach the control plane at ``public_base_url``,
+    which defaults to the service name on the fleet's own network, so no LAN
+    address has to be known in advance.
+    """
+
+    default_fleet: str = "inprocess"
+    worker_image: str = "ghcr.io/livehybrid/regulator-worker:latest"
+    browser_worker_image: str = "ghcr.io/livehybrid/regulator-worker:browser"
+    public_base_url: Optional[str] = None
+    vus_per_worker: int = 200
+    browser_contexts_per_worker: int = 10
+    heartbeat_s: float = 2.0
+    lease_s: float = 20.0
+    provision_timeout_s: float = 180.0
+    # Portainer, for Docker Swarm.
+    portainer_host: Optional[str] = None
+    portainer_token: Optional[str] = field(default=None, repr=False)
+    portainer_endpoint: int = 6
+    portainer_verify_tls: bool = False
+    swarm_network: str = "regulator_regulator_internal"
+    swarm_constraints: tuple[str, ...] = ()
+    # Kubernetes.
+    k8s_namespace: str = "regulator"
+    k8s_node_selector: Dict[str, str] = field(default_factory=dict)
+    k8s_in_cluster: Optional[bool] = None
+    kubeconfig: Optional[str] = None
+    kube_context: Optional[str] = None
+
+    @property
+    def swarm_available(self) -> bool:
+        return bool(self.portainer_host and self.portainer_token)
+
+    @property
+    def k8s_available(self) -> bool:
+        if self.k8s_in_cluster:
+            return True
+        if self.kubeconfig:
+            return Path(self.kubeconfig).is_file()
+        return Path.home().joinpath(".kube", "config").is_file() or Path(
+            "/var/run/secrets/kubernetes.io/serviceaccount/token"
+        ).is_file()
+
+
+@dataclass(frozen=True)
 class ServerConfig:
     database_url: str
     master_key: str = field(repr=False)
@@ -128,6 +177,7 @@ class ServerConfig:
     allow_unauthenticated: bool = False
     hec: Optional[HecSettings] = None
     seed_target: Optional[SeedTarget] = None
+    fleet: FleetSettings = field(default_factory=FleetSettings)
 
     @property
     def auth_enabled(self) -> bool:
@@ -230,6 +280,40 @@ def load_server_config(env: Optional[Mapping[str, str]] = None) -> ServerConfig:
         else:
             default_user_dir = "./data/scenarios"
 
+    default_fleet = (_get(env, "REG_DEFAULT_FLEET", "inprocess") or "inprocess").lower()
+    if default_fleet not in ("inprocess", "swarm", "k8s"):
+        raise ServerConfigError(f"REG_DEFAULT_FLEET must be inprocess, swarm or k8s, got {default_fleet!r}")
+    selector: Dict[str, str] = {}
+    for part in (_get(env, "REG_K8S_NODE_SELECTOR", "") or "").split(","):
+        if "=" in part:
+            key, value = part.split("=", 1)
+            selector[key.strip()] = value.strip()
+    in_cluster_raw = _get(env, "REG_K8S_IN_CLUSTER")
+    fleet = FleetSettings(
+        default_fleet=default_fleet,
+        worker_image=_get(env, "REG_WORKER_IMAGE", "ghcr.io/livehybrid/regulator-worker:latest") or "ghcr.io/livehybrid/regulator-worker:latest",
+        browser_worker_image=_get(env, "REG_BROWSER_WORKER_IMAGE", "ghcr.io/livehybrid/regulator-worker:browser") or "ghcr.io/livehybrid/regulator-worker:browser",
+        public_base_url=(_get(env, "REG_PUBLIC_BASE_URL") or None),
+        vus_per_worker=_integer(env, "REG_VUS_PER_WORKER", 200, minimum=1),
+        browser_contexts_per_worker=_integer(env, "REG_BROWSER_CONTEXTS_PER_WORKER", 10, minimum=1),
+        heartbeat_s=float(_integer(env, "REG_HEARTBEAT_S", 2, minimum=1)),
+        lease_s=float(_integer(env, "REG_LEASE_S", 20, minimum=5)),
+        provision_timeout_s=float(_integer(env, "REG_PROVISION_TIMEOUT_S", 180, minimum=10)),
+        portainer_host=_get(env, "PORTAINER_HOST"),
+        portainer_token=_get(env, "PORTAINER_TOKEN"),
+        portainer_endpoint=_integer(env, "PORTAINER_ENDPOINT", 6, minimum=1),
+        portainer_verify_tls=_boolean(env, "PORTAINER_VERIFY_TLS", False),
+        swarm_network=_get(env, "REG_SWARM_NETWORK", "regulator_regulator_internal") or "regulator_regulator_internal",
+        swarm_constraints=tuple(
+            part.strip() for part in (_get(env, "REG_SWARM_CONSTRAINTS", "") or "").split(",") if part.strip()
+        ),
+        k8s_namespace=_get(env, "REG_K8S_NAMESPACE", "regulator") or "regulator",
+        k8s_node_selector=selector,
+        k8s_in_cluster=(_boolean(env, "REG_K8S_IN_CLUSTER", False) if in_cluster_raw is not None else None),
+        kubeconfig=(_get(env, "REG_KUBECONFIG") or _get(env, "KUBECONFIG") or None),
+        kube_context=(_get(env, "REG_KUBE_CONTEXT") or None),
+    )
+
     return ServerConfig(
         database_url=database_url,
         master_key=master_key,
@@ -245,6 +329,7 @@ def load_server_config(env: Optional[Mapping[str, str]] = None) -> ServerConfig:
         allow_unauthenticated=_boolean(env, "REG_ALLOW_UNAUTHENTICATED", False),
         hec=hec,
         seed_target=seed,
+        fleet=fleet,
     )
 
 

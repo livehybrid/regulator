@@ -73,26 +73,50 @@ class RunManager:
 
     def __init__(self) -> None:
         self._active: Dict[int, ActiveRun] = {}
+        self._fleets: Dict[int, Any] = {}
         self._lock = threading.Lock()
 
     # ------------------------------------------------------------------
 
     def active_count(self) -> int:
         with self._lock:
-            return len(self._active)
+            return len(self._active) + len(self._fleets)
 
     def is_active(self, run_id: int) -> bool:
         with self._lock:
-            return run_id in self._active
+            return run_id in self._active or run_id in self._fleets
+
+    def fleet_run(self, run_id: int) -> Optional[Any]:
+        with self._lock:
+            return self._fleets.get(run_id)
+
+    def forget(self, run_id: int) -> None:
+        with self._lock:
+            self._fleets.pop(run_id, None)
 
     def live_stats(self, run_id: int) -> Optional[Dict[str, Any]]:
         with self._lock:
             entry = self._active.get(run_id)
-            return entry.snapshot if entry else None
+            if entry is not None:
+                return entry.snapshot
+            supervised = run_id in self._fleets
+        if supervised:
+            from . import fleet as fleet_module
+
+            with session_scope() as session:
+                run = session.get(Run, run_id)
+                if run is None:
+                    return None
+                return fleet_module.live_snapshot(run, fleet_module._leases(session, run))
+        return None
 
     def request_stop(self, run_id: int) -> bool:
         with self._lock:
             entry = self._active.get(run_id)
+            supervisor = self._fleets.get(run_id)
+        if supervisor is not None:
+            supervisor.request_stop()
+            return True
         if entry is None:
             return False
         entry.stop_requested = True
@@ -180,6 +204,13 @@ class RunManager:
                 marker_run_id += "-" + sanitise_marker_part(run.label)[:40]
 
             digest = scenario_digest(scenario)
+            fleet_kind = run.fleet or "inprocess"
+            if fleet_kind != "inprocess":
+                run.scenario_digest = digest
+                session.add(run)
+                session.commit()
+                self._start_fleet(run.id, fleet_kind, settings)
+                return
             config = worker_config(
                 target,
                 scenario_path=run.scenario,
@@ -219,6 +250,22 @@ class RunManager:
                 )
             self._active[run_id] = entry
         thread.start()
+
+    def _start_fleet(self, run_id: int, fleet_kind: str, settings) -> None:
+        from . import fleet as fleet_module
+        from .drivers import DriverError
+
+        with self._lock:
+            if len(self._active) + len(self._fleets) >= settings.max_concurrent_runs:
+                raise RunRejected(
+                    f"{settings.max_concurrent_runs} run(s) already in flight"
+                )
+        try:
+            supervisor = fleet_module.launch(run_id)
+        except (fleet_module.FleetError, DriverError, FileNotFoundError) as exc:
+            raise RunRejected(str(exc)) from exc
+        with self._lock:
+            self._fleets[run_id] = supervisor
 
     def reconcile_at_boot(self) -> int:
         """Mark runs that were in flight when the previous process died.

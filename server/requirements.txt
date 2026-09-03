@@ -12,3 +12,7 @@ pydantic>=2.7,<3
 # Credentials at rest (Fernet) and the signed session cookie.
 cryptography>=42,<47
 itsdangerous>=2.1,<3
+
+# The Kubernetes fleet driver. Imported lazily, so a control plane that never
+# launches a Kubernetes fleet never loads it; in the image so EKS works.
+kubernetes>=29,<32

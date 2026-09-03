@@ -53,6 +53,36 @@ def decrypt(value: Optional[str]) -> Optional[str]:
         ) from exc
 
 
+RUN_TOKEN_DOMAIN = "regulator-run-token-v1"
+
+
+def _run_token_serializer() -> URLSafeTimedSerializer:
+    # Its own domain: a run token must never verify as a session and a session
+    # cookie must never authorise a worker.
+    secret = hashlib.blake2b(
+        (RUN_TOKEN_DOMAIN + get_settings().master_key).encode(), digest_size=32
+    ).hexdigest()
+    return URLSafeTimedSerializer(secret, salt=RUN_TOKEN_DOMAIN)
+
+
+def mint_run_token(run_id: int) -> str:
+    """A bearer that authorises exactly one run's workers.
+
+    Minted per run and projected into the worker containers. It carries the
+    run id and nothing else; the claim response carries the rest, so the
+    token leaks nothing about the target if a container's environment does.
+    """
+    return _run_token_serializer().dumps({"run_id": int(run_id)})
+
+
+def verify_run_token(token: str, run_id: int, max_age_s: int) -> bool:
+    try:
+        claims = _run_token_serializer().loads(token, max_age=max_age_s)
+    except (BadSignature, Exception):  # noqa: BLE001 - any failure is "not this run"
+        return False
+    return isinstance(claims, dict) and claims.get("run_id") == int(run_id)
+
+
 def _session_serializer() -> URLSafeTimedSerializer:
     # Domain-separated from the Fernet key so a session cookie signature and a
     # credential ciphertext never share key material.

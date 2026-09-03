@@ -35,6 +35,44 @@ metadata:
 # Applying this manifest with a placeholder key does not degrade gracefully:
 # the server treats a malformed master key as fatal, so the pod crash-loops.
 ---
+# The control plane creates and removes worker Jobs, their token Secrets and
+# reads their pods' logs. Nothing outside its own namespace.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: regulator
+  namespace: regulator
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: regulator-fleet
+  namespace: regulator
+rules:
+  - apiGroups: ["batch"]
+    resources: ["jobs"]
+    verbs: ["create", "get", "list", "watch", "delete", "patch"]
+  - apiGroups: [""]
+    resources: ["secrets"]
+    verbs: ["create", "get", "delete", "patch"]
+  - apiGroups: [""]
+    resources: ["pods", "pods/log"]
+    verbs: ["get", "list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: regulator-fleet
+  namespace: regulator
+subjects:
+  - kind: ServiceAccount
+    name: regulator
+    namespace: regulator
+roleRef:
+  kind: Role
+  name: regulator-fleet
+  apiGroup: rbac.authorization.k8s.io
+---
 apiVersion: v1
 kind: PersistentVolumeClaim
 metadata:
@@ -87,9 +125,10 @@ spec:
         fsGroupChangePolicy: OnRootMismatch
         seccompProfile:
           type: RuntimeDefault
-      # Nothing here talks to the Kubernetes API, and a pod that can evict a
-      # production cache should not carry a token it never uses.
-      automountServiceAccountToken: false
+      # The control plane launches worker Jobs in its own namespace through
+      # the service account below, and nothing wider.
+      serviceAccountName: regulator
+      automountServiceAccountToken: true
       # The control plane drains in-flight runs on SIGTERM rather than
       # abandoning them mid-measurement.
       terminationGracePeriodSeconds: 120
@@ -122,6 +161,18 @@ spec:
             # Imported scenarios live on the same volume as the database.
             - name: REG_USER_SCENARIOS_DIR
               value: /data/scenarios
+            # The Kubernetes fleet: worker Jobs in this namespace, on the
+            # regulator node group, reaching this Service by name.
+            - name: REG_DEFAULT_FLEET
+              value: k8s
+            - name: REG_K8S_IN_CLUSTER
+              value: "1"
+            - name: REG_K8S_NAMESPACE
+              value: regulator
+            - name: REG_K8S_NODE_SELECTOR
+              value: workload=regulator
+            - name: REG_PUBLIC_BASE_URL
+              value: http://regulator.regulator.svc:8080
             # Telemetry for every run launched here. Fill in, or leave unset.
             # - name: REG_HEC_URL
             #   value: https://hec.splunk.svc:8088

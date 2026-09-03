@@ -31,6 +31,55 @@ from typing import Mapping, Optional
 MANAGED_ENV_KEYS = ("REG_RUN_ID", "REG_CONTROL_URL", "REG_RUN_JWT")
 
 
+@dataclass(frozen=True)
+class ManagedBoot:
+    """What a fleet member knows before it has claimed a slot.
+
+    Only enough to reach the control plane and prove which run it belongs to.
+    Everything else (the target, the scenario, its share of the load) arrives
+    in the claim response, so the launcher never has to project a credential
+    into a container's environment.
+    """
+
+    run_id: str
+    control_url: str
+    jwt: str = field(repr=False)
+    hint_slot: Optional[int] = None
+    holder: str = ""
+    deadman_s: float = 300.0
+
+
+def load_managed_boot(env: Optional[Mapping[str, str]] = None) -> Optional[ManagedBoot]:
+    """The managed-mode bootstrap, or None when this is a standalone worker."""
+    env = os.environ if env is None else env
+    present = [key for key in MANAGED_ENV_KEYS if _get(env, key)]
+    if not present:
+        return None
+    if len(present) != len(MANAGED_ENV_KEYS):
+        missing = [key for key in MANAGED_ENV_KEYS if key not in present]
+        raise ConfigError(
+            f"managed mode needs all of {', '.join(MANAGED_ENV_KEYS)}; missing "
+            f"{', '.join(missing)}"
+        )
+    hint_raw = _get(env, "REG_HINT_SLOT") or _get(env, "JOB_COMPLETION_INDEX")
+    hint: Optional[int] = None
+    if hint_raw is not None:
+        try:
+            hint = int(hint_raw)
+        except ValueError as exc:
+            raise ConfigError(f"REG_HINT_SLOT must be an integer, got {hint_raw!r}") from exc
+    import socket
+
+    return ManagedBoot(
+        run_id=_require(env, "REG_RUN_ID", "the run this worker belongs to"),
+        control_url=_url(env, "REG_CONTROL_URL", _require(env, "REG_CONTROL_URL", "the control plane")) or "",
+        jwt=_require(env, "REG_RUN_JWT", "the per-run token the control plane minted"),
+        hint_slot=hint,
+        holder=_get(env, "REG_HOLDER") or socket.gethostname(),
+        deadman_s=_number(env, "REG_DEADMAN_S", 300.0, minimum=10.0),
+    )
+
+
 class ConfigError(ValueError):
     """Raised for a malformed or missing environment value.
 
@@ -268,15 +317,17 @@ def load_config(env: Optional[Mapping[str, str]] = None) -> Config:
     standalone = _boolean(env, "REG_STANDALONE", False)
     managed_present = [key for key in MANAGED_ENV_KEYS if _get(env, key)]
     if not standalone and managed_present:
+        # A managed worker never reaches here: the entrypoint claims its slot
+        # from the control plane first and builds this Config from the claim.
         raise ConfigError(
-            "managed mode (a control plane driving this worker) arrives in Phase 1. "
-            f"Found {', '.join(managed_present)}. Set REG_STANDALONE=1 to run without "
-            "a control plane."
+            f"{', '.join(managed_present)} is set: this worker is managed, so its "
+            "configuration comes from the control plane's claim response, not from "
+            "the environment. Run it through the entrypoint"
         )
     if not standalone:
         raise ConfigError(
-            "REG_STANDALONE=1 is required in this build: the control plane lands in "
-            "Phase 1 and managed mode is not implemented yet"
+            "set REG_STANDALONE=1 to run against the environment, or REG_RUN_ID, "
+            "REG_CONTROL_URL and REG_RUN_JWT to run as a fleet member"
         )
 
     scenario_path = _require(

@@ -14,6 +14,7 @@ from fastapi import Request
 
 from ..adapters import load_named_scenario
 from ..audit import record as audit_record
+from ..config import get_settings
 from ..db import get_session
 from ..models import Run, Target, is_terminal
 from ..runner import RunRejected, manager
@@ -62,6 +63,9 @@ def _serialise(run: Run, target_name: Optional[str] = None, full: bool = True) -
         "duration_s": run.duration_s,
         "seed": run.seed,
         "scenario_digest": run.scenario_digest,
+        "fleet": run.fleet or "inprocess",
+        "workers": run.workers or 1,
+        "fleet_state": run.fleet_state,
         "created_at": run.created_at,
         "started_at": run.started_at,
         "ended_at": run.ended_at,
@@ -141,6 +145,8 @@ def create_run(
         arrival_rate_per_min=body.arrival_rate_per_min,
         pacing_s=body.pacing_s,
         seed=body.seed,
+        fleet=body.fleet or get_settings().fleet.default_fleet,
+        workers=body.workers,
         evict_cache=body.evict_cache,
         evict_cache_indexes=(
             ",".join(body.evict_cache_indexes)
