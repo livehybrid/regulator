@@ -2,8 +2,10 @@
 #
 # One service. The control plane keeps its SQLite database, its imported
 # scenarios and the run history on one named volume, so it is pinned to a node
-# and the volume stays with it. Postgres arrives with the worker fleet; a
-# single-operator control plane running scenarios in-process does not need it.
+# and the volume stays with it. SQLite is deliberate: one process owns the
+# database, and fleet workers only ever talk HTTP to it, so Postgres would buy
+# nothing here. Worker services for fleet runs are created by the control
+# plane itself through the Portainer API and removed when the run ends.
 #
 # The master key is a swarm secret (file mount, never env). The admin password,
 # API tokens and telemetry HEC token are injected as env by deploy.py from this

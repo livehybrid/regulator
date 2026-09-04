@@ -385,8 +385,9 @@ class RunManager:
             # rather than dispatching dashboard names as searches, which is
             # what happened when every run went through the API engine.
             raise RunRejected(
-                f"{exc}. Browser scenarios run from the browser worker image "
-                "(ghcr.io/livehybrid/regulator-worker:browser) until the fleet lands"
+                f"{exc}. Browser scenarios run on a fleet (swarm or k8s), which starts "
+                "the browser worker image (ghcr.io/livehybrid/regulator-worker:browser) "
+                "for them: launch this run on a fleet rather than in-process"
             )
         try:
             self._set_state(run_id, "running", started=True)

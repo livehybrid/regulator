@@ -8,10 +8,13 @@ of the control plane follow Stoker's design closely enough to say so:
 | `server/regulator_server/crypto.py` | `server/crypto.py` | Fernet at rest with a domain-separated session signer derived from the same master key |
 | `server/regulator_server/app.py` (auth middleware, exempt paths, the open-deployment warning) | `server/app.py` | the shape; the single-password model is Regulator's own |
 | `infra/stacks/regulator/deploy.py` | `infra/stacks/stoker/deploy.py` | the Portainer stack create-or-update flow and the master-key swarm secret |
+| `server/regulator_server/fleet.py` | `server/fleet.py` and the lease model | the claim protocol: leases fenced by a fresh id on every hand-over, one shared T0, heartbeats as the command channel, finals merged from raw histograms, lost leases on a lapsed heartbeat, a partial release at the provisioning timeout |
+| `server/regulator_server/drivers/{base,swarm,k8s,fake}.py` | `server/drivers/*` | the driver contract; the Swarm driver's digest pinning and scale-to-zero stop; the Kubernetes Indexed Job with the token in an adopted Secret. Regulator adds the run token as a swarm secret, engine-aware claims and per-group slot bases |
+| `worker/regulator_agent/managed.py` | the agent's managed mode | claim, ready, heartbeat, final, with the dead-man and the superseded exit; Regulator's heartbeats start at the claim and carry interval buckets |
 
-The distributed-execution skeleton (leases, shared T0, heartbeat commands, the
-Swarm and Kubernetes drivers) is still to come and is what the rest of this
-file describes.
+The distributed-execution skeleton was adapted in phase 7 and hardened in
+phase 8; the rest of this file is the original account of what was taken and
+why.
 
 ## Why copy at all
 

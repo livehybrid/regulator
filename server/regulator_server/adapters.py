@@ -203,13 +203,12 @@ def worker_config(
 ) -> Config:
     """Build the worker's own Config for an in-process run.
 
-    Note ``standalone=True``. The worker's managed mode talks to a control
-    plane over the claim protocol, which is the fleet path and does not exist
-    yet. Running the scheduler directly inside the control plane is the
-    in-process fleet: fine for tens to low hundreds of virtual users, and
-    honest about it, because the generator-drift guard invalidates a run where
-    this process could not keep to its own schedule rather than reporting a
-    number that describes the server.
+    Note ``standalone=True``. A fleet worker takes the same values from its
+    claim (see ``fleet._claim_env``); this is the in-process path, where the
+    scheduler runs inside the control plane. Fine for tens to low hundreds of
+    virtual users, and honest about it, because the generator-drift guard
+    invalidates a run where this process could not keep to its own schedule
+    rather than reporting a number that describes the server.
     """
     return Config(
         standalone=True,

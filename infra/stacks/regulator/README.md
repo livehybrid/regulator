@@ -25,8 +25,9 @@ What the stack does that the plain image does not:
   a self-signed collector needs;
 - registers `REG_SEED_TARGET_*` at boot, so a rebuilt stack is runnable at once.
 
-Browser scenarios do not run from this stack: the control-plane image carries no
-Chromium. Run them from the browser worker image until the fleet lands:
+Browser scenarios do not run in-process: the control-plane image carries no
+Chromium. Launch them on the swarm fleet (the default here), which starts the
+browser worker image for them, or run one by hand from that image:
 
 ```bash
 docker run --rm -e REG_STANDALONE=1 -e REG_SCENARIO=dashboard-triage \
