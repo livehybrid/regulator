@@ -164,7 +164,9 @@ class ControlTelemetry:
 
     def sample(self, run: Any, sample: Dict[str, Any], target_name: Optional[str] = None, slot: Optional[int] = None) -> bool:
         keys = run_fields(run, target_name)
-        event = {**keys, **sample}
+        # No slot key at all on the aggregate row: a JSON null would be
+        # extracted by Splunk as the value "null" and match slot=*.
+        event = {**keys, **{k: v for k, v in sample.items() if k != "slot"}}
         if slot is not None:
             event["slot"] = slot
         indexed = {**{k: keys.get(k) for k in ("run_no", "run_label", "scenario", "target", "fleet")}, "slot": slot}

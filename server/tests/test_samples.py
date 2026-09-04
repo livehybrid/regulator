@@ -128,9 +128,11 @@ def test_a_run_keeps_a_time_series_and_ships_it_over_hec(client, splunkd, collec
     assert len(shipped) >= 2
     first = shipped[0]
     assert first["index"] == "regulator" and first["source"] == "regulator"
-    assert first["fields"]["run_no"] == run_id and first["fields"]["emitter"] == "control"
+    assert first["event"]["run_no"] == run_id and first["fields"] == {"emitter": "control"}
     assert first["event"]["run_label"].startswith(f"r{run_id}")
     assert "interval" in first["event"] and "cum" in first["event"]
+    # The aggregate row has no slot key at all (a JSON null would read as a value in Splunk).
+    assert "slot" not in first["event"]
     finals = [e for e in collector.by_sourcetype("regulator:run") if e["event"].get("scope") == "inprocess"]
     assert len(finals) == 1 and finals[0]["event"]["outcome"] == "completed"
     # The worker's own step records take the worker's emitter (covered in

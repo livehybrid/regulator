@@ -171,7 +171,13 @@ class HecEmitter:
         # a 400.
         if self.config.index:
             envelope["index"] = self.config.index
-        indexed = {**self.fields, **{k: v for k, v in (fields or {}).items() if v is not None}}
+        # Indexed fields carry only what the body does not already say: a key
+        # present in both is extracted twice by Splunk and turns into a
+        # two-valued field, which every stats and table then has to untangle.
+        indexed = {
+            k: v for k, v in {**self.fields, **(fields or {})}.items()
+            if v is not None and k not in event
+        }
         if indexed:
             envelope["fields"] = indexed
         return envelope
