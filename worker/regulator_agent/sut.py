@@ -122,13 +122,115 @@ def build_probes(marker_prefix: str) -> List[Probe]:
             # total_run_time. Counting both reported twice the searches and
             # averaged a field half the rows did not have. Confirmed on a
             # live 10.4 instance.
+            # The same audit record also carries the bucket-cache accounting
+            # (index-file and rawdata hits and misses, with the seconds each
+            # miss cost), the startup time and the bucket elimination counts.
+            # Zero extra load, and it turns cache provenance into a cost per
+            # search. Shape after silkyrich/cluster_health_tools; every field
+            # confirmed on a live 10.4 instance.
             spl=(
                 f'search index=_audit action=search info=completed "{marker_prefix}" '
                 "| stats count as searches, "
                 "avg(total_run_time) as avg_run_time_s, "
                 "perc95(total_run_time) as p95_run_time_s, "
                 "max(total_run_time) as max_run_time_s, "
-                "sum(scan_count) as scan_count, sum(event_count) as event_count"
+                "sum(scan_count) as scan_count, sum(event_count) as event_count, "
+                "avg(search_startup_time) as avg_startup_ms, perc95(search_startup_time) as p95_startup_ms, "
+                "sum(searched_buckets) as searched_buckets, sum(eliminated_buckets) as eliminated_buckets, "
+                "sum(considered_events) as considered_events, sum(decompressed_slices) as decompressed_slices, "
+                "sum(invocations_command_search_index_bucketcache_hit) as index_cache_hits, "
+                "sum(invocations_command_search_index_bucketcache_miss) as index_cache_misses, "
+                "sum(duration_command_search_index_bucketcache_miss) as index_miss_s, "
+                "sum(invocations_command_search_rawdata_bucketcache_hit) as rawdata_cache_hits, "
+                "sum(invocations_command_search_rawdata_bucketcache_miss) as rawdata_cache_misses, "
+                "sum(duration_command_search_rawdata_bucketcache_miss) as rawdata_miss_s, "
+                "sum(invocations_command_search_index_bucketcache_error) as index_cache_errors, "
+                "sum(invocations_command_search_rawdata_bucketcache_error) as rawdata_cache_errors "
+                "| eval cold_path_s=coalesce(index_miss_s, 0) + coalesce(rawdata_miss_s, 0), "
+                "cache_lookups=coalesce(index_cache_hits, 0) + coalesce(index_cache_misses, 0) + "
+                "coalesce(rawdata_cache_hits, 0) + coalesce(rawdata_cache_misses, 0), "
+                "cache_miss_pct=if(cache_lookups > 0, round(100 * (coalesce(index_cache_misses, 0) + "
+                "coalesce(rawdata_cache_misses, 0)) / cache_lookups, 2), null())"
+            ),
+        ),
+        Probe(
+            name="queueing",
+            description=(
+                "the search head's own account of admission queueing during the window: "
+                "how many searches were enqueued, how long they waited and how deep the "
+                "queue got, from the search_queue_metrics group in metrics.log"
+            ),
+            # enqueue_seaches_count is Splunk's own spelling. Shape after
+            # silkyrich/cluster_health_tools; confirmed on 10.4, which also
+            # reports denied_queued_jobs_user_role and _systemwide.
+            spl=(
+                "search index=_internal sourcetype=splunkd group=search_concurrency name=search_queue_metrics "
+                "| stats sum(enqueue_seaches_count) as enqueued, max(current_queue_size) as max_queue_size, "
+                "max(largest_queue_size) as largest_queue_size, max(max_time_spent_in_queue) as max_queued_s, "
+                "avg(avg_time_spent_in_queue) as avg_queued_s, "
+                "sum(denied_queued_jobs_user_role) as denied_by_role, sum(denied_queued_jobs_systemwide) as denied_systemwide"
+            ),
+        ),
+        Probe(
+            name="queueing_reasons",
+            description=(
+                "why searches were queued, in the dispatcher's words: the instance's "
+                "concurrent-search ceiling and a per-role quota look the same from the "
+                "client and are different problems"
+            ),
+            spl=(
+                'search index=_internal sourcetype=splunkd component=DispatchManager "Queued job" '
+                "| stats count by reason"
+            ),
+        ),
+        Probe(
+            name="concurrency",
+            description=(
+                "concurrent searches as the search head counted them (the system total from "
+                "the search_concurrency group), so the client's in-flight figure can be laid "
+                "against the server's own"
+            ),
+            spl=(
+                'search index=_internal sourcetype=splunkd group=search_concurrency "system total" '
+                "| stats max(active_hist_searches) as peak_active_searches, avg(active_hist_searches) as avg_active_searches, "
+                "max(active_realtime_searches) as peak_realtime_searches by host"
+            ),
+        ),
+        Probe(
+            name="scheduler_lag",
+            description=(
+                "the scheduler falling behind before it starts skipping: lag, delayed and "
+                "dispatched counts from the searchscheduler group. The earlier and kinder "
+                "signal than a skip"
+            ),
+            spl=(
+                "search index=_internal sourcetype=splunkd group=searchscheduler "
+                "| stats max(max_lag) as max_lag_s, max(total_lag) as max_total_lag_s, sum(delayed) as delayed, "
+                "sum(skipped) as skipped, sum(dispatched) as dispatched, max(max_running) as max_running"
+            ),
+        ),
+        Probe(
+            name="cache_buckets",
+            description=(
+                "SmartStore cache hits, misses and evictions per indexer from the cachemgr_bucket "
+                "metrics group: the structured counterpart of the cache manager's log lines"
+            ),
+            spl=(
+                "search index=_internal sourcetype=splunkd group=cachemgr_bucket "
+                "| stats sum(cache_hit) as cache_hits, sum(cache_miss) as cache_misses, sum(evict_bucket) as evictions, "
+                "sum(manual_evict) as manual_evictions, sum(open) as opens by host"
+            ),
+        ),
+        Probe(
+            name="cache_downloads",
+            description=(
+                "bucket downloads from object storage per indexer, with how long each took and "
+                "how much came down, from the cache manager's own download records"
+            ),
+            spl=(
+                "search index=_internal sourcetype=splunkd component=CacheManager action=download status=succeeded "
+                "| stats count as downloads, sum(kb) as kb_downloaded, perc95(elapsed_ms) as p95_download_ms, "
+                "max(elapsed_ms) as max_download_ms by host"
             ),
         ),
         Probe(
@@ -374,6 +476,39 @@ def _findings(correlation: Dict[str, Any]) -> List[str]:
             findings.append(
                 f"{host} was CPU bound at peak, so latency past that point describes a "
                 "saturated machine rather than a search-tier characteristic"
+            )
+
+    # The cold path's cost, from the same audit records: seconds the searches
+    # spent waiting on bucket-cache misses, and what share of lookups missed.
+    if ours.get("cache_lookups") not in (None, "", "0", 0):
+        try:
+            cold_s = float(ours.get("cold_path_s") or 0)
+            miss_pct = float(ours.get("cache_miss_pct") or 0)
+        except (TypeError, ValueError):
+            cold_s, miss_pct = 0.0, 0.0
+        if miss_pct > 0 or cold_s > 0:
+            findings.append(
+                f"{miss_pct:.1f}% of this run's bucket-cache lookups missed and the misses cost "
+                f"{cold_s:.1f}s of search time in total: the cold path's price, per the audit trail"
+            )
+        else:
+            findings.append("every bucket-cache lookup this run's searches made was a hit: a warm run by the cluster's own account")
+
+    queueing = first_row("queueing")
+    if queueing.get("enqueued") not in (None, "", "0", 0):
+        try:
+            enqueued = int(float(queueing.get("enqueued") or 0))
+        except (TypeError, ValueError):
+            enqueued = 0
+        if enqueued:
+            reasons_probe = probes.get("queueing_reasons") or {}
+            reasons = [str(row.get("reason") or "") for row in (reasons_probe.get("rows") or []) if reasons_probe.get("available")]
+            by_role = any("role" in reason.lower() for reason in reasons)
+            findings.append(
+                f"the search head queued {enqueued} search(es) in the window (deepest queue "
+                f"{_number(queueing.get('largest_queue_size'))}, longest wait {_number(queueing.get('max_queued_s'))}s)"
+                + (": a per-role quota was among the reasons, which is the account's limit rather than the instance's ceiling"
+                   if by_role else ": the instance's concurrent-search ceiling")
             )
 
     if not findings:

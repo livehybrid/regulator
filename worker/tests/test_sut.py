@@ -211,3 +211,61 @@ def test_no_correlation_at_all_says_so_plainly():
     findings = _findings({"probes": {}})
     assert len(findings) == 1
     assert "client-side measurement" in findings[0]
+
+
+# ---------------------------------- probes borrowed from cluster_health_tools
+
+
+def test_the_audit_probe_carries_the_bucket_cache_accounting():
+    probes = {p.name: p for p in build_probes("reg:run-7:")}
+    spl = probes["our_searches"].spl
+    for field in (
+        "invocations_command_search_rawdata_bucketcache_miss",
+        "duration_command_search_index_bucketcache_miss",
+        "search_startup_time",
+        "eliminated_buckets",
+        "cold_path_s",
+        "cache_miss_pct",
+    ):
+        assert field in spl, field
+    assert '"reg:run-7:"' in spl
+
+
+def test_the_borrowed_probes_read_splunks_own_metrics():
+    probes = {p.name: p for p in build_probes("x")}
+    assert "name=search_queue_metrics" in probes["queueing"].spl and "enqueue_seaches_count" in probes["queueing"].spl
+    assert "DispatchManager" in probes["queueing_reasons"].spl and "by reason" in probes["queueing_reasons"].spl
+    assert '"system total"' in probes["concurrency"].spl and "active_hist_searches" in probes["concurrency"].spl
+    assert "group=searchscheduler" in probes["scheduler_lag"].spl and "max_lag" in probes["scheduler_lag"].spl
+    assert "group=cachemgr_bucket" in probes["cache_buckets"].spl and "manual_evict" in probes["cache_buckets"].spl
+    assert "action=download" in probes["cache_downloads"].spl and "elapsed_ms" in probes["cache_downloads"].spl
+    for name in ("queueing", "queueing_reasons", "concurrency", "scheduler_lag", "cache_buckets", "cache_downloads"):
+        assert probes[name].spl.startswith("search index=_internal")
+
+
+def test_findings_price_the_cold_path_from_the_audit_trail():
+    from regulator_agent.sut import _findings
+
+    findings = _findings({"probes": {"our_searches": {"available": True, "rows": [{
+        "searches": "12", "p95_run_time_s": "3.5", "cache_lookups": "400", "cold_path_s": "18.25", "cache_miss_pct": "12.5",
+    }]}}})
+    assert any("12.5% of this run's bucket-cache lookups missed" in f and "18.2s" in f for f in findings), findings
+    warm = _findings({"probes": {"our_searches": {"available": True, "rows": [{
+        "searches": "12", "cache_lookups": "400", "cold_path_s": "0", "cache_miss_pct": "0",
+    }]}}})
+    assert any("warm run by the cluster's own account" in f for f in warm)
+
+
+def test_findings_tell_a_role_quota_from_the_instance_ceiling():
+    from regulator_agent.sut import _findings
+
+    ceiling = _findings({"probes": {
+        "queueing": {"available": True, "rows": [{"enqueued": "40", "largest_queue_size": "9", "max_queued_s": "4.2"}]},
+        "queueing_reasons": {"available": True, "rows": [{"reason": "The maximum number of concurrent historical searches on this instance has been reached.", "count": "40"}]},
+    }})
+    assert any("queued 40 search(es)" in f and "instance's concurrent-search ceiling" in f for f in ceiling), ceiling
+    quota = _findings({"probes": {
+        "queueing": {"available": True, "rows": [{"enqueued": "3", "largest_queue_size": "1", "max_queued_s": "1"}]},
+        "queueing_reasons": {"available": True, "rows": [{"reason": "The maximum number of concurrent historical searches for this role has been reached.", "count": "3"}]},
+    }})
+    assert any("per-role quota" in f for f in quota), quota

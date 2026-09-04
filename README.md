@@ -52,15 +52,19 @@ cluster its own opinion, because the difference between "p95 went from 4 s to
 scheduled searches were skipped" is the difference between a load test and a
 benchmark.
 
-Six questions, each one search against Splunk's own internal indexes:
+Thirteen questions, each one search against Splunk's own internal indexes
+(the later ones follow the shape of the search-performance dashboards in
+silkyrich/cluster_health_tools, re-derived and confirmed on a live 10.4):
 
 | Probe | What it answers |
 |---|---|
-| `_audit`, this run | The cluster's own account of the searches we dispatched, matched by the marker each one carries |
+| `_audit`, this run | The cluster's own account of the searches we dispatched, matched by the marker each one carries: run times, scan counts, **startup time, bucket elimination, and the bucket-cache hits and misses with the seconds each miss cost**, which turns cache provenance into a price per search |
 | `_audit`, everything | All searches in the window, so other traffic on a shared cluster is visible rather than silently mixed in |
 | `search_telemetry` | Where the time went by phase. Indexer-side elapsed time separates a busy search head from busy indexers, which no client-side timing can |
-| Scheduler | Scheduled searches skipped or deferred. Past the concurrency ceiling the first casualty is usually somebody else's scheduled work, a cost that is otherwise invisible |
-| Cache manager | SmartStore downloads and evictions over the wire, corroborating the bucket-level provenance |
+| Queueing, and why | The search head's own count of searches it queued, how deep and how long, and the dispatcher's reasons, which tell the instance's ceiling from a per-role quota (the client sees the same wait for both) |
+| Concurrency | Concurrent searches as the search head counted them, so the client's in-flight figure can be laid against the server's own |
+| Scheduler, and its lag | Scheduled searches skipped or deferred, and the scheduler falling behind before it skips, which is the earlier and kinder signal |
+| Cache manager, three ways | Downloads and evictions over the wire; hits, misses and evictions per indexer from the cachemgr metrics; downloads per indexer with their latency and size |
 | Resource usage | Search head and indexer CPU, so the latency curve can be laid against the machine's own load |
 
 Two honest caveats, both established against a live 10.4 instance rather than
@@ -912,7 +916,7 @@ engine with no Splunk anywhere.
 | `managed.py` | A fleet member: claim, ready, heartbeat, final |
 | `server/…/fleet.py`, `drivers/` | Planning shares, the lease protocol, merging, and the Swarm, Kubernetes and fake drivers |
 | `smartstore.py` | Cache state and eviction per indexer, discovered from the search peers, with evictions confirmed rather than assumed |
-| `sut.py` | The seven correlation probes against the cluster's own indexes |
+| `sut.py` | The thirteen correlation probes against the cluster's own indexes |
 | `compare.py` | Baselines, per-step deltas and the gate language |
 
 ---
