@@ -76,6 +76,14 @@ class HecSettings:
     index: Optional[str] = None
     verify_tls: bool = True
     source: str = "regulator"
+    sourcetype_step: str = "regulator:step"
+    sourcetype_run: str = "regulator:run"
+    sourcetype_sample: str = "regulator:sample"
+    sourcetype_lifecycle: str = "regulator:lifecycle"
+    sourcetype_health: str = "regulator:health"
+    gzip: bool = True
+    batch_bytes: int = 512 * 1024
+    batch_ms: int = 200
 
 
 @dataclass(frozen=True)
@@ -178,6 +186,9 @@ class ServerConfig:
     hec: Optional[HecSettings] = None
     seed_target: Optional[SeedTarget] = None
     fleet: FleetSettings = field(default_factory=FleetSettings)
+    # How often a run's time series takes a sample (the graphs, and the
+    # regulator:sample events). A few thousand rows for the longest run.
+    sample_interval_s: float = 5.0
 
     @property
     def auth_enabled(self) -> bool:
@@ -242,6 +253,14 @@ def load_server_config(env: Optional[Mapping[str, str]] = None) -> ServerConfig:
             index=_get(env, "REG_HEC_INDEX"),
             verify_tls=_boolean(env, "REG_HEC_VERIFY_TLS", True),
             source=_get(env, "REG_HEC_SOURCE", "regulator") or "regulator",
+            sourcetype_step=_get(env, "REG_HEC_SOURCETYPE_STEP", "regulator:step") or "regulator:step",
+            sourcetype_run=_get(env, "REG_HEC_SOURCETYPE_RUN", "regulator:run") or "regulator:run",
+            sourcetype_sample=_get(env, "REG_HEC_SOURCETYPE_SAMPLE", "regulator:sample") or "regulator:sample",
+            sourcetype_lifecycle=_get(env, "REG_HEC_SOURCETYPE_LIFECYCLE", "regulator:lifecycle") or "regulator:lifecycle",
+            sourcetype_health=_get(env, "REG_HEC_SOURCETYPE_HEALTH", "regulator:health") or "regulator:health",
+            gzip=_boolean(env, "REG_HEC_GZIP", True),
+            batch_bytes=_integer(env, "REG_HEC_BATCH_BYTES", 512 * 1024, minimum=1024),
+            batch_ms=_integer(env, "REG_HEC_BATCH_MS", 200, minimum=10),
         )
 
     seed: Optional[SeedTarget] = None
@@ -327,6 +346,7 @@ def load_server_config(env: Optional[Mapping[str, str]] = None) -> ServerConfig:
         max_run_duration_s=float(_integer(env, "REG_MAX_RUN_DURATION_S", 4 * 3600, minimum=1)),
         api_tokens=tokens,
         allow_unauthenticated=_boolean(env, "REG_ALLOW_UNAUTHENTICATED", False),
+        sample_interval_s=float(_integer(env, "REG_SAMPLE_INTERVAL_S", 5, minimum=1)),
         hec=hec,
         seed_target=seed,
         fleet=fleet,

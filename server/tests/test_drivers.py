@@ -41,6 +41,7 @@ class Portainer:
     def __init__(self) -> None:
         self.requests: List[Dict[str, Any]] = []
         self.services: Dict[str, Dict[str, Any]] = {}
+        self.secrets: Dict[str, Dict[str, Any]] = {}
         self.digest_ok = True
 
     def handler(self, request: httpx.Request) -> httpx.Response:
@@ -48,6 +49,16 @@ class Portainer:
         body = json.loads(request.content) if request.content else None
         self.requests.append({"method": request.method, "path": path, "body": body, "params": dict(request.url.params)})
         assert request.headers.get("X-API-Key") == "secret-key"
+        if path.endswith("/secrets/create"):
+            secret_id = f"sec{len(self.secrets) + 1}"
+            self.secrets[secret_id] = {"ID": secret_id, "Spec": body}
+            return httpx.Response(201, json={"ID": secret_id})
+        if "/secrets/" in path and request.method == "DELETE":
+            if self.secrets.pop(path.rsplit("/", 1)[1], None) is None:
+                return httpx.Response(404, json={"message": "no such secret"})
+            return httpx.Response(200, json={})
+        if path.endswith("/secrets") and request.method == "GET":
+            return httpx.Response(200, json=list(self.secrets.values()))
         if path.endswith("/distribution/ghcr.io/livehybrid/regulator-worker:latest/json"):
             if not self.digest_ok:
                 return httpx.Response(500, json={"message": "registry unreachable"})
@@ -103,7 +114,10 @@ def test_swarm_creates_a_digest_pinned_service_on_the_stack_network(portainer):
     assert created["Labels"]["regulator.run"] == "42"
     task = created["TaskTemplate"]
     assert task["ContainerSpec"]["Image"].startswith("ghcr.io/livehybrid/regulator-worker@sha256:")
-    assert "REG_RUN_JWT=tok.en" in task["ContainerSpec"]["Env"]
+    # The token is a mounted secret, never environment.
+    assert not any("tok.en" in item for item in task["ContainerSpec"]["Env"])
+    assert "REG_RUN_JWT_FILE=/run/secrets/REG_RUN_JWT" in task["ContainerSpec"]["Env"]
+    assert task["ContainerSpec"]["Secrets"][0]["File"]["Name"] == "REG_RUN_JWT"
     assert task["Networks"] == [{"Target": "regulator_regulator_internal"}]
     assert task["Placement"]["Constraints"] == ["node.hostname != macdev"]
     assert task["RestartPolicy"] == {"Condition": "none"}
@@ -198,13 +212,15 @@ class FakeApi:
             raise self.ApiException(404)
         del self.jobs[name]
 
-    def list_namespaced_pod(self, namespace: str, label_selector: str) -> Dict[str, Any]:
+    def list_namespaced_pod(self, namespace: str, label_selector: str, **kwargs: Any) -> Dict[str, Any]:
+        self._record("list_pods", label_selector=label_selector, **kwargs)
         return {"items": [
             {"metadata": {"name": "pod-0"}, "status": {"phase": "Running"}, "spec": {"nodeName": "ip-1"}},
             {"metadata": {"name": "pod-1"}, "status": {"phase": "Succeeded"}, "spec": {"nodeName": "ip-2"}},
         ]}
 
-    def read_namespaced_pod_log(self, name: str, namespace: str, tail_lines: Any = None) -> str:
+    def read_namespaced_pod_log(self, name: str, namespace: str, tail_lines: Any = None, **kwargs: Any) -> str:
+        self._record("pod_log", name=name, tail_lines=tail_lines, **kwargs)
         return f"log of {name}"
 
     def list_namespaced_job(self, namespace: str, label_selector: str) -> Dict[str, Any]:
@@ -280,3 +296,72 @@ def test_k8s_cleans_up_the_secret_when_the_job_cannot_be_created(k8s):
     with pytest.raises(DriverError):
         driver.create(group())
     assert secret_name(42, "api") not in api.secrets
+
+
+def test_swarm_projects_the_token_as_a_secret_and_removes_it_with_the_service(portainer):
+    import base64
+
+    fake, driver = portainer
+    ref = driver.create(group(
+        group="browser", image="ghcr.io/livehybrid/regulator-worker:latest",
+        env={"REG_RUN_ID": "42", "REG_CONTROL_URL": "http://regulator:8080"},
+        secrets={"REG_RUN_JWT": "tok.en"}, options={"slot_base": 3},
+    ))
+    created = [r for r in fake.requests if r["path"].endswith("/secrets/create")]
+    assert len(created) == 1
+    assert created[0]["body"]["Name"] == "regulator-run-42-browser-reg-run-jwt"
+    assert base64.b64decode(created[0]["body"]["Data"]) == b"tok.en"
+    assert created[0]["body"]["Labels"] == {"regulator.run": "42"}
+    container = fake.services[ref.id]["Spec"]["TaskTemplate"]["ContainerSpec"]
+    assert not any("tok.en" in item for item in container["Env"])
+    assert container["Secrets"] == [{"SecretID": "sec1", "SecretName": "regulator-run-42-browser-reg-run-jwt",
+                                     "File": {"Name": "REG_RUN_JWT", "UID": "0", "GID": "0", "Mode": 0o444}}]
+    # The worker derives its slot from the task number and the group's base.
+    assert "REG_SWARM_TASK_SLOT={{.Task.Slot}}" in container["Env"]
+    assert "REG_SLOT_BASE=3" in container["Env"]
+    assert "REG_WORKER_ENGINE=browser" in container["Env"]
+    assert ref.raw["secrets"] == ["sec1"]
+    driver.destroy(ref)
+    assert fake.secrets == {}
+    # Destroying again is quiet: the service and the secret are both gone.
+    driver.destroy(ref)
+
+
+def test_swarm_removes_the_secret_when_the_service_cannot_be_created(portainer):
+    fake, driver = portainer
+
+    original = fake.handler
+
+    def failing(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/services/create"):
+            fake.requests.append({"method": "POST", "path": request.url.path, "body": None, "params": {}})
+            return httpx.Response(500, json={"message": "no space"})
+        return original(request)
+
+    driver._transport = httpx.MockTransport(failing)
+    with pytest.raises(DriverError):
+        driver.create(group(secrets={"REG_RUN_JWT": "tok.en"}))
+    assert fake.secrets == {}
+
+
+def test_k8s_passes_the_group_base_and_engine_and_removes_the_secret_after_a_stop(k8s):
+    api, driver = k8s
+    ref = driver.create(group(
+        group="browser", image="browser-img", options={"slot_base": 3, "active_deadline_s": 900},
+        env={"REG_RUN_ID": "42", "REG_CONTROL_URL": "http://regulator:8080"}, secrets={"REG_RUN_JWT": "tok.en"},
+    ))
+    container = api.jobs[ref.id]["spec"]["template"]["spec"]["containers"][0]
+    env = {item["name"]: item for item in container["env"]}
+    assert env["REG_SLOT_BASE"]["value"] == "3"
+    assert env["REG_WORKER_ENGINE"]["value"] == "browser"
+    assert env["REG_RUN_JWT"]["valueFrom"]["secretKeyRef"]["name"] == secret_name(42, "browser")
+    assert api.secrets[secret_name(42, "browser")]["stringData"] == {"run-token": "tok.en"}
+    # The logs call names the group and is bounded.
+    driver.logs(ref, tail=5)
+    listed = [c for c in api.calls if c["call"] == "list_pods"][-1]
+    assert "regulator.group=browser" in listed["label_selector"] and listed["_request_timeout"] == 20
+    logged = [c for c in api.calls if c["call"] == "pod_log"][-1]
+    assert logged["limit_bytes"] > 0
+    driver.stop(ref, grace_s=30)  # the job is gone now
+    driver.destroy(ref)
+    assert secret_name(42, "browser") not in api.secrets

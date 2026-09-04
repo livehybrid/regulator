@@ -108,19 +108,70 @@ class SwarmDriver:
         if group.workers < 1:
             raise DriverError("workers must be at least 1")
         image = self._resolve_image(group.image)
-        spec = self._service_spec(group, image)
+        name = service_name(group.run_id, group.group)
+        # The run token travels as a swarm secret mounted at /run/secrets, never
+        # in the service's environment, which anyone with read access to
+        # Portainer can inspect.
+        secret_refs: List[Dict[str, Any]] = []
+        secret_ids: List[str] = []
+        secrets = dict(group.secrets)
+        if group.env.get("REG_RUN_JWT"):
+            # Defensive: a caller that put the token in the environment still
+            # gets it projected as a secret, never rendered into the spec.
+            secrets.setdefault("REG_RUN_JWT", group.env["REG_RUN_JWT"])
+        for key, value in sorted(secrets.items()):
+            secret_id = self._create_secret(f"{name}-{key.lower().replace('_', '-')}", value, group.run_id)
+            secret_ids.append(secret_id)
+            secret_refs.append(
+                {
+                    "SecretID": secret_id,
+                    "SecretName": f"{name}-{key.lower().replace('_', '-')}",
+                    "File": {"Name": key, "UID": "0", "GID": "0", "Mode": 0o444},
+                }
+            )
+        spec = self._service_spec(group, image, secret_refs)
         log.info("swarm: creating %s with %d replica(s) of %s", spec["Name"], group.workers, image)
-        response = self._request("POST", "/services/create", body=spec)
+        try:
+            response = self._request("POST", "/services/create", body=spec)
+        except DriverError:
+            for secret_id in secret_ids:
+                self._delete_secret_quietly(secret_id)
+            raise
         body = _json(response)
         service_id = body.get("ID") or body.get("Id") or ""
         if not service_id:
+            for secret_id in secret_ids:
+                self._delete_secret_quietly(secret_id)
             raise DriverError(f"swarm create {spec['Name']} returned no service id")
         return DriverRef(
             kind=self.kind,
             id=str(service_id),
             group=group.group,
-            raw={"run_id": group.run_id, "name": spec["Name"], "endpoint": self._endpoint},
+            raw={"run_id": group.run_id, "name": spec["Name"], "endpoint": self._endpoint, "secrets": secret_ids},
         )
+
+    def _create_secret(self, name: str, value: str, run_id: int) -> str:
+        import base64
+
+        body = {
+            "Name": name,
+            "Data": base64.b64encode(value.encode("utf-8")).decode("ascii"),
+            "Labels": {LABEL: str(run_id)},
+        }
+        try:
+            response = self._request("POST", "/secrets/create", body=body)
+        except DriverError as exc:
+            raise DriverError(f"swarm: could not create the run secret {name}: {exc}") from exc
+        secret_id = _json(response).get("ID") or _json(response).get("Id") or ""
+        if not secret_id:
+            raise DriverError(f"swarm: creating the run secret {name} returned no id")
+        return str(secret_id)
+
+    def _delete_secret_quietly(self, secret_id: str) -> None:
+        try:
+            self._request("DELETE", f"/secrets/{secret_id}", ok=(200, 204, 404))
+        except DriverError as exc:
+            log.warning("swarm: could not remove secret %s: %s", secret_id, exc)
 
     def _resolve_image(self, image: str) -> str:
         if not image or "@sha256:" in image:
@@ -139,20 +190,32 @@ class SwarmDriver:
             repo = repo[:colon]
         return f"{repo}@{digest}"
 
-    def _service_spec(self, group: WorkerGroup, image: str) -> Dict[str, Any]:
+    def _service_spec(self, group: WorkerGroup, image: str, secret_refs: Optional[List[Dict[str, Any]]] = None) -> Dict[str, Any]:
         labels = {LABEL: str(group.run_id), "regulator.group": group.group, **(group.labels or {})}
-        env_list = [f"{key}={value}" for key, value in sorted(group.env.items()) if value is not None]
+        env = {key: value for key, value in group.env.items() if value is not None and key != "REG_RUN_JWT"}
+        # Swarm numbers a replicated service's tasks from 1; with the group's
+        # first slot the worker derives its own slot hint, so an api group and
+        # a browser group of one run never hint the same slot.
+        env["REG_SWARM_TASK_SLOT"] = "{{.Task.Slot}}"
+        env["REG_SLOT_BASE"] = str(int(group.options.get("slot_base") or 0))
+        env["REG_WORKER_ENGINE"] = group.group
+        for ref in secret_refs or []:
+            env[f"{ref['File']['Name']}_FILE"] = f"/run/secrets/{ref['File']['Name']}"
+        env_list = [f"{key}={value}" for key, value in sorted(env.items())]
         constraints = list(self._constraints) + [str(c) for c in (group.options.get("constraints") or [])]
         placement: Dict[str, Any] = {"Preferences": [{"Spread": {"SpreadDescriptor": "node.id"}}]}
         if constraints:
             placement["Constraints"] = constraints
+        container: Dict[str, Any] = {
+            "Image": image,
+            "Env": env_list,
+            "Labels": dict(labels),
+            "StopGracePeriod": int(group.stop_grace_s) * 1_000_000_000,
+        }
+        if secret_refs:
+            container["Secrets"] = list(secret_refs)
         task: Dict[str, Any] = {
-            "ContainerSpec": {
-                "Image": image,
-                "Env": env_list,
-                "Labels": dict(labels),
-                "StopGracePeriod": int(group.stop_grace_s) * 1_000_000_000,
-            },
+            "ContainerSpec": container,
             # A worker that exits is finished, not failed: its final report has
             # been posted. Restarting it would claim a fresh lease and run the
             # slice again.
@@ -190,6 +253,8 @@ class SwarmDriver:
     def destroy(self, ref: DriverRef) -> None:
         response = self._request("DELETE", f"/services/{ref.id}", ok=(200, 201, 204, 404))
         log.info("swarm: %s %s", "already gone" if response.status_code == 404 else "removed", ref.id)
+        for secret_id in (ref.raw or {}).get("secrets") or []:
+            self._delete_secret_quietly(str(secret_id))
 
     def status(self, ref: DriverRef) -> DriverStatus:
         try:
@@ -234,6 +299,12 @@ class SwarmDriver:
         """Every service this driver holds for a run, for the stray sweep."""
         response = self._request("GET", "/services", params={"filters": json.dumps({"label": [f"{LABEL}={run_id}"]})})
         body = _json(response)
+        secrets: List[str] = []
+        try:
+            found = _json(self._request("GET", "/secrets", params={"filters": json.dumps({"label": [f"{LABEL}={run_id}"]})}))
+            secrets = [str(s.get("ID") or s.get("Id")) for s in found if isinstance(s, dict) and (s.get("ID") or s.get("Id"))]
+        except DriverError as exc:
+            log.warning("swarm: could not list the secrets of run %s: %s", run_id, exc)
         refs: List[DriverRef] = []
         for service in body if isinstance(body, list) else []:
             spec = service.get("Spec") or {}
@@ -242,9 +313,13 @@ class SwarmDriver:
                     kind=self.kind,
                     id=str(service.get("ID") or service.get("Id") or ""),
                     group=str((spec.get("Labels") or {}).get("regulator.group", "api")),
-                    raw={"run_id": run_id, "name": spec.get("Name")},
+                    raw={"run_id": run_id, "name": spec.get("Name"), "secrets": secrets},
                 )
             )
+        if not refs and secrets:
+            # Secrets without a service: a launch that died between the two.
+            for secret_id in secrets:
+                self._delete_secret_quietly(secret_id)
         return refs
 
     # ------------------------------------------------------------- helpers

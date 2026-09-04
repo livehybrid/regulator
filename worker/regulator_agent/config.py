@@ -28,6 +28,8 @@ from typing import Mapping, Optional
 # Managed mode needs a control plane, which lands in Phase 1. The env contract
 # is already fixed here so the worker and the (future) control plane cannot
 # drift apart while they are written weeks apart.
+from pathlib import Path
+
 MANAGED_ENV_KEYS = ("REG_RUN_ID", "REG_CONTROL_URL", "REG_RUN_JWT")
 
 
@@ -47,36 +49,58 @@ class ManagedBoot:
     hint_slot: Optional[int] = None
     holder: str = ""
     deadman_s: float = 300.0
+    # The engine this image can run, so the claim never takes a slot it
+    # cannot serve.
+    engine: Optional[str] = None
 
 
 def load_managed_boot(env: Optional[Mapping[str, str]] = None) -> Optional[ManagedBoot]:
     """The managed-mode bootstrap, or None when this is a standalone worker."""
     env = os.environ if env is None else env
-    present = [key for key in MANAGED_ENV_KEYS if _get(env, key)]
+    # The token arrives in the environment (Kubernetes projects a Secret into
+    # it) or as a mounted file (a swarm secret), never both required.
+    jwt = _get(env, "REG_RUN_JWT")
+    jwt_file = _get(env, "REG_RUN_JWT_FILE")
+    if not jwt and jwt_file:
+        try:
+            jwt = Path(jwt_file).read_text(encoding="utf-8").strip()
+        except OSError as exc:
+            raise ConfigError(f"REG_RUN_JWT_FILE {jwt_file!r} cannot be read: {exc}") from exc
+    present = [key for key in MANAGED_ENV_KEYS if (jwt if key == "REG_RUN_JWT" else _get(env, key))]
     if not present:
         return None
     if len(present) != len(MANAGED_ENV_KEYS):
         missing = [key for key in MANAGED_ENV_KEYS if key not in present]
         raise ConfigError(
             f"managed mode needs all of {', '.join(MANAGED_ENV_KEYS)}; missing "
-            f"{', '.join(missing)}"
+            f"{', '.join(missing)} (REG_RUN_JWT may also come from REG_RUN_JWT_FILE)"
         )
-    hint_raw = _get(env, "REG_HINT_SLOT") or _get(env, "JOB_COMPLETION_INDEX")
+    # The slot hint. REG_HINT_SLOT is absolute; a Kubernetes completion index
+    # and a swarm task slot (numbered from 1) are relative to the group's
+    # first slot, which the driver passes as REG_SLOT_BASE.
     hint: Optional[int] = None
-    if hint_raw is not None:
-        try:
+    hint_raw = _get(env, "REG_HINT_SLOT")
+    try:
+        if hint_raw is not None:
             hint = int(hint_raw)
-        except ValueError as exc:
-            raise ConfigError(f"REG_HINT_SLOT must be an integer, got {hint_raw!r}") from exc
+        else:
+            base = int(_get(env, "REG_SLOT_BASE") or 0)
+            if _get(env, "JOB_COMPLETION_INDEX") is not None:
+                hint = base + int(_get(env, "JOB_COMPLETION_INDEX"))
+            elif _get(env, "REG_SWARM_TASK_SLOT") is not None:
+                hint = base + max(0, int(_get(env, "REG_SWARM_TASK_SLOT")) - 1)
+    except ValueError as exc:
+        raise ConfigError(f"the slot hint must be an integer: {exc}") from exc
     import socket
 
     return ManagedBoot(
         run_id=_require(env, "REG_RUN_ID", "the run this worker belongs to"),
         control_url=_url(env, "REG_CONTROL_URL", _require(env, "REG_CONTROL_URL", "the control plane")) or "",
-        jwt=_require(env, "REG_RUN_JWT", "the per-run token the control plane minted"),
+        jwt=jwt or "",
         hint_slot=hint,
         holder=_get(env, "REG_HOLDER") or socket.gethostname(),
         deadman_s=_number(env, "REG_DEADMAN_S", 300.0, minimum=10.0),
+        engine=(_get(env, "REG_WORKER_ENGINE") or None),
     )
 
 
@@ -217,6 +241,11 @@ class HecConfig:
     source: str = "regulator"
     sourcetype_step: str = "regulator:step"
     sourcetype_run: str = "regulator:run"
+    # The control plane's own events: periodic samples, run and worker
+    # lifecycle, and a heartbeat about the control plane itself.
+    sourcetype_sample: str = "regulator:sample"
+    sourcetype_lifecycle: str = "regulator:lifecycle"
+    sourcetype_health: str = "regulator:health"
     gzip: bool = True
     verify_tls: bool = True
     batch_bytes: int = 512 * 1024
@@ -291,6 +320,15 @@ class Config:
     indexer_token: Optional[str] = field(default=None, repr=False)
     indexer_username: Optional[str] = None
     indexer_password: Optional[str] = field(default=None, repr=False)
+    # A fleet group's own numbering (a mixed run has an api group and a
+    # browser group, each with its own step list). Defaults to the global slot
+    # and worker count, which is right for a single-group fleet.
+    group_slot: Optional[int] = None
+    group_workers: Optional[int] = None
+    # After a cache eviction, executions within this many seconds are the
+    # cold part of the epoch and are kept apart per step (cold p95 versus
+    # warm p95). The control plane sets it from the run's evict_every_s.
+    cold_window_s: Optional[float] = None
 
     @property
     def self_instrumented(self) -> bool:
@@ -413,6 +451,9 @@ def load_config(env: Optional[Mapping[str, str]] = None) -> Config:
         run_id=_get(env, "REG_RUN_LABEL") or f"local-{int(time.time())}",
         slot=_integer(env, "REG_SLOT", 0, minimum=0),
         total_workers=_integer(env, "REG_TOTAL_WORKERS", 1, minimum=1),
+        group_slot=_integer(env, "REG_GROUP_SLOT", 0, minimum=0) if _get(env, "REG_GROUP_SLOT") is not None else None,
+        group_workers=_integer(env, "REG_GROUP_WORKERS", 1, minimum=1) if _get(env, "REG_GROUP_WORKERS") else None,
+        cold_window_s=_number(env, "REG_COLD_WINDOW_S", 0.0, minimum=0.0) or None,
         max_in_flight=_integer(env, "REG_MAX_IN_FLIGHT", 512, minimum=1),
         connect_timeout_s=_number(env, "REG_CONNECT_TIMEOUT_S", 10.0, minimum=0.1),
         read_timeout_s=_number(env, "REG_READ_TIMEOUT_S", 300.0, minimum=1.0),

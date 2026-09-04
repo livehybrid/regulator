@@ -33,6 +33,11 @@ class WorkerGroup:
     env: Dict[str, str]
     labels: Dict[str, str] = dataclasses.field(default_factory=dict)
     stop_grace_s: int = 90
+    # Values that must not appear in a container's environment. A driver that
+    # can project a secret (a swarm secret, a Kubernetes Secret) mounts these;
+    # the in-memory driver merges them into the environment because a local
+    # subprocess has no secret store.
+    secrets: Dict[str, str] = dataclasses.field(default_factory=dict)
     # Driver-specific knobs: swarm placement constraints, k8s node selector,
     # resource requests.
     options: Dict[str, Any] = dataclasses.field(default_factory=dict)

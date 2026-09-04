@@ -61,6 +61,9 @@ def _serialise(run: Run, target_name: Optional[str] = None, full: bool = True) -
         "state": run.state,
         "virtual_users": run.virtual_users,
         "duration_s": run.duration_s,
+        "evict_cache": run.evict_cache,
+        "evict_every_s": run.evict_every_s,
+        "cold_window_s": run.cold_window_s,
         "seed": run.seed,
         "scenario_digest": run.scenario_digest,
         "fleet": run.fleet or "inprocess",
@@ -72,8 +75,11 @@ def _serialise(run: Run, target_name: Optional[str] = None, full: bool = True) -
         "error": run.error,
     }
     if full:
+        from ..samples import markers_for
+
         base["stats"] = live or run.stats_json
         base["summary"] = run.summary_json
+        base["markers"] = markers_for(run)
     else:
         # The list used to ship every run's complete summary, per-step
         # aggregates and correlation rows included, to draw six columns.
@@ -93,6 +99,52 @@ def get_runs(
         .limit(max(1, min(limit, 500)))
     ).all()
     return [_serialise(run, name, full=False) for run, name in rows]
+
+
+@router.get("/runs/sparklines")
+def get_sparklines(ids: str = "", session: Session = Depends(get_session)) -> Dict[str, List[Optional[float]]]:
+    """Interval p95 series, thinned, for the runs list. ``ids`` is comma separated."""
+    from ..samples import sparkline_for
+
+    out: Dict[str, List[Optional[float]]] = {}
+    for raw in ids.split(","):
+        raw = raw.strip()
+        if raw.isdigit():
+            out[raw] = sparkline_for(session, int(raw))
+    return out
+
+
+@router.get("/runs/{run_id}/samples")
+def get_run_samples(
+    run_id: int,
+    since: Optional[float] = None,
+    slots: bool = False,
+    points: int = 600,
+    session: Session = Depends(get_session),
+) -> Dict[str, Any]:
+    """The run's time series: aggregate rows, or one row per worker slot.
+
+    ``since`` (a sample's ``at``) fetches only newer rows, so a live page
+    appends rather than reloads. Rows are thinned to ``points`` server side.
+    """
+    from ..samples import markers_for, samples_for
+
+    run = session.get(Run, run_id)
+    if run is None:
+        raise HTTPException(status_code=404, detail=f"no run with id {run_id}")
+    rows = samples_for(session, run_id, since=since, slots=slots, points=max(10, min(points, 5000)))
+    markers = markers_for(run)
+    for epoch in manager.epochs_for(run_id):
+        markers.append({"at": epoch["requested_at"], "kind": "evict", "label": f"E{epoch['epoch']}", "duration_s": epoch.get("duration_s")})
+    return {
+        "run_id": run_id,
+        "state": run.state,
+        "started_at": run.started_at,
+        "ended_at": run.ended_at,
+        "t0": run.t0,
+        "samples": rows,
+        "markers": markers,
+    }
 
 
 @router.get("/runs/{run_id}")
@@ -153,6 +205,8 @@ def create_run(
             if body.evict_cache_indexes
             else ("*" if body.evict_all_indexes else None)
         ),
+        evict_every_s=body.evict_every_s,
+        cold_window_s=(body.cold_window_s or (body.evict_every_s / 2.0 if body.evict_every_s else None)),
         state="pending",
     )
     session.add(run)
@@ -167,6 +221,13 @@ def create_run(
         + (" with cache eviction" if body.evict_cache else ""),
     )
 
+    from ..telemetry import telemetry
+
+    telemetry.lifecycle(
+        "run_created", run, target.name if target is not None else None,
+        virtual_users=body.virtual_users, duration_s=body.duration_s, arrival_rate_per_min=body.arrival_rate_per_min,
+        workers=body.workers, evict_cache=body.evict_cache, seed=body.seed,
+    )
     try:
         manager.start(run_id)
     except RunRejected as exc:

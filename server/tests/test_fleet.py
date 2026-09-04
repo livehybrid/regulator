@@ -75,6 +75,11 @@ def client(tmp_path, monkeypatch, fake_driver):
 
     with TestClient(create_app()) as test_client:
         yield test_client
+    # No supervisor thread may outlive its database: the next test's engine
+    # would race it.
+    from regulator_server.runner import manager
+
+    manager.drain_fleets(20.0)
     db.reset_engine()
     set_settings(None)
 
@@ -460,3 +465,165 @@ def test_real_workers_claim_run_and_report_over_the_wire(served, splunkd):
     assert any(":vu1000000:" in m or ":vu1000001:" in m for m in markers)
     assert summary["cache"] is not None
     assert summary["sut"] is not None
+    # The time series was kept: aggregate rows merged from the workers'
+    # interval buckets, and a row per slot.
+    aggregate = http.get(f"/api/runs/{run_id}/samples").json()
+    assert aggregate["samples"], "no aggregate samples were stored"
+    assert any((s["interval"] or {}).get("executions") for s in aggregate["samples"])
+    assert "percentiles_note" not in (aggregate["samples"][-1]["interval"] or {})
+    per_slot = http.get(f"/api/runs/{run_id}/samples?slots=1").json()
+    assert {s["slot"] for s in per_slot["samples"]} == {0, 1}
+    assert any(m["kind"] == "release" for m in aggregate["markers"])
+
+
+# ------------------------------------------ findings of the phase 8 review
+
+
+def _mixed_scenario(tmp_path) -> str:
+    """A scenario with an api persona and a browser persona in the user library."""
+    import yaml
+
+    document = {
+        "name": "mixed",
+        "engine": "mixed",
+        "seed": 3,
+        "corpus": {"index": "main"},
+        "time_policy": {"mode": "rolling", "window": "1h", "jitter": "5m"},
+        "personas": [
+            {"name": "api", "weight": 75, "think_time": {"dist": "fixed", "value_s": 1},
+             "steps": [{"id": "s", "type": "search", "spl": "search index=main | head 1"}]},
+            {"name": "web", "weight": 25, "think_time": {"dist": "fixed", "value_s": 1},
+             "steps": [{"id": "d", "type": "dashboard", "engine": "browser", "app": "search", "dashboard": "x"}]},
+        ],
+        "load": {"model": "closed", "virtual_users": 8, "duration": "10s"},
+        "abort_if": {"error_rate_pct": 50},
+    }
+    directory = tmp_path / "user-scenarios" / "mixed"
+    directory.mkdir(parents=True, exist_ok=True)
+    (directory / "scenario.yaml").write_text(yaml.safe_dump(document), encoding="utf-8")
+    return "mixed"
+
+
+def _wait_terminal(client, run_id: int, timeout_s: float = 20.0) -> Dict[str, Any]:
+    """Until the supervisor has finished, not merely until the state is terminal."""
+    deadline = time.time() + timeout_s
+    run = client.get(f"/api/runs/{run_id}").json()
+    while time.time() < deadline and run.get("fleet_state") != "finished":
+        time.sleep(0.2)
+        run = client.get(f"/api/runs/{run_id}").json()
+    return run
+
+
+def test_a_fleet_run_may_exceed_the_in_process_ceiling(client, splunkd, fake_driver):
+    # The settings cap in-process runs at 50 users. A fleet exists to go past it.
+    run_id = _launch(client, splunkd, fake_driver, virtual_users=120)
+    run = client.get(f"/api/runs/{run_id}").json()
+    assert run["workers"] == 60  # 120 users at 2 per worker
+    assert run["state"] in ("pending", "running")
+    client.post(f"/api/runs/{run_id}/stop")
+    target = make_target(client, splunkd, name="again")
+    refused = client.post("/api/runs", json={"target_id": target["id"], "scenario": "smoke", "fleet": "inprocess", "duration_s": 5, "virtual_users": 120})
+    assert refused.status_code >= 400
+    assert "ceiling" in refused.text and "fleet" in refused.text
+
+
+def test_a_mixed_scenario_on_a_fleet_plans_two_groups_and_claims_are_engine_aware(client, splunkd, fake_driver, tmp_path):
+    name = _mixed_scenario(tmp_path)
+    target = client.post(
+        "/api/targets",
+        json={"name": "web", "mgmt_url": splunkd.base_url, "web_url": splunkd.base_url, "token": "tok-en", "verify_tls": False},
+    ).json()
+    register_driver("k8s", fake_driver)
+    response = client.post("/api/runs", json={"target_id": target["id"], "scenario": name, "fleet": "k8s", "duration_s": 5})
+    assert response.status_code == 201, response.text
+    run_id = response.json()["id"]
+    time.sleep(0.5)
+    workers = client.get(f"/api/runs/{run_id}/workers").json()
+    # 8 users split 75/25: 6 api users at 2 per worker, 2 browser users on one worker.
+    assert sorted(w["engine"] for w in workers) == ["api", "api", "api", "browser"]
+    groups = [g for g in fake_driver.created_groups() if g.run_id == run_id]
+    assert sorted(g.group for g in groups) == ["api", "browser"]
+    assert all("REG_RUN_JWT" not in g.env and g.secrets.get("REG_RUN_JWT") for g in groups)
+    assert {g.options["slot_base"] for g in groups} == {0, 3}
+    headers = _bearer(run_id)
+    browser = client.post(f"/api/agent/runs/{run_id}/claim", json={"holder": "b", "engine": "browser"}, headers=headers).json()
+    assert browser["engine"] == "browser" and browser["slot"] == 3
+    assert browser["share"]["group_slot"] == 0 and browser["share"]["group_workers"] == 1
+    again = client.post(f"/api/agent/runs/{run_id}/claim", json={"holder": "b2", "engine": "browser"}, headers=headers)
+    assert again.status_code == 409 and "browser" in again.text
+    api = client.post(f"/api/agent/runs/{run_id}/claim", json={"holder": "a", "engine": "api"}, headers=headers).json()
+    assert api["engine"] == "api" and api["share"]["group_workers"] == 3
+    # Each group's scenario file carries only that engine's steps.
+    import yaml
+
+    browser_doc = yaml.safe_load(browser["scenario"]["files"]["scenario.yaml"])
+    assert [p["name"] for p in browser_doc["personas"]] == ["web"]
+    client.post(f"/api/runs/{run_id}/stop")
+
+
+def test_a_stop_before_any_claim_still_ends_the_run(client, splunkd, fake_driver):
+    run_id = _launch(client, splunkd, fake_driver, virtual_users=2, workers=2)
+    time.sleep(0.5)
+    assert client.post(f"/api/runs/{run_id}/stop").status_code == 200
+    run = _wait_terminal(client, run_id)
+    assert run["state"] == "stopped", run
+    assert run["fleet_state"] == "finished"
+    workers = client.get(f"/api/runs/{run_id}/workers").json()
+    assert [w["state"] for w in workers] == [LEASE_LOST, LEASE_LOST]
+    # The concurrency slot is free again and the token no longer opens the run.
+    assert client.post(f"/api/agent/runs/{run_id}/claim", json={"holder": "late"}, headers=_bearer(run_id)).status_code == 409
+    target = make_target(client, splunkd, name="second")
+    again = client.post("/api/runs", json={"target_id": target["id"], "scenario": "smoke", "fleet": "k8s", "duration_s": 5, "virtual_users": 1})
+    assert again.status_code == 201, again.text
+    client.post(f"/api/runs/{again.json()['id']}/stop")
+
+
+def test_a_lease_lost_while_warming_up_is_restored_by_ready_and_released(client, splunkd, fake_driver):
+    from sqlalchemy import select
+
+    from regulator_server import db
+    from regulator_server.models import WorkerLease
+
+    run_id = _launch(client, splunkd, fake_driver, virtual_users=1)
+    headers = _bearer(run_id)
+    time.sleep(0.5)
+    claimed = client.post(f"/api/agent/runs/{run_id}/claim", json={"holder": "slow"}, headers=headers)
+    assert claimed.status_code == 200, claimed.text
+    lease = claimed.json()
+    # The supervisor declared it lost (a warm-up longer than a lease).
+    with db.session_scope() as session:
+        row = session.scalar(select(WorkerLease).where(WorkerLease.run_id == run_id))
+        row.state = LEASE_LOST
+        session.add(row)
+    ready = client.post(f"/api/agent/runs/{run_id}/ready", json={"slot": lease["slot"], "lease_id": lease["lease_id"]}, headers=headers).json()
+    assert ready["t0"] is not None  # the only worker: released at once, and told so
+    beat = client.post(f"/api/agent/runs/{run_id}/heartbeat", json={"slot": lease["slot"], "lease_id": lease["lease_id"], "state": "ready"}, headers=headers).json()
+    assert beat["command"] == "release" and beat["t0"] == ready["t0"]
+    beat = client.post(f"/api/agent/runs/{run_id}/heartbeat", json={"slot": lease["slot"], "lease_id": lease["lease_id"], "state": "running"}, headers=headers).json()
+    assert beat["command"] == "continue"
+    assert client.get(f"/api/runs/{run_id}").json()["state"] == "running"
+    client.post(f"/api/runs/{run_id}/stop")
+
+
+def test_a_malformed_final_costs_only_its_own_slot(client, splunkd, fake_driver):
+    run_id = _launch(client, splunkd, fake_driver, virtual_users=2, workers=2)
+    headers = _bearer(run_id)
+    time.sleep(0.5)
+    claimed = client.post(f"/api/agent/runs/{run_id}/claim", json={"holder": "w-a"}, headers=headers)
+    assert claimed.status_code == 200, claimed.text
+    first = claimed.json()
+    second = client.post(f"/api/agent/runs/{run_id}/claim", json={"holder": "w-b"}, headers=headers).json()
+    good = _summary(first["slot"], [20.0, 30.0], 2)
+    bad = _summary(second["slot"], [20.0], 1)
+    bad["stats"]["histograms"]["latency"] = {"schema": 99, "sub_bits": 1, "buckets": {"x": "y"}}
+    for doc, summary in ((first, good), (second, bad)):
+        assert client.post(f"/api/agent/runs/{run_id}/final", json={"slot": doc["slot"], "lease_id": doc["lease_id"], "summary": summary}, headers=headers).status_code == 200
+    run = _wait_terminal(client, run_id)
+    assert run["state"] == "completed"
+    assert run["summary"]["valid"] is False
+    assert "unreadable" in run["summary"]["invalid_reason"]
+    assert run["summary"]["stats"]["executions"] == 2
+    workers = client.get(f"/api/runs/{run_id}/workers").json()
+    assert sorted(w["state"] for w in workers) == [LEASE_DONE, LEASE_LOST]
+    # And a token presented after the run finished opens nothing.
+    assert client.post(f"/api/agent/runs/{run_id}/heartbeat", json={"slot": 0, "lease_id": first["lease_id"], "state": "running"}, headers=headers).status_code == 409

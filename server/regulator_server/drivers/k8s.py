@@ -27,6 +27,9 @@ LABEL = "regulator.run"
 _RUNNING = frozenset({"Running"})
 TOKEN_ENV = "REG_RUN_JWT"
 TOKEN_KEY = "run-token"
+# The logs endpoint returns at most this much per group: a worker writes its
+# whole summary, histograms included, as one stdout line.
+_LOG_BYTES_CAP = 2 * 1024 * 1024
 
 
 def job_name(run_id: int, group: str) -> str:
@@ -112,7 +115,10 @@ class K8sDriver:
         token_secret = secret_name(group.run_id, group.group)
 
         env = dict(group.env)
-        token = env.pop(TOKEN_ENV, None)
+        token = group.secrets.get(TOKEN_ENV) or env.pop(TOKEN_ENV, None)
+        env.pop(TOKEN_ENV, None)
+        env["REG_SLOT_BASE"] = str(int(group.options.get("slot_base") or 0))
+        env["REG_WORKER_ENGINE"] = group.group
         if token:
             self._call(
                 self._core_api().create_namespaced_secret,
@@ -235,13 +241,16 @@ class K8sDriver:
 
     def destroy(self, ref: DriverRef) -> None:
         namespace = (ref.raw or {}).get("namespace") or self._namespace
+        # The secret goes whether or not the job is still there: a stop has
+        # usually deleted the job already, and the owner reference that would
+        # have collected the secret is best effort.
+        secret = (ref.raw or {}).get("secret")
+        if secret:
+            self._delete_secret_quietly(namespace, secret)
         try:
             self._call(self._batch_api().delete_namespaced_job, name=ref.id, namespace=namespace, propagation_policy="Foreground")
         except NotFound:
             return
-        secret = (ref.raw or {}).get("secret")
-        if secret:
-            self._delete_secret_quietly(namespace, secret)
         log.info("kubernetes: removed job %s", ref.id)
 
     def status(self, ref: DriverRef) -> DriverStatus:
@@ -269,25 +278,33 @@ class K8sDriver:
 
     def logs(self, ref: DriverRef, tail: int) -> str:
         namespace = (ref.raw or {}).get("namespace") or self._namespace
+        selector = f"{LABEL}={(ref.raw or {}).get('run_id')},regulator.group={ref.group}"
         try:
             pods = self._call(
-                self._core_api().list_namespaced_pod, namespace=namespace, label_selector=f"{LABEL}={(ref.raw or {}).get('run_id')}"
+                self._core_api().list_namespaced_pod, namespace=namespace, label_selector=selector, _request_timeout=20
             )
         except DriverError as exc:
             log.warning("kubernetes: logs for %s unavailable: %s", ref.id, exc)
             return ""
         chunks: List[str] = []
+        budget = _LOG_BYTES_CAP
         for pod in _items(pods):
             name = _get(pod, "metadata", "name")
-            if not name:
+            if not name or budget <= 0:
                 continue
             try:
                 text = self._call(
-                    self._core_api().read_namespaced_pod_log, name=name, namespace=namespace, tail_lines=tail if tail > 0 else None
+                    self._core_api().read_namespaced_pod_log,
+                    name=name,
+                    namespace=namespace,
+                    tail_lines=tail if tail > 0 else None,
+                    limit_bytes=budget,
+                    _request_timeout=20,
                 )
             except DriverError:
                 continue
             if text:
+                budget -= len(text)
                 chunks.append(f"--- {name}\n{text}")
         return "\n".join(chunks)
 

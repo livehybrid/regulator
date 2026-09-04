@@ -219,6 +219,8 @@ class Scheduler:
         self.engine = engine
         self.resolver = resolver
         self.stats = stats or RunStats(run_id=config.run_id, slot=config.slot)
+        if config.cold_window_s:
+            self.stats.cold_window_s = float(config.cold_window_s)
         self.emitters: List[Any] = list(emitters or [])
         self.capabilities = capabilities
         # One seed for every draw in the run: parameters, persona assignment,
@@ -529,7 +531,10 @@ class Scheduler:
             vu_id += 1
             iteration += 1
             if self.load.arrivals == "poisson":
-                gap = rng_for(self.seed, "arrival", iteration).expovariate(1.0 / mean_interval)
+                # Keyed on the slot as well: N workers sharing one seed and
+                # one T0 would otherwise fire their k-th arrivals together,
+                # which is a burst schedule, not the Poisson stream asked for.
+                gap = rng_for(self.seed, "arrival", self.config.slot, iteration).expovariate(1.0 / mean_interval)
             else:
                 gap = mean_interval
             next_arrival += gap
@@ -568,10 +573,12 @@ class Scheduler:
         due = self._t0_monotonic + first_minute_in
         steps = [step for persona in self.scenario.personas for step in persona.steps if step.cron]
         # In a fleet each cron fires exactly once across the workers: the
-        # scheduled steps are dealt out by slot.
-        total = max(1, int(self.config.total_workers))
+        # scheduled steps are dealt out by slot within this worker's group,
+        # because a mixed run's groups carry different step lists.
+        total = max(1, int(self.config.group_workers or self.config.total_workers))
+        mine = int(self.config.group_slot if self.config.group_slot is not None else self.config.slot)
         if total > 1:
-            steps = [step for index, step in enumerate(steps) if index % total == self.config.slot % total]
+            steps = [step for index, step in enumerate(steps) if index % total == mine % total]
         persona_of = {
             step.id: persona for persona in self.scenario.personas for step in persona.steps
         }

@@ -15,7 +15,7 @@ from __future__ import annotations
 import time
 from typing import Any, Dict, List, Optional
 
-from sqlalchemy import JSON, Boolean, Float, ForeignKey, Integer, String, Text
+from sqlalchemy import JSON, Boolean, Float, ForeignKey, Index, Integer, String, Text
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 
 
@@ -92,6 +92,10 @@ class Run(Base):
     pacing_s: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
     evict_cache: Mapped[bool] = mapped_column(Boolean, default=False)
     evict_cache_indexes: Mapped[Optional[str]] = mapped_column(String(512), nullable=True)
+    # Periodic eviction during the run (seconds between evictions, same scope
+    # as evict_cache_indexes) and how long after each one counts as cold.
+    evict_every_s: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    cold_window_s: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
 
     created_at: Mapped[float] = mapped_column(Float, default=time.time)
     started_at: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
@@ -158,6 +162,85 @@ class WorkerLease(Base):
     log_tail_json: Mapped[Optional[List[str]]] = mapped_column(JSON, nullable=True)
 
     run: Mapped[Run] = relationship(back_populates="leases")
+
+
+class RunSample(Base):
+    """One point of a run's time series, every few seconds.
+
+    The aggregate row has no slot; a fleet run also keeps one row per slot
+    from the workers' heartbeats. ``interval_json`` is what happened since the
+    previous sample (counts and percentiles over that window alone), and
+    ``cum_json`` the cumulative figures at that instant, so a chart can show
+    both the honest moment and the number the gate reads.
+    """
+
+    __tablename__ = "run_samples"
+    __table_args__ = (Index("ix_run_samples_run_at", "run_id", "at"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    run_id: Mapped[int] = mapped_column(ForeignKey("runs.id", ondelete="CASCADE"))
+    slot: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    at: Mapped[float] = mapped_column(Float)
+    elapsed_s: Mapped[float] = mapped_column(Float, default=0.0)
+    executions: Mapped[int] = mapped_column(Integer, default=0)
+    errors: Mapped[int] = mapped_column(Integer, default=0)
+    in_flight: Mapped[int] = mapped_column(Integer, default=0)
+    searches_queued: Mapped[int] = mapped_column(Integer, default=0)
+    throughput_per_s: Mapped[float] = mapped_column(Float, default=0.0)
+    interval_json: Mapped[Optional[Dict[str, Any]]] = mapped_column(JSON, nullable=True)
+    cum_json: Mapped[Optional[Dict[str, Any]]] = mapped_column(JSON, nullable=True)
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "at": self.at,
+            "elapsed_s": self.elapsed_s,
+            "slot": self.slot,
+            "executions": self.executions,
+            "errors": self.errors,
+            "in_flight": self.in_flight,
+            "searches_queued": self.searches_queued,
+            "throughput_per_s": self.throughput_per_s,
+            "interval": self.interval_json or {},
+            "cum": self.cum_json or {},
+        }
+
+
+class TargetSample(Base):
+    """A SmartStore cache reading on a target, whenever one was taken.
+
+    Written around every run (before and after), by the Cache, Evict and
+    Report actions, and by a periodic eviction; the target page draws the
+    cache's history from these.
+    """
+
+    __tablename__ = "target_samples"
+    __table_args__ = (Index("ix_target_samples_target_at", "target_id", "at"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    target_id: Mapped[int] = mapped_column(ForeignKey("targets.id", ondelete="CASCADE"))
+    run_id: Mapped[Optional[int]] = mapped_column(ForeignKey("runs.id", ondelete="SET NULL"), nullable=True)
+    at: Mapped[float] = mapped_column(Float)
+    # before, after, evict, epoch, read
+    kind: Mapped[str] = mapped_column(String(16), default="read")
+    local_buckets: Mapped[int] = mapped_column(Integer, default=0)
+    total_buckets: Mapped[int] = mapped_column(Integer, default=0)
+    local_pct: Mapped[float] = mapped_column(Float, default=0.0)
+    fill_pct: Mapped[float] = mapped_column(Float, default=0.0)
+    local_bytes: Mapped[int] = mapped_column(Integer, default=0)
+    detail_json: Mapped[Optional[Dict[str, Any]]] = mapped_column(JSON, nullable=True)
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "at": self.at,
+            "run_id": self.run_id,
+            "kind": self.kind,
+            "local_buckets": self.local_buckets,
+            "total_buckets": self.total_buckets,
+            "local_pct": self.local_pct,
+            "fill_pct": self.fill_pct,
+            "local_bytes": self.local_bytes,
+            "detail": self.detail_json or {},
+        }
 
 
 LEASE_FREE = "free"

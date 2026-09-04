@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import threading
 from contextlib import contextmanager
 from typing import Iterator, Optional
 
@@ -69,9 +70,17 @@ def _add_missing_columns(engine: Engine) -> None:
                 )
 
 
+_init_lock = threading.Lock()
+
+
 def get_engine() -> Engine:
+    # Under a lock: a fleet supervisor thread and a request can both find the
+    # engine missing at the same instant, and two concurrent create_all calls
+    # on one SQLite file race each other into "table already exists".
     if _engine is None:
-        init_engine()
+        with _init_lock:
+            if _engine is None:
+                init_engine()
     assert _engine is not None
     return _engine
 

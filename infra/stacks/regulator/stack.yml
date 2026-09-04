@@ -42,6 +42,8 @@ services:
       - REG_HEC_TOKEN=${REG_HEC_TOKEN:-}
       - REG_HEC_INDEX=${REG_HEC_INDEX:-}
       - REG_HEC_VERIFY_TLS=${REG_HEC_VERIFY_TLS:-1}
+      # The time series behind the run page's charts and the regulator:sample events.
+      - REG_SAMPLE_INTERVAL_S=${REG_SAMPLE_INTERVAL_S:-5}
       # A target registered at boot, so a rebuilt stack is runnable at once.
       - REG_SEED_TARGET_NAME=${REG_SEED_TARGET_NAME:-}
       - REG_SEED_TARGET_URL=${REG_SEED_TARGET_URL:-}

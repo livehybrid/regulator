@@ -93,6 +93,11 @@ class StepRecord:
     # Timing, server half: taken from the job's own REST record.
     sid: Optional[str] = None
     run_duration_s: Optional[float] = None
+    # Which cache epoch this execution ran in (0 before any eviction) and how
+    # long after that epoch's eviction it started, so cold and warm can be
+    # told apart after the fact.
+    cache_epoch: int = 0
+    since_evict_s: Optional[float] = None
     scan_count: Optional[int] = None
     event_count: Optional[int] = None
     result_count: Optional[int] = None
@@ -201,11 +206,20 @@ class StepStats:
     run_duration_total_s: float = 0.0
     errors_by_class: Dict[str, int] = field(default_factory=dict)
     partial: int = 0
+    # When the run cycles its cache, the same step's latency inside the cold
+    # window after an eviction and outside it, kept apart: that split is the
+    # question a cold-versus-warm run is asked.
+    latency_cold: LatencyHistogram = field(default_factory=LatencyHistogram)
+    latency_warm: LatencyHistogram = field(default_factory=LatencyHistogram)
 
-    def add(self, record: StepRecord) -> None:
+    def add(self, record: StepRecord, phase: Optional[str] = None) -> None:
         self.executions += 1
         if record.partial:
             self.partial += 1
+        if record.ok and phase == "cold":
+            self.latency_cold.record_ms(record.latency_ms)
+        elif record.ok and phase == "warm":
+            self.latency_warm.record_ms(record.latency_ms)
         # Only successful executions feed the latency histograms.
         #
         # A search head at its admission ceiling refuses work in the time of one
@@ -257,6 +271,8 @@ class StepStats:
             "dispatch": self.dispatch.to_dict(),
             "ttfr": self.ttfr.to_dict(),
             "failure_latency": self.failure_latency.to_dict(),
+            "latency_cold": self.latency_cold.to_dict(),
+            "latency_warm": self.latency_warm.to_dict(),
         }
 
     def summary(self) -> Dict[str, Any]:
@@ -270,6 +286,8 @@ class StepStats:
             "error_rate_pct": round(100.0 * self.errors / self.executions, 3) if self.executions else 0.0,
             "errors_by_class": dict(self.errors_by_class),
             "latency": self.latency.summary(),
+            "cold": self.latency_cold.summary() if len(self.latency_cold) else None,
+            "warm": self.latency_warm.summary() if len(self.latency_warm) else None,
             "failure_latency": self.failure_latency.summary(),
             "service_time": self.service_time.summary(),
             "dispatch": self.dispatch.summary(),
@@ -343,13 +361,50 @@ class RunStats:
         # abandoned. Recorded as failures with the time they had accrued, and
         # counted here so the summary can say the tail is a floor.
         self.abandoned = 0
+        # The rolling interval behind the time series: everything since the
+        # last sample was taken. Cumulative percentiles hide a degradation
+        # twenty minutes into a run; these do not.
+        self.interval = IntervalStats()
+        # The cache epoch clock. Epoch 0 is before any eviction; every
+        # eviction during the run starts the next one at its instant, and
+        # records are stamped with the epoch and the seconds since it began.
+        self.epoch = 0
+        self.epoch_started_at: Optional[float] = None
+        self.cold_window_s: Optional[float] = None
+        self.epoch_latency: Dict[int, LatencyHistogram] = {}
+        self.epoch_executions: Dict[int, int] = {}
+
+    def set_epoch(self, epoch: int, started_at: float) -> None:
+        """An eviction happened (or was announced) at ``started_at``."""
+        if epoch <= self.epoch:
+            return
+        self.epoch = int(epoch)
+        self.epoch_started_at = float(started_at)
+
+    def take_interval(self, with_buckets: bool = False) -> Dict[str, Any]:
+        """The last interval's figures, then start a fresh one."""
+        document = self.interval.summary(with_buckets=with_buckets)
+        document["in_flight"] = self.in_flight
+        document["cache_epoch"] = self.epoch
+        self.interval.reset()
+        return document
 
     def record(self, record: StepRecord) -> None:
         stats = self.steps.get(record.step_id)
         if stats is None:
             stats = StepStats(step_id=record.step_id, step_class=record.step_class)
             self.steps[record.step_id] = stats
-        stats.add(record)
+        phase: Optional[str] = None
+        record.cache_epoch = self.epoch
+        if self.epoch > 0 and self.epoch_started_at is not None:
+            record.since_evict_s = round(max(0.0, (record.started_at or time.time()) - self.epoch_started_at), 3)
+            if self.cold_window_s:
+                phase = "cold" if record.since_evict_s <= self.cold_window_s else "warm"
+            if record.ok:
+                self.epoch_latency.setdefault(self.epoch, LatencyHistogram()).record_ms(record.latency_ms)
+            self.epoch_executions[self.epoch] = self.epoch_executions.get(self.epoch, 0) + 1
+        stats.add(record, phase)
+        self.interval.add(record)
 
         self.executions += 1
         if record.partial:
@@ -383,6 +438,7 @@ class RunStats:
         if lag_ms <= 0:
             return
         self.loop_lag.record_ms(lag_ms)
+        self.interval.loop_lag.record_ms(lag_ms)
         self.max_loop_lag_ms = max(self.max_loop_lag_ms, lag_ms)
 
     def enter(self) -> None:
@@ -409,7 +465,19 @@ class RunStats:
             "loop_lag": self.loop_lag.to_dict(),
             "drift": self.drift.to_dict(),
             "steps": {step_id: stats.histograms() for step_id, stats in self.steps.items()},
+            "epochs": {str(epoch): hist.to_dict() for epoch, hist in self.epoch_latency.items()},
         }
+
+    def epochs_summary(self) -> List[Dict[str, Any]]:
+        """Per cache epoch: how many executions and the latency percentiles."""
+        return [
+            {
+                "epoch": epoch,
+                "executions": self.epoch_executions.get(epoch, 0),
+                "latency": hist.summary(),
+            }
+            for epoch, hist in sorted(self.epoch_latency.items())
+        ]
 
     def snapshot(self, include_histograms: bool = False) -> Dict[str, Any]:
         document = self._snapshot()
@@ -462,7 +530,123 @@ class RunStats:
                 "max_drift_ms": round(self.max_drift_ms, 1),
             },
             "steps": [s.summary() for s in self.steps.values()],
+            "cache_epoch": self.epoch,
+            "epochs": self.epochs_summary(),
         }
+
+
+class IntervalStats:
+    """What happened since the last sample: counts and rolling histograms.
+
+    Reset on every take. The histograms are mergeable, so a fleet's workers
+    ship their interval buckets in heartbeats and the control plane computes
+    honest fleet-wide interval percentiles rather than averaging numbers.
+    """
+
+    def __init__(self) -> None:
+        self.reset()
+
+    def reset(self) -> None:
+        self.started_at = time.time()
+        self.executions = 0
+        self.errors = 0
+        self.queued = 0
+        self.job_executions = 0
+        self.scan_count = 0
+        self.errors_by_class: Dict[str, int] = {}
+        self.latency = LatencyHistogram()
+        self.failure_latency = LatencyHistogram()
+        self.queued_ms = LatencyHistogram()
+        self.loop_lag = LatencyHistogram()
+
+    def add(self, record: StepRecord) -> None:
+        self.executions += 1
+        if record.ok:
+            self.latency.record_ms(record.latency_ms)
+        else:
+            self.errors += 1
+            self.failure_latency.record_ms(record.service_time_ms)
+            cls = record.error_class or ERROR_CLIENT
+            self.errors_by_class[cls] = self.errors_by_class.get(cls, 0) + 1
+        if record.ok and record.sid and record.step_type == "search":
+            self.job_executions += 1
+        if record.queued_ms:
+            self.queued += 1
+            self.queued_ms.record_ms(record.queued_ms)
+        self.scan_count += int(getattr(record, "scan_count", 0) or 0)
+
+    def summary(self, with_buckets: bool = False) -> Dict[str, Any]:
+        seconds = max(0.0, time.time() - self.started_at)
+        document: Dict[str, Any] = {
+            "since": round(self.started_at, 3),
+            "seconds": round(seconds, 3),
+            "executions": self.executions,
+            "errors": self.errors,
+            "error_rate_pct": round(100.0 * self.errors / self.executions, 3) if self.executions else 0.0,
+            "errors_by_class": dict(self.errors_by_class),
+            "queued": self.queued,
+            "job_executions": self.job_executions,
+            "queued_pct": round(100.0 * self.queued / self.job_executions, 2) if self.job_executions else 0.0,
+            "scan_count": self.scan_count,
+            "throughput_per_s": round(self.executions / seconds, 3) if seconds > 0 else 0.0,
+            "p50_ms": self.latency.percentile_ms(50) if len(self.latency) else None,
+            "p95_ms": self.latency.percentile_ms(95) if len(self.latency) else None,
+            "p99_ms": self.latency.percentile_ms(99) if len(self.latency) else None,
+            "max_ms": self.latency.max_ms if len(self.latency) else None,
+            "queued_p95_ms": self.queued_ms.percentile_ms(95) if len(self.queued_ms) else None,
+            "loop_lag_p95_ms": self.loop_lag.percentile_ms(95) if len(self.loop_lag) else None,
+        }
+        if with_buckets:
+            document["buckets"] = {
+                "latency": self.latency.to_dict(),
+                "failure_latency": self.failure_latency.to_dict(),
+                "queued": self.queued_ms.to_dict(),
+                "loop_lag": self.loop_lag.to_dict(),
+            }
+        return document
+
+
+def merge_intervals(documents: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
+    """One interval from many workers' intervals, percentiles over merged buckets."""
+    from .histogram import merge_dicts
+
+    documents = [d for d in documents if isinstance(d, dict)]
+    counts = {key: sum(int(d.get(key) or 0) for d in documents) for key in ("executions", "errors", "queued", "job_executions", "scan_count", "in_flight")}
+    seconds = max((float(d.get("seconds") or 0) for d in documents), default=0.0)
+    by_class: Dict[str, int] = {}
+    for d in documents:
+        for key, value in (d.get("errors_by_class") or {}).items():
+            by_class[key] = by_class.get(key, 0) + int(value or 0)
+    buckets = [d.get("buckets") or {} for d in documents]
+    latency = merge_dicts([b.get("latency") for b in buckets if isinstance(b.get("latency"), dict)])
+    queued = merge_dicts([b.get("queued") for b in buckets if isinstance(b.get("queued"), dict)])
+    loop_lag = merge_dicts([b.get("loop_lag") for b in buckets if isinstance(b.get("loop_lag"), dict)])
+    have_buckets = any(isinstance(b.get("latency"), dict) for b in buckets)
+    out: Dict[str, Any] = {
+        "since": min((float(d.get("since") or 0) for d in documents if d.get("since")), default=time.time()),
+        "seconds": round(seconds, 3),
+        **counts,
+        "error_rate_pct": round(100.0 * counts["errors"] / counts["executions"], 3) if counts["executions"] else 0.0,
+        "errors_by_class": by_class,
+        "queued_pct": round(100.0 * counts["queued"] / counts["job_executions"], 2) if counts["job_executions"] else 0.0,
+        "throughput_per_s": round(counts["executions"] / seconds, 3) if seconds > 0 else 0.0,
+    }
+    if have_buckets:
+        out.update({
+            "p50_ms": latency.percentile_ms(50) if len(latency) else None,
+            "p95_ms": latency.percentile_ms(95) if len(latency) else None,
+            "p99_ms": latency.percentile_ms(99) if len(latency) else None,
+            "max_ms": latency.max_ms if len(latency) else None,
+            "queued_p95_ms": queued.percentile_ms(95) if len(queued) else None,
+            "loop_lag_p95_ms": loop_lag.percentile_ms(95) if len(loop_lag) else None,
+        })
+    else:
+        # Numbers only: the largest contributor's percentiles, labelled.
+        biggest = max(documents, key=lambda d: int(d.get("executions") or 0), default={})
+        for key in ("p50_ms", "p95_ms", "p99_ms", "max_ms", "queued_p95_ms", "loop_lag_p95_ms"):
+            out[key] = biggest.get(key)
+        out["percentiles_note"] = "busiest worker's"
+    return out
 
 
 @dataclass

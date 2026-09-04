@@ -87,3 +87,47 @@ def test_scenario_files_from_a_claim_can_never_escape_their_directory(tmp_path):
     directory = _materialise_scenario(claim, tmp_path)
     assert (directory / "evil.yaml").is_file()
     assert not (tmp_path.parent / "evil.yaml").exists()
+
+
+def test_the_token_may_come_from_a_mounted_file_and_the_slot_from_the_task_number(tmp_path):
+    token_file = tmp_path / "REG_RUN_JWT"
+    token_file.write_text("tok.en\n", encoding="utf-8")
+    boot = load_managed_boot({
+        "REG_RUN_ID": "7", "REG_CONTROL_URL": "http://cp:8080", "REG_RUN_JWT_FILE": str(token_file),
+        "REG_SWARM_TASK_SLOT": "3", "REG_SLOT_BASE": "4", "REG_WORKER_ENGINE": "browser",
+    })
+    assert boot is not None
+    assert boot.jwt == "tok.en"
+    assert boot.hint_slot == 6  # task 3 of a group whose first slot is 4
+    assert boot.engine == "browser"
+    boot = load_managed_boot({"REG_RUN_ID": "7", "REG_CONTROL_URL": "http://cp:8080", "REG_RUN_JWT": "x", "JOB_COMPLETION_INDEX": "2", "REG_SLOT_BASE": "10"})
+    assert boot is not None and boot.hint_slot == 12
+    boot = load_managed_boot({"REG_RUN_ID": "7", "REG_CONTROL_URL": "http://cp:8080", "REG_RUN_JWT": "x", "REG_HINT_SLOT": "5", "REG_SLOT_BASE": "10"})
+    assert boot is not None and boot.hint_slot == 5  # an explicit hint is absolute
+    with pytest.raises(ConfigError):
+        load_managed_boot({"REG_RUN_ID": "7", "REG_CONTROL_URL": "http://cp:8080", "REG_RUN_JWT_FILE": str(tmp_path / "missing")})
+
+
+def test_a_claim_carries_the_group_numbering(tmp_path, monkeypatch):
+    monkeypatch.setenv("REG_RUN_ID", "7")
+    monkeypatch.setenv("REG_CONTROL_URL", "http://cp:8080")
+    monkeypatch.setenv("REG_RUN_JWT", "tok.en")
+    boot = load_managed_boot()
+    claim = {
+        "slot": 5,
+        "lease_id": "abc",
+        "total_workers": 6,
+        "engine": "api",
+        "run_label": "r7",
+        "share": {"model": "closed", "virtual_users": 2, "group_slot": 1, "group_workers": 2},
+        "scenario": {
+            "name": "../../smoke",  # a hostile name is only ever a directory name
+            "files": {"scenario.yaml": (Path(__file__).resolve().parents[2] / "scenarios" / "smoke" / "scenario.yaml").read_text()},
+        },
+        "env": {"REG_TARGET_URL": "https://splunk.example:8089", "REG_TARGET_TOKEN": "t", "REG_VUS": "2", "REG_DURATION_S": "5"},
+    }
+    directory = _materialise_scenario(claim, tmp_path)
+    assert directory.parent == tmp_path and directory.name == "smoke"
+    config = _config_from_claim(boot, claim, directory)
+    assert config.slot == 5 and config.total_workers == 6
+    assert config.group_slot == 1 and config.group_workers == 2

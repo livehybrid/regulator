@@ -40,6 +40,7 @@ import yaml
 from sqlalchemy import select
 
 from regulator_agent.histogram import LatencyHistogram, merge_dicts
+from regulator_agent.results import merge_intervals
 from regulator_agent.scenario import Scenario, load_scenario
 from regulator_agent.smartstore import cache_state, delta as cache_delta, evict_all
 from regulator_agent.splunk import SplunkClient
@@ -62,6 +63,13 @@ from .models import (
     Target,
     WorkerLease,
 )
+from .samples import build_sample, cache_facts as _cache_facts, store_cache_sample, store_sample
+from .telemetry import telemetry
+
+
+def _target_name(session, run: Run) -> Optional[str]:
+    target = session.get(Target, run.target_id) if run.target_id else None
+    return target.name if target is not None else None
 
 log = logging.getLogger("regulator.server.fleet")
 
@@ -69,6 +77,9 @@ log = logging.getLogger("regulator.server.fleet")
 # last worker's next heartbeat to carry it, short enough not to matter.
 RELEASE_DELAY_S = 4.0
 SUPERVISE_TICK_S = 1.0
+# After a stop, how long the workers get to hear the command over their
+# heartbeats and report before the driver's SIGTERM is used as the fallback.
+DRAIN_GRACE_S = 60.0
 STATE_PROVISIONING = "provisioning"
 STATE_RELEASING = "releasing"
 STATE_RUNNING = "running"
@@ -122,11 +133,19 @@ def _sub_scenario_yaml(text: str, engine: str) -> str:
     personas = []
     for persona in document.get("personas") or []:
         steps = persona.get("steps") or []
-        engines = {str(step.get("engine", "api")).lower() for step in steps}
-        if persona.get("steps_from"):
-            engines.add("api")
-        if engine in engines or not engines:
-            personas.append(persona)
+        # Filter the steps, not the personas: a persona that mixes engines
+        # keeps its share of each, and neither group's copy fails lint for
+        # carrying the other engine's steps.
+        kept = [step for step in steps if str(step.get("engine", "api")).lower() == engine]
+        saved = bool(persona.get("steps_from")) and engine == "api"
+        if not kept and not saved and (steps or engine != "api"):
+            continue
+        copy = dict(persona)
+        if steps:
+            copy["steps"] = kept
+        elif not saved:
+            copy.pop("steps", None)
+        personas.append(copy)
     document["personas"] = personas
     document["engine"] = engine
     return yaml.safe_dump(document, sort_keys=False)
@@ -135,6 +154,21 @@ def _sub_scenario_yaml(text: str, engine: str) -> str:
 def _split_evenly(total: int, workers: int) -> List[int]:
     base, remainder = divmod(int(total), workers)
     return [base + (1 if index < remainder else 0) for index in range(workers)]
+
+
+def _deal(total: int, weights: Dict[str, float]) -> Dict[str, int]:
+    """Apportion an integer by weight so the shares add up to the total.
+
+    Largest remainder, so 7 users split evenly become 4 and 3 rather than
+    two independently rounded 4s.
+    """
+    weight_total = sum(weights.values()) or 1.0
+    raw = {key: total * weight / weight_total for key, weight in weights.items()}
+    shares = {key: int(math.floor(value)) for key, value in raw.items()}
+    remainder = int(total) - sum(shares.values())
+    for key in sorted(raw, key=lambda k: (raw[k] - shares[k], k), reverse=True)[: max(0, remainder)]:
+        shares[key] += 1
+    return shares
 
 
 def plan(run: Run, scenario: Scenario, directory: Path, settings: FleetSettings) -> List[GroupPlan]:
@@ -166,16 +200,28 @@ def plan(run: Run, scenario: Scenario, directory: Path, settings: FleetSettings)
 
     groups: List[GroupPlan] = []
     next_slot = 0
+    vus_by_engine = _deal(total_vus, weights) if len(engines) > 1 else {engines[0]: total_vus}
+    workers_by_engine = (
+        _deal(int(run.workers), weights) if run.workers and run.workers > 0 and len(engines) > 1 else {}
+    )
     for engine in engines:
         density = settings.browser_contexts_per_worker if engine == "browser" else settings.vus_per_worker
-        vus = total_vus if len(engines) == 1 else max(1, round(total_vus * weights[engine] / weight_total))
+        vus = max(1, int(vus_by_engine.get(engine, 0)))
         rate = total_rate if len(engines) == 1 else total_rate * weights[engine] / weight_total
         if run.workers and run.workers > 0:
-            workers = int(run.workers) if len(engines) == 1 else max(1, round(run.workers * weights[engine] / weight_total))
+            workers = int(run.workers) if len(engines) == 1 else max(1, int(workers_by_engine.get(engine, 1)))
         elif model == "closed":
             workers = max(1, math.ceil(vus / density))
+        elif model == "open":
+            # A worker honestly sustains about one arrival a second per unit
+            # of its density, the rule the in-process ceiling applies too.
+            workers = max(1, math.ceil(rate / (density * 60.0))) if rate else 1
         else:
             workers = 1
+        if model == "closed" and workers > vus:
+            # More workers than users would hand every worker one user and
+            # run more load than was configured.
+            workers = vus
         group = GroupPlan(
             engine=engine,
             image=settings.browser_worker_image if engine == "browser" else settings.worker_image,
@@ -187,7 +233,7 @@ def plan(run: Run, scenario: Scenario, directory: Path, settings: FleetSettings)
         )
         vu_shares = _split_evenly(vus, workers) if model == "closed" else [0] * workers
         for index in range(workers):
-            share: Dict[str, Any] = {"model": model, "engine": engine}
+            share: Dict[str, Any] = {"model": model, "engine": engine, "group_slot": index, "group_workers": workers}
             if model == "closed":
                 share["virtual_users"] = max(1, vu_shares[index])
             elif model == "open":
@@ -212,11 +258,12 @@ def public_base_url(settings: ServerConfig, fleet_kind: str) -> str:
     return "http://regulator:8080"
 
 
-def launch(run_id: int, driver: Optional[ExecutionDriver] = None) -> "FleetRun":
+def launch(run_id: int, driver: Optional[ExecutionDriver] = None, start: bool = True) -> "FleetRun":
     """Plan the run, seed its leases and start its supervisor thread.
 
     Raises :class:`FleetError` before anything is launched when the plan
-    cannot be made; a driver failure after that is recorded on the run.
+    cannot be made; a driver failure after that is recorded on the run. With
+    ``start=False`` the caller registers the supervisor first, then starts it.
     """
     settings = get_settings()
     with session_scope() as session:
@@ -256,7 +303,8 @@ def launch(run_id: int, driver: Optional[ExecutionDriver] = None) -> "FleetRun":
         run_number = run.id
 
     supervisor = FleetRun(run_number, groups, driver)
-    supervisor.start()
+    if start:
+        supervisor.start()
     return supervisor
 
 
@@ -308,6 +356,10 @@ def _claim_env(run: Run, target: Target, settings: ServerConfig, share: Dict[str
         env["REG_HEC_URL"] = hec.url
         env["REG_HEC_TOKEN"] = hec.token
         env["REG_HEC_VERIFY_TLS"] = "1" if hec.verify_tls else "0"
+        env["REG_HEC_SOURCE"] = hec.source
+        env["REG_HEC_SOURCETYPE_STEP"] = hec.sourcetype_step
+        env["REG_HEC_SOURCETYPE_RUN"] = hec.sourcetype_run
+        env["REG_HEC_GZIP"] = "1" if hec.gzip else "0"
         if hec.index:
             env["REG_HEC_INDEX"] = hec.index
     if share.get("model") == "closed" and share.get("virtual_users"):
@@ -320,12 +372,27 @@ def _claim_env(run: Run, target: Target, settings: ServerConfig, share: Dict[str
         env["REG_PACING_S"] = str(run.pacing_s)
     if run.seed:
         env["REG_SEED"] = str(run.seed)
+    if run.cold_window_s:
+        env["REG_COLD_WINDOW_S"] = str(run.cold_window_s)
     return env
 
 
-def claim(session, run: Run, holder: str, hint_slot: Optional[int], files_by_engine: Dict[str, Dict[str, str]]) -> Dict[str, Any]:
-    """Issue a lease. Fenced with a fresh lease id every time it changes hands."""
+def claim(
+    session,
+    run: Run,
+    holder: str,
+    hint_slot: Optional[int],
+    files_by_engine: Dict[str, Dict[str, str]],
+    engine: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Issue a lease. Fenced with a fresh lease id every time it changes hands.
+
+    The write is a conditional update on the lease's current state, so two
+    workers claiming at the same instant cannot both be told they hold the
+    same slot: the second update matches no row and moves on to the next.
+    """
     from fastapi import HTTPException
+    from sqlalchemy import update
 
     if run.fleet_state in (STATE_DRAINING, STATE_FINISHED) or run.state in ("completed", "stopped", "aborted", "failed"):
         raise HTTPException(status_code=409, detail="the run is not accepting claims")
@@ -336,24 +403,42 @@ def claim(session, run: Run, holder: str, hint_slot: Optional[int], files_by_eng
         if lease.holder == holder and lease.state in LIVE_LEASE_STATES:
             lease.last_heartbeat_at = time.time()
             return _claim_response(session, run, lease, files_by_engine)
-    claimable = [lease for lease in leases if lease.state in (LEASE_FREE, LEASE_LOST)]
+    claimable = [
+        lease for lease in leases
+        if lease.state in (LEASE_FREE, LEASE_LOST) and (engine is None or lease.engine == engine)
+    ]
     if not claimable:
-        raise HTTPException(status_code=409, detail="no free lease: every slot is held")
-    chosen = None
+        wanted = f" for the {engine} engine" if engine else ""
+        raise HTTPException(status_code=409, detail=f"no free lease{wanted}: every slot is held")
+    ordered = claimable
     if hint_slot is not None:
-        chosen = next((lease for lease in claimable if lease.slot == hint_slot), None)
-    if chosen is None:
-        chosen = claimable[0]
-    if chosen.state == LEASE_LOST:
-        chosen.restarts = (chosen.restarts or 0) + 1
-    chosen.lease_id = secrets.token_urlsafe(16)
-    chosen.holder = holder
-    chosen.state = LEASE_CLAIMED
-    chosen.claimed_at = time.time()
-    chosen.last_heartbeat_at = time.time()
-    session.add(chosen)
-    session.flush()
-    return _claim_response(session, run, chosen, files_by_engine)
+        ordered = [lease for lease in claimable if lease.slot == hint_slot] + [
+            lease for lease in claimable if lease.slot != hint_slot
+        ]
+    now = time.time()
+    for candidate in ordered:
+        lease_id = secrets.token_urlsafe(16)
+        result = session.execute(
+            update(WorkerLease)
+            .where(WorkerLease.id == candidate.id, WorkerLease.state.in_((LEASE_FREE, LEASE_LOST)))
+            .values(
+                lease_id=lease_id,
+                holder=holder,
+                state=LEASE_CLAIMED,
+                claimed_at=now,
+                last_heartbeat_at=now,
+                restarts=(candidate.restarts or 0) + (1 if candidate.state == LEASE_LOST else 0),
+            )
+        )
+        if result.rowcount == 1:
+            session.flush()
+            session.refresh(candidate)
+            telemetry.lifecycle(
+                "worker_claimed", run, _target_name(session, run),
+                slot=candidate.slot, worker=holder, engine=candidate.engine, restarts=candidate.restarts,
+            )
+            return _claim_response(session, run, candidate, files_by_engine)
+    raise HTTPException(status_code=409, detail="every free slot was taken by another claim; retry")
 
 
 def _claim_response(session, run: Run, lease: WorkerLease, files_by_engine: Dict[str, Dict[str, str]]) -> Dict[str, Any]:
@@ -376,7 +461,13 @@ def _claim_response(session, run: Run, lease: WorkerLease, files_by_engine: Dict
     }
 
 
-def mark_ready(session, run: Run, slot: int, lease_id: Optional[str]) -> None:
+def mark_ready(session, run: Run, slot: int, lease_id: Optional[str]) -> Dict[str, Any]:
+    """The worker is warmed up. Returns T0 when the fleet is already released.
+
+    A lease that was marked lost while the worker warmed up is restored here:
+    the worker is evidently alive, and a late worker is better in the fleet
+    than stranded outside it.
+    """
     from fastapi import HTTPException
 
     lease = _find(session, run, slot)
@@ -384,11 +475,22 @@ def mark_ready(session, run: Run, slot: int, lease_id: Optional[str]) -> None:
         raise HTTPException(status_code=409, detail="lease is not the slot holder (superseded)")
     assert lease is not None
     lease.last_heartbeat_at = time.time()
-    if lease.state in (LEASE_CLAIMED, LEASE_READY):
+    if lease.state in (LEASE_CLAIMED, LEASE_READY, LEASE_LOST):
         lease.state = LEASE_READY
     session.add(lease)
     session.flush()
+    telemetry.lifecycle("worker_ready", run, _target_name(session, run), slot=lease.slot, worker=lease.holder)
     evaluate_release(session, run)
+    return {"t0": run.t0}
+
+
+def _release_delay() -> float:
+    """Long enough for the last ready worker's next heartbeat to carry T0."""
+    try:
+        heartbeat_s = float(get_settings().fleet.heartbeat_s)
+    except Exception:  # noqa: BLE001 - settings are always loadable in a server
+        heartbeat_s = 2.0
+    return max(RELEASE_DELAY_S, 2.5 * heartbeat_s)
 
 
 def evaluate_release(session, run: Run, force: bool = False) -> bool:
@@ -406,15 +508,36 @@ def evaluate_release(session, run: Run, force: bool = False) -> bool:
         for lease in pending:
             lease.state = LEASE_LOST
             session.add(lease)
-    run.t0 = time.time() + RELEASE_DELAY_S
+    delay = _release_delay()
+    run.t0 = time.time() + delay
     run.fleet_state = STATE_RELEASING
     session.add(run)
-    log.info("run %s released: T0 in %.0fs, %d worker(s) ready, %d lost", run.id, RELEASE_DELAY_S, len(ready), len(pending))
+    log.info("run %s released: T0 in %.0fs, %d worker(s) ready, %d lost", run.id, delay, len(ready), len(pending))
+    telemetry.lifecycle(
+        "run_released", run, _target_name(session, run),
+        t0=run.t0, ready=len(ready), lost=[lease.slot for lease in pending], forced=bool(force and pending),
+    )
     return True
+
+
+def _with_epoch(run: Run, reply: Dict[str, Any]) -> Dict[str, Any]:
+    """Every reply carries the run's current cache epoch, so a worker that
+    missed the beat in which it changed still catches up on the next."""
+    from .runner import manager
+
+    epochs = manager.epochs_for(run.id)
+    if epochs:
+        reply["epoch"] = epochs[-1]["epoch"]
+        reply["epoch_started_at"] = epochs[-1]["requested_at"]
+    return reply
 
 
 def heartbeat(session, run: Run, slot: int, lease_id: Optional[str], payload: Dict[str, Any]) -> Dict[str, Any]:
     """Renew the lease, keep its live statistics, and answer with a command."""
+    return _with_epoch(run, _heartbeat(session, run, slot, lease_id, payload))
+
+
+def _heartbeat(session, run: Run, slot: int, lease_id: Optional[str], payload: Dict[str, Any]) -> Dict[str, Any]:
     lease = _find(session, run, slot)
     if not _holder_ok(lease, lease_id):
         return {"command": "superseded"}
@@ -424,25 +547,45 @@ def heartbeat(session, run: Run, slot: int, lease_id: Optional[str], payload: Di
     stats = payload.get("stats")
     if isinstance(stats, dict):
         lease.stats_json = stats
+    interval = payload.get("interval")
+    if isinstance(interval, dict) and interval.get("executions") is not None:
+        # Handed to the supervisor, which merges every worker's interval into
+        # the run's next sample.
+        from .runner import manager
+
+        supervisor = manager.fleet_run(run.id)
+        if supervisor is not None:
+            supervisor.absorb(slot, interval)
     reported = str(payload.get("state") or "")
     if run.fleet_state == STATE_DRAINING or run.state in ("stopped", "aborted", "failed", "completed"):
         session.add(lease)
         return {"command": "stop"}
     if lease.state == LEASE_LOST:
-        lease.state = LEASE_RUNNING if run.t0 is not None else LEASE_READY
-    if run.t0 is not None and lease.state in (LEASE_CLAIMED, LEASE_READY):
-        if reported != "running":
-            # Not yet started: tell it T0 again. Repeating the release until
-            # the worker says it is running is what makes a heartbeat lost
-            # in transit harmless.
-            session.add(lease)
-            return {"command": "release", "t0": run.t0}
+        # It is evidently alive: a heartbeat lost in transit, or a warm-up
+        # longer than a lease. Put it back where its own report says it is.
+        lease.state = LEASE_READY if reported in ("ready", "running", "finishing") else LEASE_CLAIMED
+    if run.t0 is None:
+        if lease.state == LEASE_READY:
+            # A lease restored to ready through a heartbeat must be able to
+            # complete the fleet, not wait for the provisioning timeout.
+            evaluate_release(session, run)
+        session.add(lease)
+        return {"command": "continue"} if run.t0 is None else {"command": "release", "t0": run.t0}
+    if reported not in ("running", "finishing") and lease.state != LEASE_DONE:
+        # Not yet started: tell it T0 again. Repeating the release until the
+        # worker says it is running is what makes a heartbeat lost in
+        # transit harmless, whatever state the lease is in.
+        session.add(lease)
+        return {"command": "release", "t0": run.t0}
+    if lease.state in (LEASE_CLAIMED, LEASE_READY):
         lease.state = LEASE_RUNNING
-        if run.fleet_state == STATE_RELEASING:
-            run.fleet_state = STATE_RUNNING
-            run.state = "running"
-            run.started_at = run.started_at or run.t0
-            session.add(run)
+        telemetry.lifecycle("worker_running", run, _target_name(session, run), slot=lease.slot, worker=lease.holder)
+    if run.fleet_state == STATE_RELEASING and reported in ("running", "finishing"):
+        run.fleet_state = STATE_RUNNING
+        run.state = "running"
+        run.started_at = run.started_at or run.t0
+        session.add(run)
+        telemetry.lifecycle("run_started", run, _target_name(session, run), t0=run.t0, workers=run.workers)
     session.add(lease)
     return {"command": "continue"}
 
@@ -461,6 +604,13 @@ def final(session, run: Run, slot: int, lease_id: Optional[str], summary: Dict[s
         lease.state = LEASE_DONE
         lease.last_heartbeat_at = time.time()
         session.add(lease)
+        stats = summary.get("stats") if isinstance(summary, dict) else {}
+        telemetry.lifecycle(
+            "worker_done", run, _target_name(session, run), slot=slot, worker=lease.holder,
+            outcome=summary.get("outcome") if isinstance(summary, dict) else None,
+            valid=summary.get("valid") if isinstance(summary, dict) else None,
+            executions=(stats or {}).get("executions"), errors=(stats or {}).get("errors"),
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -470,6 +620,22 @@ def final(session, run: Run, slot: int, lease_id: Optional[str], summary: Dict[s
 
 def _hist(documents: Sequence[Optional[Dict[str, Any]]]) -> LatencyHistogram:
     return merge_dicts([doc for doc in documents if isinstance(doc, dict)])
+
+
+def summary_problem(summary: Any) -> Optional[str]:
+    """Why a worker's summary cannot be merged, or None when it can.
+
+    A worker on a different build can ship histograms this build cannot
+    read; a token holder can ship anything at all. One bad document must
+    cost its own slot, never every other worker's data.
+    """
+    if not isinstance(summary, dict):
+        return "the final report is not an object"
+    try:
+        merge_summaries("check", "", [summary], [])
+    except Exception as exc:  # noqa: BLE001 - any failure means "do not merge this one"
+        return f"unreadable final report: {str(exc)[:160]}"
+    return None
 
 
 def merge_summaries(run_label: str, scenario: str, summaries: Sequence[Dict[str, Any]], lost_slots: Sequence[int]) -> Dict[str, Any]:
@@ -524,10 +690,28 @@ def merge_summaries(run_label: str, scenario: str, summaries: Sequence[Dict[str,
             if mean_eps and step.get("scan_count_total"):
                 entry["_run_duration_total_s"] += float(step["scan_count_total"]) / float(mean_eps)
             step_hists.setdefault(sid, []).append((h.get("steps") or {}).get(sid) or {})
+    # Cache epochs, merged by epoch number across the workers.
+    epoch_hists: Dict[str, List[Dict[str, Any]]] = {}
+    epoch_execs: Dict[str, int] = {}
+    for st, h in zip(stats_list, hists):
+        for key, doc in (h.get("epochs") or {}).items():
+            epoch_hists.setdefault(str(key), []).append(doc)
+        for epoch in st.get("epochs") or []:
+            key = str(epoch.get("epoch"))
+            epoch_execs[key] = epoch_execs.get(key, 0) + int(epoch.get("executions") or 0)
+    epochs_out = [
+        {"epoch": int(key), "executions": epoch_execs.get(key, 0), "latency": _hist(docs).summary()}
+        for key, docs in sorted(epoch_hists.items(), key=lambda kv: int(kv[0]))
+    ]
+
     steps_out: List[Dict[str, Any]] = []
     for sid, entry in merged_steps.items():
         parts = step_hists.get(sid, [])
         entry["latency"] = _hist([p.get("latency") for p in parts]).summary()
+        cold = _hist([p.get("latency_cold") for p in parts])
+        warm = _hist([p.get("latency_warm") for p in parts])
+        entry["cold"] = cold.summary() if len(cold) else None
+        entry["warm"] = warm.summary() if len(warm) else None
         entry["failure_latency"] = _hist([p.get("failure_latency") for p in parts]).summary()
         entry["service_time"] = _hist([p.get("service_time") for p in parts]).summary()
         entry["dispatch"] = _hist([p.get("dispatch") for p in parts]).summary()
@@ -558,6 +742,7 @@ def merge_summaries(run_label: str, scenario: str, summaries: Sequence[Dict[str,
         "errors": errors,
         "error_rate_pct": round(100.0 * errors / executions, 3) if executions else 0.0,
         "errors_by_class": errors_by_class,
+        "epochs": epochs_out,
         "partial": total("partial"),
         "abandoned": total("abandoned"),
         "in_flight": 0,
@@ -724,6 +909,21 @@ class FleetRun(threading.Thread):
         self.refs: List[DriverRef] = []
         self.stop_requested = False
         self._stopped_driver = False
+        self._target_name: Optional[str] = None
+        # Interval documents from the workers' heartbeats, per slot, waiting
+        # for the next sample to merge them.
+        self._intervals: Dict[int, List[Dict[str, Any]]] = {}
+        self._interval_lock = threading.Lock()
+
+    def absorb(self, slot: int, interval: Dict[str, Any]) -> None:
+        """Keep a worker's interval until the next sample merges it."""
+        with self._interval_lock:
+            self._intervals.setdefault(int(slot), []).append(interval)
+
+    def _take_intervals(self) -> Dict[int, List[Dict[str, Any]]]:
+        with self._interval_lock:
+            pending, self._intervals = self._intervals, {}
+        return pending
 
     def request_stop(self) -> None:
         self.stop_requested = True
@@ -752,10 +952,13 @@ class FleetRun(threading.Thread):
         with session_scope() as session:
             run = session.get(Run, self.run_id)
             target = session.get(Target, run.target_id)
+            self._target_name = target.name
+            target_id = target.id
             cfg = target_config(target)
             where = indexer_settings(target)
             evict_indexes = (run.evict_cache_indexes or "").split(",") if run.evict_cache_indexes else []
             evict = bool(run.evict_cache)
+            run_evict_every = float(run.evict_every_s or 0)
             corpus_index = None
             duration = float(run.duration_s or 0)
             label = f"r{run.id}" + (f"-{run.label}" if run.label else "")
@@ -772,13 +975,25 @@ class FleetRun(threading.Thread):
         await client.start()
         eviction = None
         before = None
+        # A ramp-only scenario has no declared duration; the deadlines then
+        # cover the longest run this control plane allows rather than
+        # cutting a healthy fleet off after five minutes.
+        deadline_basis = duration or float(settings.max_run_duration_s)
         try:
             if evict:
                 indexes = None if "*" in evict_indexes else (evict_indexes or ([corpus_index] if corpus_index else None))
                 eviction = await evict_all(client, indexes=indexes, **where)
             before = await cache_state(client, **where)
+            with session_scope() as session:
+                run = session.get(Run, self.run_id)
+                store_cache_sample(session, target_id, self.run_id, "before", before.to_dict())
+            if eviction is not None:
+                telemetry.lifecycle("cache_evicted", run, self._target_name, **{k: v for k, v in eviction.to_dict().items() if k != "errors"})
+            telemetry.lifecycle("cache_before", run, self._target_name, **_cache_facts(before.to_dict()))
 
-            # Launch every group. The bootstrap is the same for all of them.
+            # Launch every group. The bootstrap is the same for all of them;
+            # the token rides as a secret the driver projects, never as
+            # environment.
             token = mint_run_token(self.run_id)
             base_url = public_base_url(settings, self.driver.kind if self.driver.kind != "fake" else "swarm")
             slot_base = 0
@@ -791,12 +1006,12 @@ class FleetRun(threading.Thread):
                     env={
                         "REG_RUN_ID": str(self.run_id),
                         "REG_CONTROL_URL": base_url,
-                        "REG_RUN_JWT": token,
                         "REG_LOG_LEVEL": "INFO",
                     },
+                    secrets={"REG_RUN_JWT": token},
                     labels={"regulator.scenario": self._scenario_name()},
                     stop_grace_s=90,
-                    options={"slot_base": slot_base, "active_deadline_s": int(duration + 600) if duration else None},
+                    options={"slot_base": slot_base, "active_deadline_s": int(deadline_basis + 600)},
                 )
                 slot_base += group.workers
                 try:
@@ -804,26 +1019,60 @@ class FleetRun(threading.Thread):
                 except DriverError as exc:
                     raise FleetError(f"could not launch the {group.engine} workers: {exc}") from exc
                 self.refs.append(ref)
-            with session_scope() as session:
-                run = session.get(Run, self.run_id)
-                run.driver_refs_json = [ref.to_json() for ref in self.refs]
-                session.add(run)
+                # Persisted as each group is created, so a control plane that
+                # dies between two groups leaves nothing the boot sweep
+                # cannot find.
+                with session_scope() as session:
+                    run = session.get(Run, self.run_id)
+                    run.driver_refs_json = [r.to_json() for r in self.refs]
+                    session.add(run)
 
-            await self._watch(settings, duration)
+            evictor: Optional[asyncio.Task[None]] = None
+            if run_evict_every:
+                periodic_indexes = None if "*" in evict_indexes else (evict_indexes or ([corpus_index] if corpus_index else None))
+                evictor = asyncio.create_task(self._evict_loop(client, where, periodic_indexes, run_evict_every, target_id))
+            try:
+                await self._watch(settings, deadline_basis)
+            finally:
+                if evictor is not None:
+                    evictor.cancel()
+                    try:
+                        await evictor
+                    except (asyncio.CancelledError, Exception):  # noqa: BLE001
+                        pass
 
             # Every slot is done or lost: merge, then the cluster's own view.
+            # A report this build cannot read costs its own slot only.
             with session_scope() as session:
                 run = session.get(Run, self.run_id)
                 leases = _leases(session, run)
-                summaries = [lease.summary_json for lease in leases if lease.state == LEASE_DONE and lease.summary_json]
-                lost = [lease.slot for lease in leases if lease.state == LEASE_LOST]
+                summaries = []
+                lost = []
+                lost_reasons: List[str] = []
+                for lease in leases:
+                    if lease.state == LEASE_DONE and lease.summary_json:
+                        problem = summary_problem(lease.summary_json)
+                        if problem is None:
+                            summaries.append(lease.summary_json)
+                            continue
+                        log.warning("run %s slot %s: %s", self.run_id, lease.slot, problem)
+                        lost_reasons.append(f"slot {lease.slot}: {problem}")
+                        lease.state = LEASE_LOST
+                        session.add(lease)
+                    if lease.state == LEASE_LOST:
+                        lost.append(lease.slot)
                 scenario_name = run.scenario
             merged = merge_summaries(label, scenario_name, summaries, lost)
+            if lost_reasons:
+                merged["invalid_reason"] = "; ".join(filter(None, [merged.get("invalid_reason"), *lost_reasons]))
             if before is not None and before.available:
                 after = await cache_state(client, **where)
                 merged["cache"] = {"before": before.to_dict(), "after": after.to_dict(), "delta": cache_delta(before, after).to_dict()}
                 if eviction is not None:
                     merged["cache"]["eviction"] = eviction.to_dict()
+                with session_scope() as session:
+                    store_cache_sample(session, target_id, self.run_id, "after", after.to_dict(), {"delta": merged["cache"]["delta"]})
+                telemetry.lifecycle("cache_after", run, self._target_name, **_cache_facts(after.to_dict()), delta=merged["cache"]["delta"])
             elif before is not None:
                 merged["cache"] = {"available": False, "reason": before.reason}
             if merged.get("started_at") and merged.get("ended_at") and summaries:
@@ -831,37 +1080,158 @@ class FleetRun(threading.Thread):
                     merged["sut"] = await correlate(client, merged["started_at"], merged["ended_at"], marker_prefix_for(label))
                 except Exception as exc:  # noqa: BLE001 - correlation never fails a run
                     log.warning("correlation failed for run %s: %s", self.run_id, exc)
+            from .runner import manager as _manager
+
+            epochs = _manager.epochs_for(self.run_id, forget=True)
+            if epochs:
+                merged["cache"] = {**(merged.get("cache") or {}), "epochs": epochs}
             with session_scope() as session:
                 run = session.get(Run, self.run_id)
                 run.summary_json = merged
                 run.stats_json = merged.get("stats")
-                run.state = merged["outcome"] if summaries else "failed"
-                if not summaries and not run.error:
+                if summaries:
+                    run.state = merged["outcome"]
+                else:
+                    # Nothing came back: a stop before any worker reported is
+                    # a stopped run, anything else is a failed one.
+                    run.state = "stopped" if self.stop_requested else "failed"
+                if not summaries and not run.error and not self.stop_requested:
                     run.error = merged.get("invalid_reason") or "no worker reported a result"
                 run.ended_at = time.time()
                 run.fleet_state = STATE_FINISHED
                 session.add(run)
+                final_state = run.state
+            if isinstance(merged.get("sut"), dict):
+                telemetry.lifecycle("correlation", run, self._target_name, findings=merged["sut"].get("findings"), probes=sorted((merged["sut"].get("probes") or {}).keys()))
+            stats = merged.get("stats") or {}
+            telemetry.lifecycle(
+                f"run_{final_state}", run, self._target_name, outcome=final_state, valid=merged.get("valid"),
+                invalid_reason=merged.get("invalid_reason"), executions=stats.get("executions"), errors=stats.get("errors"),
+                p95_ms=(stats.get("latency") or {}).get("p95_ms"), error_rate_pct=stats.get("error_rate_pct"),
+                workers=stats.get("workers"), lost=lost,
+            )
+            telemetry.run_final(run, merged, scope="fleet", target_name=self._target_name)
         finally:
             await client.close()
 
+    async def _evict_loop(self, client: SplunkClient, where: Dict[str, Any], indexes, every_s: float, target_id: int) -> None:
+        """The fleet's periodic eviction: the clock starts at T0, and every
+        eviction is an epoch every worker hears about on its next heartbeat."""
+        from .cachelock import evict_lock
+        from .runner import manager
+
+        t0: Optional[float] = None
+        try:
+            while t0 is None:
+                await asyncio.sleep(1.0)
+                with session_scope() as session:
+                    run = session.get(Run, self.run_id)
+                    t0 = run.t0 if run is not None else None
+                    if run is None or run.fleet_state in (STATE_DRAINING, STATE_FINISHED):
+                        return
+            due = t0 + every_s
+            while True:
+                await asyncio.sleep(max(0.2, due - time.time()))
+                started = time.time()
+                try:
+                    async with evict_lock(target_id):
+                        result = await asyncio.wait_for(evict_all(client, indexes=indexes, **where), timeout=min(every_s, 600.0))
+                    outcome = result.to_dict()
+                except asyncio.TimeoutError:
+                    outcome = {"attempted": 0, "evicted": 0, "confirmed": 0, "failed": 0, "bytes_evicted": 0, "status": "timeout"}
+                except Exception as exc:  # noqa: BLE001
+                    outcome = {"attempted": 0, "evicted": 0, "confirmed": 0, "failed": 0, "bytes_evicted": 0, "status": f"failed: {str(exc)[:120]}"}
+                duration = round(time.time() - started, 1)
+                epoch = manager.mark_cache_epoch(self.run_id, {**outcome, "duration_s": duration}, source="timer")
+                if epoch is not None and duration > every_s:
+                    epoch["note"] = f"the eviction took {duration}s, longer than the {every_s:.0f}s interval: epochs are irregular"
+                try:
+                    after = await cache_state(client, **where)
+                    with session_scope() as session:
+                        run = session.get(Run, self.run_id)
+                        store_cache_sample(session, target_id, self.run_id, "epoch", after.to_dict(), {"epoch": epoch})
+                    telemetry.lifecycle("cache_epoch", run, self._target_name, **(epoch or {}), **_cache_facts(after.to_dict()))
+                except Exception:  # noqa: BLE001
+                    log.debug("cache reading after the periodic eviction failed", exc_info=True)
+                due = max(time.time(), due + every_s)
+        except asyncio.CancelledError:
+            return
+
+    def _driver_notes(self) -> List[str]:
+        """What the driver itself says about the workers, for the operator."""
+        notes: List[str] = []
+        for ref in self.refs:
+            try:
+                status = self.driver.status(ref)
+            except DriverError as exc:
+                notes.append(f"{ref.group}: status unavailable ({exc})")
+                continue
+            notes.append(f"{ref.group}: {status.running} of {status.desired} running")
+            for task in status.tasks:
+                message = task.get("message") or task.get("state")
+                if message and str(message).lower() not in ("started", "running"):
+                    notes.append(f"{ref.group}: {message}")
+        return notes[:12]
+
     async def _watch(self, settings: ServerConfig, duration: float) -> None:
-        """Until every lease is done or lost."""
-        provision_deadline = time.time() + settings.fleet.provision_timeout_s
+        """Until every lease is done or lost.
+
+        Three clocks: a lease lapses when its heartbeats stop (a claimed
+        lease still warming up gets the provisioning window instead, because
+        an engine start and a validation can outlast a lease); the run is
+        released or given up at the provisioning deadline; and a wall-clock
+        ceiling that depends on nothing else, so no state, not even a stop
+        before the first claim, can leave this loop running for ever.
+        """
+        started = time.time()
+        provision_deadline = started + settings.fleet.provision_timeout_s
         lease_s = settings.fleet.lease_s
         hard_deadline: Optional[float] = None
+        ceiling = started + settings.fleet.provision_timeout_s + float(duration or settings.max_run_duration_s) + 600.0
+        drain_started: Optional[float] = None
+        last_persist = 0.0
+        sample_every = max(1.0, float(getattr(settings, "sample_interval_s", 5.0)))
+        last_sample = started
         while True:
             await asyncio.sleep(SUPERVISE_TICK_S)
+            shipped: List[Tuple[Dict[str, Any], Optional[int]]] = []
+            events: List[Tuple[str, Dict[str, Any]]] = []
             with session_scope() as session:
                 run = session.get(Run, self.run_id)
                 leases = _leases(session, run)
                 now = time.time()
+                draining = run.fleet_state == STATE_DRAINING
 
                 # A worker that stopped heartbeating loses its lease.
                 for lease in leases:
-                    if lease.state in LIVE_LEASE_STATES and lease.last_heartbeat_at and now - lease.last_heartbeat_at > lease_s:
-                        log.warning("run %s slot %s lost: no heartbeat for %.0fs", run.id, lease.slot, now - lease.last_heartbeat_at)
+                    if lease.state not in LIVE_LEASE_STATES or not lease.last_heartbeat_at:
+                        continue
+                    warming_up = lease.state == LEASE_CLAIMED and now <= provision_deadline and not draining
+                    allowance = max(lease_s, settings.fleet.provision_timeout_s) if warming_up else lease_s
+                    silent = now - lease.last_heartbeat_at
+                    if silent > allowance:
+                        log.warning("run %s slot %s lost: no heartbeat for %.0fs", run.id, lease.slot, silent)
                         lease.state = LEASE_LOST
                         session.add(lease)
+                        events.append(("worker_lost", {"slot": lease.slot, "worker": lease.holder, "silent_s": round(silent, 1)}))
+
+                # The time series: every worker's intervals since the last
+                # sample, merged (percentiles over merged buckets) into one
+                # aggregate row, plus a row per slot.
+                if now - last_sample >= sample_every:
+                    pending = self._take_intervals()
+                    if pending or any(lease.stats_json for lease in leases):
+                        aggregate = live_snapshot(run, leases)
+                        sample = build_sample(merge_intervals([d for docs in pending.values() for d in docs]), aggregate, now)
+                        store_sample(session, run.id, sample)
+                        shipped.append((sample, None))
+                        for lease in leases:
+                            docs = pending.get(lease.slot)
+                            if docs:
+                                slot_sample = build_sample(merge_intervals(docs), lease.stats_json or {}, now, slot=lease.slot)
+                                store_sample(session, run.id, slot_sample)
+                                shipped.append((slot_sample, lease.slot))
+                    last_sample = now
 
                 if run.t0 is None and run.fleet_state == STATE_PROVISIONING and now > provision_deadline:
                     if not evaluate_release(session, run, force=True):
@@ -869,23 +1239,61 @@ class FleetRun(threading.Thread):
                             if lease.state in (LEASE_FREE, LEASE_CLAIMED):
                                 lease.state = LEASE_LOST
                                 session.add(lease)
-                        run.error = "no worker became ready within the provisioning timeout"
+                                events.append(("worker_lost", {"slot": lease.slot, "worker": lease.holder, "reason": "provisioning timeout"}))
+                        notes = self._driver_notes()
+                        run.error = "no worker became ready within the provisioning timeout" + (
+                            ". The driver reports: " + "; ".join(notes) if notes else ""
+                        )
                         run.fleet_state = STATE_DRAINING
+                        draining = True
                         session.add(run)
 
+                if draining:
+                    drain_started = drain_started or now
+                    # Nobody will claim a free slot now; a claimed or ready
+                    # worker hears "stop" on its next heartbeat and reports.
+                    for lease in leases:
+                        if lease.state == LEASE_FREE:
+                            lease.state = LEASE_LOST
+                            session.add(lease)
+
                 if run.t0 is not None and hard_deadline is None:
-                    hard_deadline = run.t0 + (duration or 0) + 300.0
+                    hard_deadline = run.t0 + float(duration or settings.max_run_duration_s) + 300.0
+
+                # The live aggregate is persisted so a restart, or a page
+                # opened later, still has what the fleet reported so far.
+                if now - last_persist >= 5.0 and any(lease.stats_json for lease in leases):
+                    run.stats_json = live_snapshot(run, leases)
+                    session.add(run)
+                    last_persist = now
 
                 states = [lease.state for lease in leases]
-                if all(state in (LEASE_DONE, LEASE_LOST) for state in states):
-                    return
-                if hard_deadline is not None and now > hard_deadline:
+                finished = all(state in (LEASE_DONE, LEASE_LOST) for state in states)
+                timed_out = (hard_deadline is not None and now > hard_deadline) or now > ceiling
+                if timed_out and not finished:
                     for lease in leases:
                         if lease.state not in (LEASE_DONE,):
                             lease.state = LEASE_LOST
                             session.add(lease)
-                    return
-                if run.fleet_state == STATE_DRAINING and not self._stopped_driver:
+                            events.append(("worker_lost", {"slot": lease.slot, "worker": lease.holder, "reason": "deadline"}))
+                    if not run.error:
+                        run.error = "the run outlived its deadline; workers still running were declared lost"
+                        session.add(run)
+            # Outside the session: telemetry is fire and forget, and the run
+            # row's attributes survive the session's close.
+            for sample, slot in shipped:
+                telemetry.sample(run, sample, self._target_name, slot=slot)
+            for kind, detail in events:
+                telemetry.lifecycle(kind, run, self._target_name, **detail)
+            if finished or timed_out:
+                return
+            with session_scope() as session:
+                run = session.get(Run, self.run_id)
+                draining = run.fleet_state == STATE_DRAINING
+                # The driver's own stop (SIGTERM) is the fallback for a worker
+                # that never heard the command over its heartbeat. Workers
+                # that did hear it are reporting and exiting on their own.
+                if draining and not self._stopped_driver and drain_started and now - drain_started > DRAIN_GRACE_S:
                     self._stopped_driver = True
                     for ref in self.refs:
                         try:
@@ -910,19 +1318,35 @@ class FleetRun(threading.Thread):
             session.add(run)
 
     def _destroy_quietly(self) -> None:
+        remaining: List[DriverRef] = []
         for ref in self.refs:
             try:
                 self.driver.destroy(ref)
             except DriverError as exc:
                 log.warning("destroying %s failed: %s", ref.id, exc)
+                remaining.append(ref)
+        # A finished run holds no refs, so the boot sweep has nothing to do
+        # for it; only what could not be removed stays recorded.
+        with session_scope() as session:
+            run = session.get(Run, self.run_id)
+            if run is not None:
+                run.driver_refs_json = [r.to_json() for r in remaining] or None
+                session.add(run)
 
 
 def reconcile_fleets_at_boot() -> int:
-    """Destroy worker groups left behind by a control plane that died mid-run."""
+    """Destroy worker groups left behind by a control plane that died mid-run.
+
+    Only runs that were still in flight are swept: a finished run's refs are
+    cleared when it finishes, and sweeping history against a slow Portainer
+    at every boot is how a control plane fails its own readiness probe.
+    """
     settings = get_settings()
-    destroyed = 0
+    swept = 0
     with session_scope() as session:
-        rows = session.scalars(select(Run).where(Run.driver_refs_json.isnot(None))).all()
+        rows = session.scalars(
+            select(Run).where(Run.driver_refs_json.isnot(None), Run.state.in_(("pending", "running")))
+        ).all()
         for run in rows:
             refs = [DriverRef.from_json(doc) for doc in (run.driver_refs_json or [])]
             for ref in refs:
@@ -930,11 +1354,11 @@ def reconcile_fleets_at_boot() -> int:
                     continue
                 try:
                     get_driver(ref.kind, settings.fleet).destroy(ref)
-                    destroyed += 1
+                    swept += 1
                 except DriverError as exc:
                     log.warning("could not destroy stray %s %s: %s", ref.kind, ref.id, exc)
             run.driver_refs_json = None
             session.add(run)
-    if destroyed:
-        log.warning("destroyed %d worker group(s) left behind by the previous control plane", destroyed)
-    return destroyed
+    if swept:
+        log.warning("swept %d worker group(s) left behind by the previous control plane", swept)
+    return swept

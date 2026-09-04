@@ -28,6 +28,7 @@ from ..audit import record as audit_record
 from ..crypto import DecryptionError, encrypt
 from ..db import get_session
 from ..models import Run, Target
+from ..runner import manager
 from ..schemas import (
     EvictRequest,
     SavedSearchPreview,
@@ -194,10 +195,30 @@ async def report_target(target_id: int, session: Session = Depends(get_session))
 
 @router.get("/{target_id}/cache")
 async def target_cache(target_id: int, session: Session = Depends(get_session)) -> Dict[str, Any]:
+    from ..samples import store_cache_sample
+
     target = _get_target(session, target_id)
     extra = _cache_kwargs(target)
     state = await _with_client(target, lambda client: cache_state(client, **extra), ACTION_TIMEOUT_S)
-    return state.to_dict()
+    document = state.to_dict()
+    store_cache_sample(session, target.id, None, "read", document)
+    return document
+
+
+@router.get("/{target_id}/samples")
+def target_samples(target_id: int, since: Optional[float] = None, session: Session = Depends(get_session)) -> Dict[str, Any]:
+    """The cache's history on this target: every reading, with what took it."""
+    from ..samples import cache_samples_for
+
+    target = _get_target(session, target_id)
+    return {"target_id": target.id, "samples": cache_samples_for(session, target.id, since=since)}
+
+
+from ..cachelock import evict_lock  # noqa: E402 - one eviction at a time per target
+
+
+def _runs_in_flight(session: Session, target_id: int) -> List[int]:
+    return list(session.scalars(select(Run.id).where(Run.target_id == target_id, Run.state.in_(("pending", "running")))))
 
 
 @router.post("/{target_id}/evict")
@@ -209,10 +230,17 @@ async def evict_target_cache(
 ) -> Dict[str, Any]:
     """Drop cached buckets so the next searches read cold.
 
-    Requires either named indexes or an explicit all-indexes flag. There is no
-    undo beyond waiting for everything to re-download, and on a shared cluster
-    most of that cache belongs to other people's dashboards.
+    Requires either named indexes or an explicit all-indexes flag (the purge
+    button sends the flag). There is no undo beyond waiting for everything to
+    re-download, and on a shared cluster most of that cache belongs to other
+    people's dashboards. A run in flight on the target is told, so its next
+    epoch starts here rather than the eviction reading as churn.
     """
+    import time as _time
+
+    from ..samples import cache_facts, store_cache_sample
+    from ..telemetry import telemetry
+
     try:
         body.check()
     except ValueError as exc:
@@ -221,6 +249,11 @@ async def evict_target_cache(
     target = _get_target(session, target_id)
     indexes = body.indexes or None
     extra = _cache_kwargs(target)
+    lock = evict_lock(target.id)
+    if lock.locked():
+        raise HTTPException(status_code=409, detail="an eviction is already running on this target; wait for it")
+    in_flight = _runs_in_flight(session, target.id)
+    scope_text = ", ".join(indexes) if indexes else "every index"
 
     async def do_evict(client: SplunkClient):
         before = await cache_state(client, **extra)
@@ -229,6 +262,7 @@ async def evict_target_cache(
                 status_code=409,
                 detail=f"there is no SmartStore cache to evict: {before.reason}",
             )
+        started = _time.time()
         result = await evict_all(client, indexes=indexes, **extra)
         after = await cache_state(client, **extra)
         return {
@@ -236,21 +270,39 @@ async def evict_target_cache(
             "eviction": result.to_dict(),
             "before": before.to_dict(),
             "after": after.to_dict(),
+            "duration_s": round(_time.time() - started, 1),
+            "in_flight_runs": in_flight,
         }
 
-    log.warning(
-        "evicting the SmartStore cache on target %s (%s) for %s",
-        target.id,
-        target.name,
-        ", ".join(indexes) if indexes else "every index",
-    )
+    log.warning("evicting the SmartStore cache on target %s (%s) for %s", target.id, target.name, scope_text)
+    async with lock:
+        try:
+            outcome = await _with_client(target, do_evict, EVICT_TIMEOUT_S)
+        except HTTPException as exc:
+            audit_record("cache_evict_failed", request=request, target_id=target.id, detail=f"{target.name}: {scope_text}: {exc.detail}")
+            raise
+    eviction = outcome["eviction"]
+    # The audit row is written after the result, with the counts: an eviction
+    # that evicted nothing must not read as one that did.
     audit_record(
         "cache_evicted",
         request=request,
         target_id=target.id,
-        detail=f"{target.name}: {', '.join(indexes) if indexes else 'every index'}",
+        detail=(
+            f"{target.name}: {scope_text}: {eviction.get('confirmed', 0)} of {eviction.get('attempted', 0)} "
+            f"bucket(s) confirmed evicted, {eviction.get('bytes_evicted', 0)} bytes, {outcome['duration_s']}s"
+            + (f", during run(s) {', '.join(str(r) for r in in_flight)}" if in_flight else "")
+        ),
     )
-    return await _with_client(target, do_evict, EVICT_TIMEOUT_S)
+    store_cache_sample(session, target.id, in_flight[0] if in_flight else None, "evict", outcome["after"], {"eviction": eviction, "before": cache_facts(outcome["before"])})
+    telemetry.lifecycle(
+        "cache_evicted", None, target.name, target=target.name, scope=indexes or "all", in_flight_runs=in_flight,
+        **{k: v for k, v in eviction.items() if k != "errors"}, duration_s=outcome["duration_s"],
+    )
+    # A run in flight starts a new cache epoch here.
+    for run_id in in_flight:
+        manager.mark_cache_epoch(run_id, eviction)
+    return outcome
 
 
 # --------------------------------------------------------------- saved searches

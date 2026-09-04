@@ -147,6 +147,14 @@ def hec_config(settings: ServerConfig) -> Optional[HecConfig]:
         index=settings.hec.index,
         source=settings.hec.source,
         verify_tls=settings.hec.verify_tls,
+        sourcetype_step=settings.hec.sourcetype_step,
+        sourcetype_run=settings.hec.sourcetype_run,
+        sourcetype_sample=settings.hec.sourcetype_sample,
+        sourcetype_lifecycle=settings.hec.sourcetype_lifecycle,
+        sourcetype_health=settings.hec.sourcetype_health,
+        gzip=settings.hec.gzip,
+        batch_bytes=settings.hec.batch_bytes,
+        batch_ms=settings.hec.batch_ms,
     )
 
 
@@ -191,6 +199,7 @@ def worker_config(
     evict_cache_indexes: Optional[List[str]] = None,
     hec: Optional[HecConfig] = None,
     seed: Optional[int] = None,
+    cold_window_s: Optional[float] = None,
 ) -> Config:
     """Build the worker's own Config for an in-process run.
 
@@ -230,5 +239,6 @@ def worker_config(
         log_level="INFO",
         metrics_port=0,
         builtin_scenarios_dir=str(scenarios_dir()),
+        cold_window_s=cold_window_s,
         **indexer_settings(target),
     )

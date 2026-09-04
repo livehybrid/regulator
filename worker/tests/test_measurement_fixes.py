@@ -342,3 +342,26 @@ def test_partial_is_a_statement_about_the_results_not_the_box(message, expected)
     from regulator_agent.engines.api import _looks_partial
 
     assert _looks_partial([message]) is expected
+
+
+def test_fleet_slots_draw_different_arrival_streams(env):
+    # Two workers of one fleet share the seed and T0; if their arrival draws
+    # were the same stream the fleet would fire in lock-step bursts.
+    doc = copy.deepcopy(tiny_scenario_dict())
+    doc["load"] = {"model": "open", "arrival_rate_per_min": 3000, "duration": "0.5s"}
+    class Capture:
+        def __init__(self) -> None:
+            self.starts: list = []
+
+        def emit(self, record) -> None:
+            self.starts.append(record.intended_start)
+
+    offsets = []
+    for slot in ("0", "1"):
+        scenario, config, resolver = build(doc, env, REG_SLOT=slot, REG_TOTAL_WORKERS="2")
+        capture = Capture()
+        run_async(Scheduler(scenario=scenario, config=config, engine=FakeEngine(latency=0.001), resolver=resolver, emitters=[capture]).run())
+        starts = sorted(capture.starts)[:6]
+        offsets.append([round(value - starts[0], 4) for value in starts])
+    assert len(offsets[0]) > 3 and len(offsets[1]) > 3
+    assert offsets[0] != offsets[1]

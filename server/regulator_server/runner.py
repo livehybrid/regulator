@@ -74,6 +74,9 @@ class RunManager:
     def __init__(self) -> None:
         self._active: Dict[int, ActiveRun] = {}
         self._fleets: Dict[int, Any] = {}
+        # Cache epochs marked on runs in flight (an eviction from the button
+        # or a run's own timer), folded into the summary at the end.
+        self._epochs: Dict[int, List[Dict[str, Any]]] = {}
         self._lock = threading.Lock()
 
     # ------------------------------------------------------------------
@@ -93,6 +96,55 @@ class RunManager:
     def forget(self, run_id: int) -> None:
         with self._lock:
             self._fleets.pop(run_id, None)
+
+    def mark_cache_epoch(self, run_id: int, eviction: Optional[Dict[str, Any]] = None, source: str = "button") -> Optional[Dict[str, Any]]:
+        """An eviction happened while this run was in flight: a new cache epoch.
+
+        Recorded on the run (the charts draw it, the summary lists it) so a
+        purge mid-run is a marked instant rather than unexplained churn.
+        """
+        with self._lock:
+            if run_id not in self._active and run_id not in self._fleets:
+                return None
+            epochs = self._epochs.setdefault(run_id, [])
+            epoch = {
+                "epoch": len(epochs) + 1,
+                "requested_at": time.time(),
+                "source": source,
+                **{k: v for k, v in (eviction or {}).items() if k in ("attempted", "evicted", "confirmed", "failed", "bytes_evicted", "duration_s")},
+            }
+            epochs.append(epoch)
+            entry = self._active.get(run_id)
+        if entry is not None and getattr(entry, "stats", None) is not None:
+            set_epoch = getattr(entry.stats, "set_epoch", None)
+            if set_epoch is not None:
+                set_epoch(epoch["epoch"], epoch["requested_at"])
+        return epoch
+
+    def epochs_for(self, run_id: int, forget: bool = False) -> List[Dict[str, Any]]:
+        with self._lock:
+            epochs = list(self._epochs.get(run_id) or [])
+            if forget:
+                self._epochs.pop(run_id, None)
+        return epochs
+
+    def drain_fleets(self, timeout_s: float = 15.0) -> int:
+        """Stop every fleet supervisor and wait for its thread. Returns how many.
+
+        A shutdown seam (and a test seam): a supervisor thread that outlives
+        the process's database engine would otherwise race the next one.
+        """
+        with self._lock:
+            supervisors = list(self._fleets.values())
+        for supervisor in supervisors:
+            try:
+                supervisor.request_stop()
+            except Exception:  # noqa: BLE001 - draining is best effort
+                log.warning("stop request during drain failed", exc_info=True)
+        deadline = time.time() + timeout_s
+        for supervisor in supervisors:
+            supervisor.join(timeout=max(0.0, deadline - time.time()))
+        return len(supervisors)
 
     def live_stats(self, run_id: int) -> Optional[Dict[str, Any]]:
         with self._lock:
@@ -153,33 +205,39 @@ class RunManager:
             # it.
             engines = {step.engine for step in scenario.steps}
             vus = run.virtual_users or scenario.load.virtual_users
-            if run.arrival_rate_per_min:
-                if run.arrival_rate_per_min > settings.max_virtual_users * 60:
+            fleet_kind = run.fleet or "inprocess"
+            # The ceiling is the in-process generator's, and only its. A fleet
+            # exists to go past it; the per-worker share is what bounds a
+            # fleet, and the planner sizes that from REG_VUS_PER_WORKER.
+            if fleet_kind == "inprocess":
+                if run.arrival_rate_per_min:
+                    if run.arrival_rate_per_min > settings.max_virtual_users * 60:
+                        raise RunRejected(
+                            f"an arrival rate of {run.arrival_rate_per_min:.0f}/min exceeds what "
+                            f"this control plane's ceiling of {settings.max_virtual_users} in-flight "
+                            "searches can honestly generate. Launch it on a fleet"
+                        )
+                elif vus > settings.max_virtual_users:
                     raise RunRejected(
-                        f"an arrival rate of {run.arrival_rate_per_min:.0f}/min exceeds what "
-                        f"this control plane's ceiling of {settings.max_virtual_users} in-flight "
-                        "searches can honestly generate"
+                        f"{vus} virtual users exceeds this control plane's ceiling of "
+                        f"{settings.max_virtual_users}. It generates the load in its own "
+                        "process, so beyond that it becomes the bottleneck and the result "
+                        "would describe the server rather than Splunk. Launch it on a fleet"
                     )
-            elif vus > settings.max_virtual_users:
-                raise RunRejected(
-                    f"{vus} virtual users exceeds this control plane's ceiling of "
-                    f"{settings.max_virtual_users}. It generates the load in its own "
-                    "process, so beyond that it becomes the bottleneck and the result "
-                    "would describe the server rather than Splunk"
-                )
+                if len(engines) > 1:
+                    raise RunRejected(
+                        "the scenario mixes the api and browser engines, which needs the "
+                        "worker fleet: launch it on one, or split it into an api scenario "
+                        "and a browser scenario"
+                    )
             duration = run.duration_s or scenario.load.duration_s or 0.0
             if duration > settings.max_run_duration_s:
                 raise RunRejected(
                     f"a duration of {duration:.0f}s exceeds this control plane's maximum of "
                     f"{settings.max_run_duration_s:.0f}s (REG_MAX_RUN_DURATION_S)"
                 )
-            if len(engines) > 1:
-                raise RunRejected(
-                    "the scenario mixes the api and browser engines, which needs the "
-                    "worker fleet. Split it into an api scenario and a browser scenario"
-                )
-            engine_name = next(iter(engines)) if engines else "api"
-            if engine_name == "browser" and not target.web_url:
+            engine_name = "browser" if engines == {"browser"} else "api"
+            if "browser" in engines and not target.web_url:
                 raise RunRejected(
                     "a browser scenario needs the target's Web URL (Splunk Web, normally "
                     "port 8000): edit the target and add it"
@@ -204,7 +262,6 @@ class RunManager:
                 marker_run_id += "-" + sanitise_marker_part(run.label)[:40]
 
             digest = scenario_digest(scenario)
-            fleet_kind = run.fleet or "inprocess"
             if fleet_kind != "inprocess":
                 run.scenario_digest = digest
                 session.add(run)
@@ -225,6 +282,7 @@ class RunManager:
                 else [],
                 hec=hec_config(settings),
                 seed=run.seed,
+                cold_window_s=run.cold_window_s,
             )
             run.state = "pending"
             run.scenario_digest = digest
@@ -261,11 +319,15 @@ class RunManager:
                     f"{settings.max_concurrent_runs} run(s) already in flight"
                 )
         try:
-            supervisor = fleet_module.launch(run_id)
+            supervisor = fleet_module.launch(run_id, start=False)
         except (fleet_module.FleetError, DriverError, FileNotFoundError) as exc:
             raise RunRejected(str(exc)) from exc
+        # Registered before it starts: a supervisor that fails fast calls
+        # forget() from its own thread, and a registration after that would
+        # leave a ghost entry holding a concurrency slot for the process life.
         with self._lock:
             self._fleets[run_id] = supervisor
+        supervisor.start()
 
     def reconcile_at_boot(self) -> int:
         """Mark runs that were in flight when the previous process died.
@@ -358,6 +420,10 @@ class RunManager:
                 eviction = await evict_all(engine.client, indexes=indexes, **where)
 
             before = await cache_state(engine.client, **where)
+            if eviction is not None:
+                self._lifecycle(run_id, "cache_evicted", **{k: v for k, v in eviction.to_dict().items() if k != "errors"})
+            self._cache_sample(run_id, "before", before.to_dict())
+            self._lifecycle(run_id, "cache_before", **_cache_facts(before.to_dict()))
 
             scheduler = Scheduler(
                 scenario=scenario,
@@ -381,10 +447,30 @@ class RunManager:
             scheduler.emitters = emitters
 
             publisher = asyncio.create_task(self._publish_loop(run_id, entry))
-            summary = await scheduler.run()
+            evictor: Optional[asyncio.Task[None]] = None
+            with session_scope() as session:
+                row = session.get(Run, run_id)
+                every = float(row.evict_every_s or 0) if row is not None else 0.0
+                scope = (row.evict_cache_indexes or "") if row is not None else ""
+                target_id = row.target_id if row is not None else None
+            if every > 0:
+                periodic_indexes = None if "*" in scope else ([i for i in scope.split(",") if i] or indexes)
+                evictor = asyncio.create_task(self._evict_loop(run_id, engine.client, where, periodic_indexes, every, target_id))
+            try:
+                summary = await scheduler.run()
+            finally:
+                if evictor is not None:
+                    evictor.cancel()
+                    try:
+                        await evictor
+                    except (asyncio.CancelledError, Exception):  # noqa: BLE001
+                        pass
             summary.scenario_digest = scenario_digest(scenario)
 
             summary.cache = await self._cache_provenance(engine.client, before, eviction, where)
+            if isinstance(summary.cache, dict) and summary.cache.get("after"):
+                self._cache_sample(run_id, "after", summary.cache["after"], {"delta": summary.cache.get("delta")})
+                self._lifecycle(run_id, "cache_after", **_cache_facts(summary.cache["after"]), delta=summary.cache.get("delta"))
             if summary.started_at and summary.ended_at:
                 summary.sut = await correlate(
                     engine.client,
@@ -392,6 +478,8 @@ class RunManager:
                     summary.ended_at,
                     marker_prefix_for(config.run_id),
                 )
+                if isinstance(summary.sut, dict):
+                    self._lifecycle(run_id, "correlation", findings=summary.sut.get("findings"), probes=sorted((summary.sut.get("probes") or {}).keys()))
 
             payload = summary.to_dict()
             if hec is not None:
@@ -435,8 +523,57 @@ class RunManager:
             payload["eviction"] = eviction.to_dict()
         return payload
 
+    async def _evict_loop(self, run_id: int, client, where: Dict[str, Any], indexes, every_s: float, target_id: Optional[int]) -> None:
+        """Evict on a clock during the run: each eviction starts a cache epoch.
+
+        Never overlapping: the next eviction is due ``every_s`` after the last
+        one was due, and one that takes longer than the interval pushes the
+        clock rather than stacking. The per-target lock keeps it clear of the
+        Purge button and of another run on the same target.
+        """
+        from .cachelock import evict_lock
+        from .samples import store_cache_sample
+
+        due = time.time() + every_s
+        try:
+            while True:
+                await asyncio.sleep(max(0.2, due - time.time()))
+                started = time.time()
+                try:
+                    async with evict_lock(target_id or 0):
+                        result = await asyncio.wait_for(evict_all(client, indexes=indexes, **where), timeout=min(every_s, 600.0))
+                    outcome = result.to_dict()
+                except asyncio.TimeoutError:
+                    outcome = {"attempted": 0, "evicted": 0, "confirmed": 0, "failed": 0, "bytes_evicted": 0, "status": "timeout"}
+                except Exception as exc:  # noqa: BLE001 - an eviction failure is noted, never fatal
+                    outcome = {"attempted": 0, "evicted": 0, "confirmed": 0, "failed": 0, "bytes_evicted": 0, "status": f"failed: {str(exc)[:120]}"}
+                duration = round(time.time() - started, 1)
+                epoch = self.mark_cache_epoch(run_id, {**outcome, "duration_s": duration}, source="timer")
+                if epoch is not None and duration > every_s:
+                    epoch["note"] = f"the eviction took {duration}s, longer than the {every_s:.0f}s interval: epochs are irregular"
+                try:
+                    after = await cache_state(client, **where)
+                    with session_scope() as session:
+                        store_cache_sample(session, target_id, run_id, "epoch", after.to_dict(), {"epoch": epoch})
+                    self._lifecycle(run_id, "cache_epoch", **(epoch or {}), **_cache_facts(after.to_dict()))
+                except Exception:  # noqa: BLE001
+                    log.debug("cache reading after the periodic eviction failed", exc_info=True)
+                due = max(time.time(), due + every_s)
+        except asyncio.CancelledError:
+            return
+
     async def _publish_loop(self, run_id: int, entry: ActiveRun) -> None:
-        """Write the live aggregate back so the UI has something to poll."""
+        """Write the live aggregate back so the UI has something to poll.
+
+        Every few seconds it also takes a sample: the interval since the last
+        one plus the cumulative figures, stored for the graphs and shipped
+        over HEC as one regulator:sample event.
+        """
+        from .samples import build_sample, store_sample
+        from .telemetry import telemetry
+
+        sample_every = max(1.0, float(getattr(get_settings(), "sample_interval_s", 5.0)))
+        last_sample = time.time()
         try:
             while True:
                 await asyncio.sleep(PUBLISH_INTERVAL_S)
@@ -445,12 +582,23 @@ class RunManager:
                 snapshot = entry.stats.snapshot()
                 with self._lock:
                     entry.snapshot = snapshot
+                now = time.time()
+                sample = None
+                if now - last_sample >= sample_every:
+                    sample = build_sample(entry.stats.take_interval(), snapshot, now)
+                    last_sample = now
+                target_name = None
                 with session_scope() as session:
                     run = session.get(Run, run_id)
                     if run is None:
                         return
                     run.stats_json = snapshot
                     session.add(run)
+                    if sample is not None:
+                        store_sample(session, run_id, sample)
+                        target_name = run.target.name if run.target is not None else None
+                if sample is not None:
+                    telemetry.sample(run, sample, target_name)
         except asyncio.CancelledError:
             return
         except Exception:  # noqa: BLE001 - publishing must never kill the run
@@ -463,6 +611,9 @@ class RunManager:
     # ------------------------------------------------------------------
 
     def _set_state(self, run_id: int, state: str, started: bool = False) -> None:
+        from .telemetry import telemetry
+
+        target_name = None
         with session_scope() as session:
             run = session.get(Run, run_id)
             if run is None:
@@ -471,6 +622,35 @@ class RunManager:
             if started and run.started_at is None:
                 run.started_at = time.time()
             session.add(run)
+            target_name = run.target.name if run.target is not None else None
+        if started:
+            telemetry.lifecycle("run_started", run, target_name, virtual_users=run.virtual_users, duration_s=run.duration_s)
+
+    def _lifecycle(self, run_id: int, kind: str, **detail: Any) -> None:
+        """One lifecycle event about a run, with its join keys, best effort."""
+        from .telemetry import telemetry
+
+        try:
+            with session_scope() as session:
+                run = session.get(Run, run_id)
+                if run is None:
+                    return
+                target_name = run.target.name if run.target is not None else None
+            telemetry.lifecycle(kind, run, target_name, **detail)
+        except Exception:  # noqa: BLE001 - telemetry never fails a run
+            log.debug("lifecycle event %s for run %s not sent", kind, run_id, exc_info=True)
+
+    def _cache_sample(self, run_id: int, kind: str, state: Dict[str, Any], detail: Optional[Dict[str, Any]] = None) -> None:
+        from .samples import store_cache_sample
+
+        try:
+            with session_scope() as session:
+                run = session.get(Run, run_id)
+                if run is None:
+                    return
+                store_cache_sample(session, run.target_id, run_id, kind, state, detail)
+        except Exception:  # noqa: BLE001
+            log.debug("cache sample for run %s not stored", run_id, exc_info=True)
 
     def _finish(
         self,
@@ -480,19 +660,45 @@ class RunManager:
         stats: Optional[Dict[str, Any]] = None,
         error: Optional[str] = None,
     ) -> None:
+        from .telemetry import telemetry
+
+        target_name = None
         with session_scope() as session:
             run = session.get(Run, run_id)
             if run is None:
                 return
             run.state = state
             run.ended_at = time.time()
+            target_name = run.target.name if run.target is not None else None
+            epochs = self.epochs_for(run_id, forget=True)
             if summary is not None:
+                if epochs:
+                    cache = summary.get("cache") if isinstance(summary.get("cache"), dict) else {}
+                    summary["cache"] = {**cache, "epochs": epochs}
                 run.summary_json = summary
             if stats is not None:
                 run.stats_json = stats
             if error is not None:
                 run.error = error
             session.add(run)
+        headline = (stats or {}) if isinstance(stats, dict) else {}
+        telemetry.lifecycle(
+            f"run_{state}",
+            run,
+            target_name,
+            outcome=state,
+            valid=(summary or {}).get("valid") if isinstance(summary, dict) else None,
+            invalid_reason=(summary or {}).get("invalid_reason") if isinstance(summary, dict) else None,
+            executions=headline.get("executions"),
+            errors=headline.get("errors"),
+            p95_ms=(headline.get("latency") or {}).get("p95_ms"),
+            error_rate_pct=headline.get("error_rate_pct"),
+            error=error,
+        )
+        if isinstance(summary, dict):
+            telemetry.run_final(run, summary, scope="inprocess", target_name=target_name)
 
+
+from .samples import cache_facts as _cache_facts  # noqa: E402 - shared with the fleet supervisor
 
 manager = RunManager()

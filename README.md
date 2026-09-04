@@ -225,6 +225,15 @@ check everybody disables.
 
 ## The web interface
 
+The run page draws its charts from samples the control plane stores every few
+seconds, so a run opened after the fact has the same charts as one watched
+live: throughput and in flight against the target's ceiling, interval p50,
+p95 and p99 with the cumulative p95 dashed (the number a gate reads), error
+and queued share, per-worker throughput for a fleet, and generator loop lag
+for an in-process run, with T0, stops, lost workers and evictions marked. The
+runs list carries a p95 sparkline per run, and each target has a history page
+of every cache reading taken on it.
+
 ```bash
 pip install -r worker/requirements.txt -r server/requirements.txt
 REG_ADMIN_PASSWORD=choose-one PYTHONPATH=worker:server \
@@ -468,11 +477,27 @@ deployment disposable and a CI job a single `docker run`.
 | `REG_HEC_VERIFY_TLS` | `1` | Set `0` for a self-signed collector, which is the normal case for an on-premises indexer or an in-cluster service name. **Worth knowing:** this module swallows its own errors by design, so without this flag telemetry against a self-signed endpoint disappears into TLS failures the run never mentions |
 | `REG_HEC_INDEX` | the token's default | Omitted from the envelope when unset, because sending an explicit null is a 400 |
 | `REG_HEC_SOURCE` | `regulator` | |
-| `REG_HEC_SOURCETYPE_STEP` / `_RUN` | `regulator:step` / `regulator:run` | |
+| `REG_HEC_SOURCETYPE_STEP` / `_RUN` / `_SAMPLE` / `_LIFECYCLE` / `_HEALTH` | `regulator:step` and so on | |
 | `REG_HEC_GZIP` | `1` | |
 | `REG_HEC_BATCH_BYTES` / `REG_HEC_BATCH_MS` | `524288` / `200` | Flush thresholds. Batching keeps the telemetry round trip off the hot path entirely, so it never lands in the latency being measured |
+| `REG_SAMPLE_INTERVAL_S` | `5` | Control plane only: how often a run's time series takes a sample |
 | `REG_OUTPUT` | stdout | NDJSON step records |
 | `REG_SUMMARY_PATH` | | Where to write the run summary as JSON |
+
+**Two halves ship.** Workers ship a `regulator:step` record per execution and
+their own `regulator:run` summary. The control plane ships everything it knows
+and they do not: `regulator:sample` every few seconds (throughput, in flight,
+interval and cumulative percentiles, one row for the run and one per worker
+slot of a fleet), `regulator:lifecycle` as things happen (`run_created`,
+`run_started`, `run_released`, `run_completed`, `worker_claimed`,
+`worker_ready`, `worker_lost`, `worker_done`, `cache_before`, `cache_after`,
+`cache_evicted`, `cache_epoch`, `correlation`), the merged fleet summary as
+`regulator:run` with `scope: fleet`, and a `regulator:health` heartbeat every
+minute. Every event carries `run_no`, `run_label`, `scenario`, `target`,
+`fleet` and `slot` as indexed fields. The same samples drive the charts on the
+run page, so the chart in the browser and the chart in Splunk are one series.
+`splunk-app/regulator_telemetry` is the Splunk app for it: field extractions
+for the five sourcetypes and a **Regulator runs** dashboard.
 
 Telemetry is **off by default and separately addressed** on purpose: writing
 results into the cluster you are measuring adds load to it. When the telemetry
@@ -497,6 +522,26 @@ questions.
 
 **Evict before a run.** `REG_EVICT_CACHE=1` drops the cache, then runs. Use it
 when the question is "how does this workload behave against unlocalised data".
+
+**Purge at any time.** The Purge button (on a target, and on a running run's
+page) evicts every cached bucket on every indexer of the target after one
+typed confirmation, and records the counts in the audit trail. A run in flight
+on that target is told: the eviction becomes a **cache epoch** on the run, a
+marked instant on its charts rather than unexplained churn in its provenance.
+
+**Evict on a clock.** A run launched with `evict_every_s` evicts again every N
+seconds for its whole duration (same index scope as the eviction before it),
+so one run measures the cold path repeatedly. Each eviction is an epoch: every
+record carries `cache_epoch` and `since_evict_s`, executions within
+`cold_window_s` of an eviction (default half the interval) are that epoch's
+cold part, and every step reports a **cold p95 and a warm p95** side by side.
+The control plane does the evicting (workers never hold indexer credentials);
+a fleet's workers hear the epoch on their next heartbeat. Evictions never
+overlap, one that outlasts the interval pushes the clock and says so, and a
+failed or partial one is recorded on the epoch rather than hidden. What
+eviction cannot make cold, stated on the dialog: hot buckets, buckets a running
+search holds open, bloom filters inside the hotlist window, and the operating
+system's page cache after a re-download.
 
 ```bash
 REG_EVICT_CACHE=1 REG_EVICT_CACHE_INDEXES=main python -m regulator_agent
@@ -913,13 +958,13 @@ request rather than the merge.
 |---|---|
 | **0** | **API engine, scenario format, standalone worker, fake splunkd, CI** (done, and validated against a real Splunk 10.4.0) |
 | **1** | **Control plane and web interface** (done): targets, the report, cache inspection and eviction, scenario launch, and a live run detail with an inline latency chart. Scenarios execute in the control plane's own process |
-| 1b | Worker fleet over Docker Swarm, Postgres, merged histograms across the fleet, which lifts the in-process virtual-user ceiling |
 | **2** | **Browser engine** (done): Playwright, a persistent context per virtual user, Navigation Timing and LCP, and every search the page fires captured from the wire and joined back to its own server-side job statistics |
 | **3** | **CI and regression gates** (done): named baselines, run comparison with per-step deltas, a small gate language, and a GitHub Action |
 | **4** | **Server-side correlation and Kubernetes** (done): every run pulls back the cluster's own account of it from `_audit`, `_introspection`, the scheduler and the cache manager, and manifests deploy it onto a dedicated node group so the generator never shares a node with the system under test |
 | **5** | **Adversarial review, twice** (done): measurement defects that let a failing target look good (empty histograms reading as zero, leaked jobs under saturation, dropped tails, unit-ambiguous gates, per-run scan totals), control-plane defects (unbounded durations, the open model bypassing the ceiling, zombie runs, unattributable evictions) and Splunk-facing defects (cache state read from a search head, doubled audit counts, dashboards ignoring the pinned range) fixed with regression tests |
 | **6** | **Splunk's own search format** (done): `savedsearches.conf` as a scenario source, import and export from a target, dispatch by name, the schedule load model, and a scenario for every Stoker pack |
-| **7** | **The worker fleet** (done): Swarm services through Portainer and Kubernetes Indexed Jobs driven by Stoker's claim protocol (fenced leases, a shared T0, heartbeats as the command channel, finals merged from raw histograms), proven with real worker processes over a real socket in the test suite |
+| **7** | **The worker fleet** (done): Swarm services through Portainer and Kubernetes Indexed Jobs driven by Stoker's claim protocol (fenced leases, a shared T0, heartbeats as the command channel, finals merged from raw histograms), proven with real worker processes over a real socket in the test suite and live on a swarm |
+| **8** | **Time series, monitoring and cache control** (done): a stored sample every few seconds with interval percentiles from merged worker buckets, charts drawn from it (throughput and in flight against the ceiling, interval and cumulative latency, errors and queueing, per worker, cache history per target) with markers for T0, stops, lost workers and evictions; the control plane's own HEC telemetry (samples, lifecycle, merged fleet summaries, health) and a Splunk app for it; one-click purge with an audit of the counts; eviction on a clock with cache epochs and cold versus warm per step; and the fleet review's fixes (the fleet may exceed the in-process ceiling, mixed scenarios run as two groups, run tokens are swarm secrets bound to the run's state, warm-ups longer than a lease are not lost, a stop before any claim ends the run, workers drain on SIGTERM, atomic claims, engine-aware slots, per-slot arrival streams, per-group cron dealing, robust merging) |
 
 ---
 

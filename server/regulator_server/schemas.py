@@ -253,6 +253,11 @@ class RunCreate(BaseModel):
     evict_cache: bool = False
     evict_cache_indexes: List[str] = Field(default_factory=list)
     evict_all_indexes: bool = False
+    # Evict again every N seconds during the run (same scope as above), so
+    # one run measures the cold path repeatedly; executions within
+    # cold_window_s of an eviction are its cold part (default: half of N).
+    evict_every_s: Optional[float] = Field(default=None, ge=10, le=86400, allow_inf_nan=False)
+    cold_window_s: Optional[float] = Field(default=None, gt=0, le=86400, allow_inf_nan=False)
     # Where the load is generated: inprocess (this control plane), swarm or
     # k8s (worker containers). Blank means the configured default.
     fleet: Optional[str] = None
@@ -301,6 +306,17 @@ class RunCreate(BaseModel):
         for name in self.evict_cache_indexes:
             if not re.match(r"^[A-Za-z0-9_:.-]{1,128}$", name or ""):
                 raise ValueError(f"index name {name!r} is not a valid Splunk index name")
+        if self.evict_every_s:
+            if not (self.evict_cache_indexes or self.evict_all_indexes):
+                raise ValueError(
+                    "evict_every_s needs a scope: name the indexes in evict_cache_indexes or set evict_all_indexes"
+                )
+            if self.duration_s and self.evict_every_s >= self.duration_s:
+                raise ValueError("evict_every_s must be shorter than the run's duration")
+            if self.cold_window_s and self.cold_window_s > self.evict_every_s:
+                raise ValueError("cold_window_s cannot be longer than evict_every_s")
+        elif self.cold_window_s:
+            raise ValueError("cold_window_s only makes sense with evict_every_s")
 
 
 class RunOut(BaseModel):

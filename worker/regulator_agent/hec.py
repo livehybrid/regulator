@@ -52,9 +52,14 @@ class HecEmitter:
         config: HecConfig,
         run_id: str = "local",
         transport: Optional[httpx.AsyncBaseTransport] = None,
+        fields: Optional[Dict[str, Any]] = None,
     ) -> None:
         self.config = config
         self.run_id = run_id
+        # Indexed fields stamped on every event (run number, scenario, target,
+        # fleet, slot): the join keys a dashboard filters on without parsing
+        # the event body.
+        self.fields: Dict[str, Any] = {k: v for k, v in (fields or {}).items() if v is not None}
         # Injectable purely for tests. Everything in this module is best effort
         # and swallows its own failures by design, which makes it exactly the
         # kind of code that can be quietly broken for months, so it needs to be
@@ -133,12 +138,28 @@ class HecEmitter:
     def emit_summary(self, summary: Dict[str, Any]) -> None:
         self._append(self._envelope(summary, self.config.sourcetype_run, time.time()))
 
+    def emit_event(
+        self,
+        event: Dict[str, Any],
+        sourcetype: str,
+        when: Optional[float] = None,
+        fields: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        """Queue any event under any sourcetype. Never blocks, never raises."""
+        self._append(self._envelope(event, sourcetype, when or time.time(), fields))
+
     def _append(self, envelope: Dict[str, Any]) -> None:
         line = json.dumps(envelope, separators=(",", ":"))
         self._pending.append(envelope)
         self._pending_bytes += len(line)
 
-    def _envelope(self, event: Dict[str, Any], sourcetype: str, when: float) -> Dict[str, Any]:
+    def _envelope(
+        self,
+        event: Dict[str, Any],
+        sourcetype: str,
+        when: float,
+        fields: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
         envelope: Dict[str, Any] = {
             "time": when or time.time(),
             "source": self.config.source,
@@ -150,6 +171,9 @@ class HecEmitter:
         # a 400.
         if self.config.index:
             envelope["index"] = self.config.index
+        indexed = {**self.fields, **{k: v for k, v in (fields or {}).items() if v is not None}}
+        if indexed:
+            envelope["fields"] = indexed
         return envelope
 
     # ------------------------------------------------------------------

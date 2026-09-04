@@ -35,6 +35,7 @@ import json
 import logging
 import os
 import random
+import signal
 import sys
 import tempfile
 import time
@@ -141,24 +142,38 @@ class ControlClient:
                 await asyncio.sleep(delay)
                 attempt += 1
 
-    async def claim(self, holder: str, hint_slot: Optional[int]) -> Dict[str, Any]:
+    async def claim(self, holder: str, hint_slot: Optional[int], engine: Optional[str] = None) -> Dict[str, Any]:
         body: Dict[str, Any] = {"holder": holder, "protocol_version": PROTOCOL_VERSION}
         if hint_slot is not None:
             body["hint_slot"] = hint_slot
+        if engine:
+            body["engine"] = engine
         return await self._post_with_backoff("claim", body)
 
     async def ready(self, slot: int, lease_id: str) -> Dict[str, Any]:
         return await self._post_with_backoff("ready", {"slot": slot, "lease_id": lease_id})
 
-    async def heartbeat(self, slot: int, lease_id: str, stats: Dict[str, Any], state: str) -> Optional[Dict[str, Any]]:
+    async def heartbeat(
+        self,
+        slot: int,
+        lease_id: str,
+        stats: Dict[str, Any],
+        state: str,
+        interval: Optional[Dict[str, Any]] = None,
+    ) -> Optional[Dict[str, Any]]:
         """One heartbeat. None on a missed acknowledgement."""
-        body = {
+        body: Dict[str, Any] = {
             "slot": slot,
             "lease_id": lease_id,
             "protocol_version": PROTOCOL_VERSION,
             "state": state,
             "stats": stats,
         }
+        if interval:
+            # What happened since the last heartbeat, with the raw buckets, so
+            # the control plane's time series has honest fleet-wide
+            # percentiles rather than an average of averages.
+            body["interval"] = interval
         try:
             document = await self._post("heartbeat", body)
         except Superseded:
@@ -196,7 +211,7 @@ def _materialise_scenario(claim: Dict[str, Any], root: Path) -> Path:
     nowhere else. Writing them out keeps one loader for both cases.
     """
     scenario = claim.get("scenario") or {}
-    name = str(scenario.get("name") or "claimed")
+    name = Path(str(scenario.get("name") or "claimed")).name or "claimed"  # never a traversal
     directory = root / name
     directory.mkdir(parents=True, exist_ok=True)
     files = scenario.get("files") or {}
@@ -216,15 +231,29 @@ def _config_from_claim(boot: ManagedBoot, claim: Dict[str, Any], scenario_dir: P
     """
     env: Dict[str, str] = {
         key: value for key, value in os.environ.items()
-        if key.startswith("REG_") and key not in ("REG_RUN_ID", "REG_CONTROL_URL", "REG_RUN_JWT", "REG_HINT_SLOT")
+        if key.startswith("REG_") and key not in MANAGED_ONLY_KEYS
     }
     env.update({str(k): str(v) for k, v in (claim.get("env") or {}).items() if v is not None})
     env["REG_STANDALONE"] = "1"
     env["REG_SCENARIO"] = str(scenario_dir)
     env["REG_SLOT"] = str(int(claim.get("slot", 0)))
     env["REG_TOTAL_WORKERS"] = str(int(claim.get("total_workers", 1)))
+    # The group's own numbering, for dealing out work that lives in this
+    # group's scenario (a mixed run's api and browser groups have different
+    # step lists). The global slot stays what keeps virtual-user ids disjoint.
+    share = claim.get("share") or {}
+    if share.get("group_slot") is not None:
+        env["REG_GROUP_SLOT"] = str(int(share["group_slot"]))
+    if share.get("group_workers"):
+        env["REG_GROUP_WORKERS"] = str(int(share["group_workers"]))
     env["REG_RUN_LABEL"] = str(claim.get("run_label") or f"run{boot.run_id}")
     return load_config(env)
+
+
+MANAGED_ONLY_KEYS = (
+    "REG_RUN_ID", "REG_CONTROL_URL", "REG_RUN_JWT", "REG_RUN_JWT_FILE", "REG_HINT_SLOT",
+    "REG_SLOT_BASE", "REG_SWARM_TASK_SLOT", "REG_WORKER_ENGINE", "REG_HOLDER", "REG_DEADMAN_S",
+)
 
 
 def _parse_t0(document: Dict[str, Any]) -> Optional[float]:
@@ -238,15 +267,77 @@ def _parse_t0(document: Dict[str, Any]) -> Optional[float]:
 
 
 async def run_managed(boot: ManagedBoot) -> int:
-    """The whole life of a fleet member. Returns the process exit code."""
+    """The whole life of a fleet member. Returns the process exit code.
+
+    Heartbeats start the moment the claim is granted, not when the worker is
+    ready: a browser engine's start plus a validation against the target can
+    take longer than a lease, and a healthy worker declared lost while it
+    warmed up was the failure mode that stranded a fleet.
+    """
     client = ControlClient(boot)
     await client.start()
     workdir = Path(tempfile.mkdtemp(prefix="regulator-"))
     engine = None
     hec: Optional[HecEmitter] = None
     heartbeat_task: Optional[asyncio.Task[None]] = None
+    scheduler: Optional[Scheduler] = None
+    stats: Optional[RunStats] = None
+    released = asyncio.Event()
+    t0_holder: Dict[str, Optional[float]] = {"t0": None}
+    phase = {"name": "starting"}
+    superseded = {"flag": False}
+    stopped: Dict[str, Any] = {"flag": False, "reason": ""}
+
+    def request_stop(reason: str) -> None:
+        """A stop from any source: the control plane, a signal, the dead-man."""
+        if not stopped["flag"]:
+            log.info("stop requested: %s", reason)
+        stopped["flag"] = True
+        stopped["reason"] = stopped["reason"] or reason
+        if scheduler is not None:
+            scheduler.request_stop(reason)
+        released.set()  # a stop before the release means: do not wait for one
+
+    # The orchestrator's stop is a SIGTERM with a grace period. Without a
+    # handler the process dies at once and the slot is lost with its data.
+    loop = asyncio.get_running_loop()
+    for signum in (signal.SIGTERM, signal.SIGINT):
+        with contextlib.suppress(NotImplementedError, RuntimeError, ValueError):
+            loop.add_signal_handler(signum, request_stop, f"signal {signum.name}")
+
+    async def heartbeats(slot: int, lease_id: str, heartbeat_s: float) -> None:
+        while True:
+            snapshot = stats.snapshot() if stats is not None else {}
+            interval = stats.take_interval(with_buckets=True) if stats is not None else None
+            try:
+                document = await client.heartbeat(slot, lease_id, snapshot, phase["name"], interval=interval)
+            except Superseded:
+                superseded["flag"] = True
+                request_stop("lease superseded by the control plane")
+                return
+            if document is not None:
+                command = str(document.get("command") or "continue")
+                # The cache epoch clock is the control plane's: it evicts, and
+                # every worker tags its records from the same instant.
+                epoch = document.get("epoch")
+                if stats is not None and isinstance(epoch, int) and epoch > 0 and epoch != stats.epoch:
+                    stats.set_epoch(epoch, float(document.get("epoch_started_at") or time.time()))
+                if command == "release":
+                    t0 = _parse_t0(document)
+                    if t0 is not None:
+                        t0_holder["t0"] = t0
+                    if phase["name"] == "ready":
+                        released.set()
+                elif command == "stop":
+                    request_stop("stopped by the control plane")
+            elif client.deadman_expired():
+                log.error("no control-plane contact for %.0fs: draining", boot.deadman_s)
+                request_stop("control plane unreachable")
+                return
+            await asyncio.sleep(heartbeat_s)
+
     try:
-        claim = await client.claim(boot.holder, boot.hint_slot)
+        claim = await client.claim(boot.holder, boot.hint_slot, engine=boot.engine)
         slot = int(claim.get("slot", 0))
         lease_id = str(claim.get("lease_id") or "")
         heartbeat_s = float(claim.get("heartbeat_s") or DEFAULT_HEARTBEAT_S)
@@ -254,6 +345,7 @@ async def run_managed(boot: ManagedBoot) -> int:
             "claimed slot %d of %d for run %s (%s)",
             slot, int(claim.get("total_workers", 1)), boot.run_id, boot.holder,
         )
+        heartbeat_task = asyncio.create_task(heartbeats(slot, lease_id, heartbeat_s), name="heartbeat")
 
         scenario_dir = _materialise_scenario(claim, workdir)
         try:
@@ -270,6 +362,9 @@ async def run_managed(boot: ManagedBoot) -> int:
             log.error(message)
             await client.final(slot, lease_id, _failure_summary(boot, slot, message), [])
             return EXIT_LINT
+        if stopped["flag"]:
+            await client.final(slot, lease_id, _failure_summary(boot, slot, stopped["reason"], outcome="stopped"), [])
+            return EXIT_SUPERSEDED if superseded["flag"] else EXIT_OK
 
         engine_name = str(claim.get("engine") or "api")
         try:
@@ -309,48 +404,26 @@ async def run_managed(boot: ManagedBoot) -> int:
             capabilities=capabilities,
         )
         scheduler.wire_histograms = True
+        if stopped["flag"]:
+            scheduler.request_stop(stopped["reason"])
 
         # Ready, then wait to be released with the fleet's shared T0. The
-        # heartbeat loop is the only thing that learns T0.
-        await client.ready(slot, lease_id)
-        released = asyncio.Event()
-        t0_holder: Dict[str, Optional[float]] = {"t0": None}
-        superseded = {"flag": False}
-
-        async def heartbeats() -> None:
-            phase = "ready"
-            while True:
-                try:
-                    document = await client.heartbeat(slot, lease_id, stats.snapshot(), phase)
-                except Superseded:
-                    superseded["flag"] = True
-                    scheduler.request_stop("lease superseded by the control plane")
-                    released.set()
-                    return
-                if document is not None:
-                    command = str(document.get("command") or "continue")
-                    if command == "release" and not released.is_set():
-                        t0_holder["t0"] = _parse_t0(document)
-                        released.set()
-                        phase = "running"
-                    elif command == "stop":
-                        scheduler.request_stop("stopped by the control plane")
-                        if not released.is_set():
-                            t0_holder["t0"] = None
-                            released.set()
-                elif client.deadman_expired():
-                    log.error("no control-plane contact for %.0fs: draining", boot.deadman_s)
-                    scheduler.request_stop("control plane unreachable")
-                    released.set()
-                    return
-                await asyncio.sleep(heartbeat_s)
-
-        heartbeat_task = asyncio.create_task(heartbeats(), name="heartbeat")
+        # release rides on the ready response when the fleet is already
+        # released (a late worker), otherwise on a heartbeat.
+        phase["name"] = "ready"
+        ready_doc = await client.ready(slot, lease_id)
+        t0 = _parse_t0(ready_doc)
+        if t0 is not None:
+            t0_holder["t0"] = t0
+        if t0_holder["t0"] is not None:
+            released.set()
         await released.wait()
         if superseded["flag"]:
             return EXIT_SUPERSEDED
+        phase["name"] = "running"
 
         summary = await scheduler.run(start_at=t0_holder["t0"])
+        phase["name"] = "finishing"
         payload = summary.to_dict()
         if hec is not None:
             await hec.flush()
@@ -381,13 +454,13 @@ async def run_managed(boot: ManagedBoot) -> int:
         await client.close()
 
 
-def _failure_summary(boot: ManagedBoot, slot: int, reason: str) -> Dict[str, Any]:
+def _failure_summary(boot: ManagedBoot, slot: int, reason: str, outcome: str = "failed") -> Dict[str, Any]:
     """A summary for a worker that never got as far as a run."""
     return {
         "run_id": boot.run_id,
         "slot": slot,
         "scenario": "",
-        "outcome": "failed",
+        "outcome": outcome,
         "valid": False,
         "invalid_reason": reason,
         "started_at": time.time(),

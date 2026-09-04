@@ -89,8 +89,10 @@ class FakeDriver:
         for index in range(state.group.workers):
             env = dict(os.environ)
             env.update(state.group.env)
+            env.update(state.group.secrets)  # a subprocess has no secret store
             env["REG_HINT_SLOT"] = str(index + state.group.options.get("slot_base", 0))
             env["REG_HOLDER"] = f"{state.group.group}-{index}"
+            env["REG_WORKER_ENGINE"] = state.group.group
             env.update(self._env_overrides)
             proc = subprocess.Popen(
                 [self._python, "-m", "regulator_agent"],
