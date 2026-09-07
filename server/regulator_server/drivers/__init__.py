@@ -53,6 +53,7 @@ def _build(kind: str, settings: FleetSettings) -> ExecutionDriver:
         return K8sDriver(
             namespace=settings.k8s_namespace,
             node_selector=settings.k8s_node_selector,
+            tolerations=settings.k8s_tolerations,
             kubeconfig=settings.kubeconfig,
             context=settings.kube_context,
             in_cluster=settings.k8s_in_cluster,

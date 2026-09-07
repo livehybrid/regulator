@@ -17,7 +17,7 @@ against injected fakes with no cluster anywhere.
 from __future__ import annotations
 
 import logging
-from typing import Any, Dict, List, Optional, Set
+from typing import Any, Dict, List, Optional, Sequence, Set
 
 from .base import DriverError, DriverRef, DriverStatus, NotFound, WorkerGroup
 
@@ -30,6 +30,41 @@ TOKEN_KEY = "run-token"
 # The logs endpoint returns at most this much per group: a worker writes its
 # whole summary, histograms included, as one stdout line.
 _LOG_BYTES_CAP = 2 * 1024 * 1024
+
+
+_TOLERATION_KEYS = ("key", "operator", "value", "effect", "tolerationSeconds")
+
+
+def _clean_tolerations(tolerations: Optional[Sequence[Any]]) -> List[Dict[str, Any]]:
+    """Normalise tolerations into pod-spec objects.
+
+    Accepts what :func:`config._parse_tolerations` stores, ``(key, operator,
+    value, effect)`` quads with ``""`` for absent parts, and also plain dicts
+    so a run's ``options["tolerations"]`` can pass them straight through. Only
+    whitelisted keys survive, so a malformed or hostile entry cannot smuggle
+    extra pod-spec fields in. Anything unusable is dropped rather than raising:
+    the boot-time parser is where a bad value should have been caught.
+    """
+    if not tolerations:
+        return []
+    cleaned: List[Dict[str, Any]] = []
+    for entry in tolerations:
+        if isinstance(entry, dict):
+            item = {k: v for k, v in entry.items() if k in _TOLERATION_KEYS and v not in (None, "")}
+            if item.get("key") or item.get("operator") == "Exists":
+                cleaned.append(item)
+            continue
+        if isinstance(entry, (tuple, list)) and len(entry) == 4:
+            key, operator, value, effect = (str(p or "") for p in entry)
+            if not key:
+                continue
+            item = {"key": key, "operator": operator or "Exists"}
+            if value:
+                item["value"] = value
+            if effect:
+                item["effect"] = effect
+            cleaned.append(item)
+    return cleaned
 
 
 def job_name(run_id: int, group: str) -> str:
@@ -47,6 +82,7 @@ class K8sDriver:
         self,
         namespace: str = "regulator",
         node_selector: Optional[Dict[str, str]] = None,
+        tolerations: Optional[Sequence[Any]] = None,
         batch_api: Any = None,
         core_api: Any = None,
         kubeconfig: Optional[str] = None,
@@ -56,6 +92,7 @@ class K8sDriver:
     ) -> None:
         self._namespace = namespace or "regulator"
         self._node_selector = dict(node_selector or {})
+        self._tolerations = _clean_tolerations(tolerations)
         self._batch = batch_api
         self._core = core_api
         self._kubeconfig = kubeconfig
@@ -189,10 +226,26 @@ class K8sDriver:
         selector.update(group.options.get("node_selector") or {})
         if selector:
             pod["spec"]["nodeSelector"] = selector
-            pod["spec"]["tolerations"] = [
+        # Placement and admission are two different questions. nodeSelector
+        # matches node LABELS and says where the pod MAY go; a toleration
+        # matches node TAINTS and says whether a reserved node will ACCEPT it.
+        # They coincide only when an estate happens to label and taint with the
+        # same key=value, which is exactly the assumption that used to leave
+        # workers Pending forever against a node group labelled one way and
+        # tainted another.
+        #
+        # An explicit toleration list (REG_K8S_TOLERATIONS, or a group's own
+        # options) therefore wins outright. With none given we still derive one
+        # NoSchedule toleration per selector pair, which is what deployments
+        # configured before this existed rely on.
+        tolerations = _clean_tolerations(group.options.get("tolerations")) or self._tolerations
+        if not tolerations and selector:
+            tolerations = [
                 {"key": key, "operator": "Equal", "value": value, "effect": "NoSchedule"}
                 for key, value in selector.items()
             ]
+        if tolerations:
+            pod["spec"]["tolerations"] = [dict(t) for t in tolerations]
         deadline = group.options.get("active_deadline_s")
         spec: Dict[str, Any] = {
             "completionMode": "Indexed",

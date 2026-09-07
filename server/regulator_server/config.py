@@ -18,7 +18,7 @@ import os
 import secrets
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Dict, Mapping, Optional
+from typing import Dict, Mapping, Optional, Tuple
 
 from cryptography.fernet import Fernet
 
@@ -60,6 +60,56 @@ def _integer(env: Mapping[str, str], key: str, default: int, minimum: Optional[i
     if minimum is not None and value < minimum:
         raise ServerConfigError(f"{key} must be >= {minimum}, got {value}")
     return value
+
+
+_TOLERATION_EFFECTS = ("NoSchedule", "PreferNoSchedule", "NoExecute")
+
+
+def _parse_tolerations(env: Mapping[str, str]) -> Tuple[Tuple[str, str, str, str], ...]:
+    """Parse ``REG_K8S_TOLERATIONS`` into (key, operator, value, effect) quads.
+
+    Comma separated, each entry written the way a taint is written,
+    ``key[=value][:effect]``, e.g. ``splunk.crc.dwp/role=regulator:NoSchedule``:
+
+    * ``key=value`` -> operator ``Equal`` with that value;
+    * ``key`` alone -> operator ``Exists``, tolerating any value;
+    * a trailing ``:effect`` limits it to one effect, omit it to tolerate the
+      taint under every effect.
+
+    This is deliberately the same syntax as Stoker's ``K8S_TOLERATIONS``: the
+    two run side by side on the same node groups and there is no reason for an
+    operator to learn two spellings.
+
+    Quads rather than dicts so the frozen settings object stays hashable;
+    :class:`K8sDriver` rebuilds real toleration objects from them. A malformed
+    entry is a hard error at boot rather than a pod that mysteriously never
+    schedules.
+    """
+    raw = _get(env, "REG_K8S_TOLERATIONS")
+    if not raw:
+        return ()
+    quads = []
+    for part in raw.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        body, sep, effect = part.rpartition(":")
+        if not sep:  # no ':' at all, so the whole entry is key[=value]
+            body, effect = part, ""
+        body, effect = body.strip(), effect.strip()
+        key, eq, value = body.partition("=")
+        key, value = key.strip(), value.strip()
+        if not key:
+            raise ServerConfigError(
+                f"REG_K8S_TOLERATIONS entries need a key, got {part!r}"
+            )
+        if effect and effect not in _TOLERATION_EFFECTS:
+            raise ServerConfigError(
+                f"REG_K8S_TOLERATIONS effect must be one of "
+                f"{', '.join(_TOLERATION_EFFECTS)}, got {effect!r}"
+            )
+        quads.append((key, "Equal" if eq else "Exists", value, effect))
+    return tuple(quads)
 
 
 @dataclass(frozen=True)
@@ -136,6 +186,16 @@ class FleetSettings:
     # Kubernetes.
     k8s_namespace: str = "regulator"
     k8s_node_selector: Dict[str, str] = field(default_factory=dict)
+    # Worker-pod tolerations (env REG_K8S_TOLERATIONS), as
+    # (key, operator, value, effect) quads with "" for an absent value/effect.
+    #
+    # These are SEPARATE from k8s_node_selector on purpose. A nodeSelector
+    # matches node LABELS and decides where a pod may go; a toleration matches
+    # node TAINTS and decides whether a reserved node will accept it. They are
+    # only ever the same string by coincidence. Leaving this empty keeps the
+    # old behaviour, where the driver derives a NoSchedule toleration from each
+    # selector pair, so existing deployments are unaffected.
+    k8s_tolerations: Tuple[Tuple[str, str, str, str], ...] = ()
     k8s_in_cluster: Optional[bool] = None
     kubeconfig: Optional[str] = None
     kube_context: Optional[str] = None
@@ -299,6 +359,7 @@ def load_server_config(env: Optional[Mapping[str, str]] = None) -> ServerConfig:
         else:
             default_user_dir = "./data/scenarios"
 
+    tolerations = _parse_tolerations(env)
     default_fleet = (_get(env, "REG_DEFAULT_FLEET", "inprocess") or "inprocess").lower()
     if default_fleet not in ("inprocess", "swarm", "k8s"):
         raise ServerConfigError(f"REG_DEFAULT_FLEET must be inprocess, swarm or k8s, got {default_fleet!r}")
@@ -328,6 +389,7 @@ def load_server_config(env: Optional[Mapping[str, str]] = None) -> ServerConfig:
         ),
         k8s_namespace=_get(env, "REG_K8S_NAMESPACE", "regulator") or "regulator",
         k8s_node_selector=selector,
+        k8s_tolerations=tolerations,
         k8s_in_cluster=(_boolean(env, "REG_K8S_IN_CLUSTER", False) if in_cluster_raw is not None else None),
         kubeconfig=(_get(env, "REG_KUBECONFIG") or _get(env, "KUBECONFIG") or None),
         kube_context=(_get(env, "REG_KUBE_CONTEXT") or None),

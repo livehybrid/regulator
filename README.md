@@ -326,7 +326,22 @@ launching, because swarm does not re-pull a floating tag a node already holds.
 | `PORTAINER_HOST` / `PORTAINER_TOKEN` / `PORTAINER_ENDPOINT` | | The Swarm fleet. The same key the stack is deployed with |
 | `REG_SWARM_NETWORK` / `REG_SWARM_CONSTRAINTS` | the stack's network / none | Keep workers off the node that runs the Splunk under test: `node.hostname != macdev` |
 | `REG_K8S_NAMESPACE` / `REG_K8S_NODE_SELECTOR` / `REG_K8S_IN_CLUSTER` / `REG_KUBECONFIG` | `regulator` / none / auto / auto | The Kubernetes fleet. In-cluster uses the pod's service account and the Role in `infra/k8s/regulator.yaml` |
+| `REG_K8S_TOLERATIONS` | none | Worker-pod tolerations, `key[=value][:effect]` comma separated, e.g. `splunk.crc.dwp/role=regulator:NoSchedule`. Same syntax as Stoker's `K8S_TOLERATIONS`. See the note below |
 | `REG_HEARTBEAT_S` / `REG_LEASE_S` / `REG_PROVISION_TIMEOUT_S` | `2` / `20` / `180` | The protocol's clocks |
+
+**`REG_K8S_NODE_SELECTOR` and `REG_K8S_TOLERATIONS` answer different questions.**
+The selector matches node **labels** and decides where a worker pod *may* go.
+A toleration matches node **taints** and decides whether a reserved node will
+*accept* it. A dedicated node group usually carries both, and they are only the
+same string by coincidence: a group labelled `workload=regulator` but tainted
+`splunk.crc.dwp/role=regulator:NoSchedule` needs the label in the selector and
+the taint in the tolerations. Get that wrong and the workers sit `Pending`
+until the run times out, with nothing in the Regulator logs to say why, so
+check `kubectl describe pod` for `FailedScheduling` first.
+
+Set no tolerations and each selector pair still becomes a `NoSchedule`
+toleration of the same `key=value`, which is what deployments predating this
+variable rely on. Setting it replaces that guess outright.
 
 A fleet member is the same image as a standalone worker. Given `REG_RUN_ID`,
 `REG_CONTROL_URL` and `REG_RUN_JWT` it claims instead of reading its target from

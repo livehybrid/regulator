@@ -261,6 +261,69 @@ def test_k8s_creates_an_indexed_job_with_the_token_in_a_secret(k8s):
     assert adopted["body"]["metadata"]["ownerReferences"][0]["uid"] == "uid-1"
 
 
+def test_k8s_explicit_tolerations_replace_the_derived_ones():
+    """A nodeSelector matches LABELS, a toleration matches TAINTS.
+
+    The regression this guards: a node group labelled ``workload=regulator``
+    but tainted ``splunk.crc.dwp/role=regulator:NoSchedule`` used to get a
+    toleration derived from the label, which tolerates a taint that does not
+    exist, so every worker stayed Pending forever.
+    """
+    api = FakeApi()
+    driver = K8sDriver(
+        namespace="regulator",
+        node_selector={"workload": "regulator"},
+        tolerations=[("splunk.crc.dwp/role", "Equal", "regulator", "NoSchedule")],
+        batch_api=api,
+        core_api=api,
+    )
+    ref = driver.create(group(workers=1))
+    pod = api.jobs[ref.id]["spec"]["template"]["spec"]
+    # Placement is still by label.
+    assert pod["nodeSelector"] == {"workload": "regulator"}
+    # Admission is by the taint we were actually given, not the label.
+    assert pod["tolerations"] == [
+        {"key": "splunk.crc.dwp/role", "operator": "Equal",
+         "value": "regulator", "effect": "NoSchedule"}
+    ]
+
+
+def test_k8s_tolerations_need_no_node_selector():
+    """"Run anywhere, but tolerate this taint" was previously inexpressible."""
+    api = FakeApi()
+    driver = K8sDriver(
+        namespace="regulator",
+        tolerations=[("dedicated", "Exists", "", "")],
+        batch_api=api,
+        core_api=api,
+    )
+    ref = driver.create(group(workers=1))
+    pod = api.jobs[ref.id]["spec"]["template"]["spec"]
+    assert "nodeSelector" not in pod
+    assert pod["tolerations"] == [{"key": "dedicated", "operator": "Exists"}]
+
+
+def test_k8s_a_groups_own_tolerations_win(k8s):
+    api, driver = k8s
+    ref = driver.create(group(workers=1, options={
+        "tolerations": [{"key": "spot", "operator": "Exists", "effect": "NoSchedule"}],
+    }))
+    pod = api.jobs[ref.id]["spec"]["template"]["spec"]
+    assert pod["tolerations"] == [
+        {"key": "spot", "operator": "Exists", "effect": "NoSchedule"}
+    ]
+
+
+def test_k8s_toleration_options_cannot_inject_pod_spec_keys(k8s):
+    api, driver = k8s
+    ref = driver.create(group(workers=1, options={
+        "tolerations": [{"key": "spot", "operator": "Exists", "hostNetwork": True}],
+    }))
+    pod = api.jobs[ref.id]["spec"]["template"]["spec"]
+    assert pod["tolerations"] == [{"key": "spot", "operator": "Exists"}]
+    assert "hostNetwork" not in pod
+
+
 def test_k8s_browser_group_gets_shared_memory(k8s):
     api, driver = k8s
     ref = driver.create(group(group="browser", image="browser-img"))
