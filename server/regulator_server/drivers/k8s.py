@@ -26,6 +26,13 @@ log = logging.getLogger("regulator.driver.k8s")
 LABEL = "regulator.run"
 _RUNNING = frozenset({"Running"})
 TOKEN_ENV = "REG_RUN_JWT"
+# The UID each worker image actually runs as. runAsNonRoot alone is not enough:
+# both images declare a NAME in their Dockerfile USER line (regulator, pwuser),
+# and the kubelet refuses to start a container when it cannot prove the user is
+# not root -- "image has non-numeric user, cannot verify user is non-root".
+# Numbers, not names, are what make that check pass.
+DEFAULT_WORKER_UID = 10011        # worker/Dockerfile: useradd --uid 10011
+DEFAULT_BROWSER_WORKER_UID = 1000  # playwright base image's pwuser
 TOKEN_KEY = "run-token"
 # The logs endpoint returns at most this much per group: a worker writes its
 # whole summary, histograms included, as one stdout line.
@@ -83,6 +90,8 @@ class K8sDriver:
         namespace: str = "regulator",
         node_selector: Optional[Dict[str, str]] = None,
         tolerations: Optional[Sequence[Any]] = None,
+        worker_uid: int = DEFAULT_WORKER_UID,
+        browser_worker_uid: int = DEFAULT_BROWSER_WORKER_UID,
         batch_api: Any = None,
         core_api: Any = None,
         kubeconfig: Optional[str] = None,
@@ -93,6 +102,8 @@ class K8sDriver:
         self._namespace = namespace or "regulator"
         self._node_selector = dict(node_selector or {})
         self._tolerations = _clean_tolerations(tolerations)
+        self._worker_uid = int(worker_uid)
+        self._browser_worker_uid = int(browser_worker_uid)
         self._batch = batch_api
         self._core = core_api
         self._kubeconfig = kubeconfig
@@ -211,13 +222,27 @@ class K8sDriver:
         if group.group == "browser":
             container["volumeMounts"] = [{"name": "dshm", "mountPath": "/dev/shm"}]
             volumes.append({"name": "dshm", "emptyDir": {"medium": "Memory", "sizeLimit": "1Gi"}})
+        run_as_user = int(
+            group.options.get("run_as_user")
+            or (self._browser_worker_uid if group.group == "browser" else self._worker_uid)
+        )
         pod: Dict[str, Any] = {
             "metadata": {"labels": dict(labels)},
             "spec": {
                 "restartPolicy": "Never",
                 "automountServiceAccountToken": False,
                 "terminationGracePeriodSeconds": int(group.stop_grace_s),
-                "securityContext": {"runAsNonRoot": True, "seccompProfile": {"type": "RuntimeDefault"}},
+                "securityContext": {
+                    "runAsNonRoot": True,
+                    # Without an explicit numeric UID the kubelet cannot verify
+                    # the image's named user is non-root and refuses to start
+                    # the container (CreateContainerConfigError), so a
+                    # Kubernetes fleet never gets a worker running at all.
+                    "runAsUser": run_as_user,
+                    "runAsGroup": run_as_user,
+                    "fsGroup": run_as_user,
+                    "seccompProfile": {"type": "RuntimeDefault"},
+                },
                 "containers": [container],
                 "volumes": volumes,
             },

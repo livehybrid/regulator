@@ -196,6 +196,13 @@ class FleetSettings:
     # old behaviour, where the driver derives a NoSchedule toleration from each
     # selector pair, so existing deployments are unaffected.
     k8s_tolerations: Tuple[Tuple[str, str, str, str], ...] = ()
+    # Numeric UID each worker image runs as (REG_K8S_WORKER_UID /
+    # REG_K8S_BROWSER_WORKER_UID). Both images set a NAMED user in their
+    # Dockerfile, and the kubelet will not start a container under
+    # runAsNonRoot unless it can prove the user is not root, which needs a
+    # number. Defaults match the shipped images.
+    k8s_worker_uid: int = 10011
+    k8s_browser_worker_uid: int = 1000
     k8s_in_cluster: Optional[bool] = None
     kubeconfig: Optional[str] = None
     kube_context: Optional[str] = None
@@ -390,6 +397,8 @@ def load_server_config(env: Optional[Mapping[str, str]] = None) -> ServerConfig:
         k8s_namespace=_get(env, "REG_K8S_NAMESPACE", "regulator") or "regulator",
         k8s_node_selector=selector,
         k8s_tolerations=tolerations,
+        k8s_worker_uid=_integer(env, "REG_K8S_WORKER_UID", 10011, minimum=1),
+        k8s_browser_worker_uid=_integer(env, "REG_K8S_BROWSER_WORKER_UID", 1000, minimum=1),
         k8s_in_cluster=(_boolean(env, "REG_K8S_IN_CLUSTER", False) if in_cluster_raw is not None else None),
         kubeconfig=(_get(env, "REG_KUBECONFIG") or _get(env, "KUBECONFIG") or None),
         kube_context=(_get(env, "REG_KUBE_CONTEXT") or None),

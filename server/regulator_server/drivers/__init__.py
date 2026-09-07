@@ -54,6 +54,8 @@ def _build(kind: str, settings: FleetSettings) -> ExecutionDriver:
             namespace=settings.k8s_namespace,
             node_selector=settings.k8s_node_selector,
             tolerations=settings.k8s_tolerations,
+            worker_uid=settings.k8s_worker_uid,
+            browser_worker_uid=settings.k8s_browser_worker_uid,
             kubeconfig=settings.kubeconfig,
             context=settings.kube_context,
             in_cluster=settings.k8s_in_cluster,

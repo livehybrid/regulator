@@ -261,6 +261,35 @@ def test_k8s_creates_an_indexed_job_with_the_token_in_a_secret(k8s):
     assert adopted["body"]["metadata"]["ownerReferences"][0]["uid"] == "uid-1"
 
 
+def test_k8s_worker_runs_as_an_explicit_numeric_uid(k8s):
+    """runAsNonRoot without runAsUser is not startable.
+
+    Both worker images declare a NAMED user (regulator, pwuser). The kubelet
+    refuses a container it cannot prove is non-root, so every Kubernetes worker
+    died in CreateContainerConfigError before this.
+    """
+    api, driver = k8s
+    ref = driver.create(group(workers=1))
+    sc = api.jobs[ref.id]["spec"]["template"]["spec"]["securityContext"]
+    assert sc["runAsNonRoot"] is True
+    assert sc["runAsUser"] == 10011, "must be the worker image's numeric uid"
+    assert sc["runAsGroup"] == 10011
+
+
+def test_k8s_browser_group_uses_the_playwright_uid(k8s):
+    api, driver = k8s
+    ref = driver.create(group(workers=1, group="browser"))
+    sc = api.jobs[ref.id]["spec"]["template"]["spec"]["securityContext"]
+    assert sc["runAsUser"] == 1000, "playwright's pwuser, not the api worker's uid"
+
+
+def test_k8s_run_as_user_is_overridable_per_run(k8s):
+    api, driver = k8s
+    ref = driver.create(group(workers=1, options={"run_as_user": 4242}))
+    sc = api.jobs[ref.id]["spec"]["template"]["spec"]["securityContext"]
+    assert sc["runAsUser"] == 4242
+
+
 def test_k8s_explicit_tolerations_replace_the_derived_ones():
     """A nodeSelector matches LABELS, a toleration matches TAINTS.
 
