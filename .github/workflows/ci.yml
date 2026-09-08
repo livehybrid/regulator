@@ -8,6 +8,13 @@ on:
 
 env:
   IMAGE_NAME: ghcr.io/livehybrid/regulator-worker
+  # Docker Hub push is opt-in: set repository secrets DOCKERHUB_USERNAME and
+  # DOCKERHUB_TOKEN to also publish to docker.io/livehybrid/*. Absent them the
+  # builds still succeed and publish to ghcr only. Each publishing job maps the
+  # username into its own env so a step `if:` can gate on it (secrets are not
+  # allowed in `if` directly). Same shape as stoker's ci.yml.
+  DOCKERHUB_IMAGE_WORKER: docker.io/livehybrid/regulator-worker
+  DOCKERHUB_IMAGE_CP: docker.io/livehybrid/regulator
 
 # Concurrency is set per job, not once at workflow level, because the two
 # halves of this pipeline want opposite behaviour.
@@ -228,6 +235,8 @@ jobs:
       contents: read
       packages: write
       id-token: write
+    env:
+      DOCKERHUB_USER: ${{ secrets.DOCKERHUB_USERNAME }}
     outputs:
       digest: ${{ steps.push.outputs.digest }}
     steps:
@@ -246,10 +255,19 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
+      - name: Log in to Docker Hub
+        if: env.DOCKERHUB_USER != ''
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
       - uses: docker/metadata-action@v5
         id: meta
         with:
-          images: ${{ env.IMAGE_NAME }}
+          images: |
+            ${{ env.IMAGE_NAME }}
+            ${{ env.DOCKERHUB_USER != '' && env.DOCKERHUB_IMAGE_WORKER || '' }}
           tags: |
             type=sha
             type=ref,event=tag
@@ -285,6 +303,8 @@ jobs:
       contents: read
       packages: write
       id-token: write
+    env:
+      DOCKERHUB_USER: ${{ secrets.DOCKERHUB_USERNAME }}
     steps:
       - uses: actions/checkout@v4
       - uses: docker/setup-buildx-action@v3
@@ -293,10 +313,19 @@ jobs:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Log in to Docker Hub
+        if: env.DOCKERHUB_USER != ''
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
       - uses: docker/metadata-action@v5
         id: meta
         with:
-          images: ${{ env.IMAGE_NAME }}
+          images: |
+            ${{ env.IMAGE_NAME }}
+            ${{ env.DOCKERHUB_USER != '' && env.DOCKERHUB_IMAGE_WORKER || '' }}
           tags: |
             type=raw,value=browser,enable={{is_default_branch}}
             type=sha,prefix=browser-
@@ -328,6 +357,8 @@ jobs:
       contents: read
       packages: write
       id-token: write
+    env:
+      DOCKERHUB_USER: ${{ secrets.DOCKERHUB_USERNAME }}
     outputs:
       digest: ${{ steps.push.outputs.digest }}
     steps:
@@ -339,10 +370,19 @@ jobs:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Log in to Docker Hub
+        if: env.DOCKERHUB_USER != ''
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
       - uses: docker/metadata-action@v5
         id: meta
         with:
-          images: ghcr.io/livehybrid/regulator
+          images: |
+            ghcr.io/livehybrid/regulator
+            ${{ env.DOCKERHUB_USER != '' && env.DOCKERHUB_IMAGE_CP || '' }}
           tags: |
             type=sha
             type=ref,event=tag
