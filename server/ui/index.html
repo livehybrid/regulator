@@ -160,6 +160,15 @@ dialog::backdrop{background:rgba(0,0,0,.6)}
 .charts{display:grid;grid-template-columns:repeat(auto-fit,minmax(340px,1fr));gap:12px;margin-bottom:14px}
 .charts .chart{margin-bottom:0}
 .chart h3{margin:0 0 6px}
+.chart{position:relative}
+.chart .zoom{position:absolute;top:8px;right:8px;opacity:0;transition:opacity .12s;background:var(--panel);border:1px solid var(--line);border-radius:4px;color:inherit;cursor:pointer;font-size:11px;line-height:1;padding:4px 6px}
+.chart:hover .zoom,.chart .zoom:focus{opacity:1}
+.chart[data-zoomable]{cursor:zoom-in}
+.chart-modal{position:fixed;inset:0;background:rgba(0,0,0,.72);display:flex;align-items:center;justify-content:center;z-index:50;padding:24px}
+.chart-modal .inner{background:var(--panel);border:1px solid var(--line);border-radius:6px;padding:16px;max-width:96vw;max-height:94vh;overflow:auto;position:relative}
+.chart-modal .inner svg{width:100%;height:auto}
+.chart-modal .close{position:absolute;top:8px;right:10px;background:none;border:0;color:inherit;cursor:pointer;font-size:20px;line-height:1}
+.chart-modal h3{margin:0 0 10px;padding-right:28px}
 .spark svg{display:block;width:120px;height:26px}
 td.spark{width:130px}
 .scroll{overflow-x:auto}
@@ -1118,7 +1127,7 @@ function drawRun(r){
     "<h3>Steps, worst p95 first</h3>" +
     (stepRows ? '<div class="panel scroll" style="padding:0"><table><thead><tr><th>Step</th><th>Class</th>' +
       "<th class='num'>Execs</th><th class='num'>Errors</th><th class='num'>Err %</th><th class='num'>p50</th>" +
-      "<th class='num'>p95</th>" + (cycled ? "<th class='num'>Cold p95</th><th class='num'>Warm p95</th>" : "") + "<th class='num'>Dispatch p95</th><th class='num'>TTFR p95</th>" +
+      "<th class='num'>p95</th>" + (cycled ? "<th class='num'>Cold p95</th><th class='num'>Warm p95</th>" : "") + "<th class='num' title='Time from the dispatch call being made to Splunk accepting the job.'>Dispatch p95</th>" + "<th class='num' title='TTFR, time to first result: how long until the search returns its first row. This is what a user actually feels; the total time is how long the whole search took, and on a wide cluster the two diverge a lot.'>Time to first result p95</th>" +
       "<th class='num'>Scanned</th><th class='num'>Events/s</th></tr></thead><tbody>" + stepRows + "</tbody></table></div>"
       : '<div class="panel"><p class="muted">No per-step figures yet.</p></div>');
   const wrap = $("#runWrap");
@@ -1277,16 +1286,53 @@ function niceMax(v){
 }
 // opts: { title, series: [{label, color, dashed, axis: "left"|"right", points: [[x, y], ...]}],
 //         xMax, markers: [{x, label, kind}], leftKind, rightKind, rightAxis, height, empty }
+// Click-to-enlarge for the run charts. Delegated from the document so it keeps
+// working across the re-renders a live run does every few seconds, rather than
+// needing a re-bind each time.
+(function chartZoom(){
+  function openChart(el){
+    const big = el.getAttribute("data-big"), title = el.getAttribute("data-title") || "";
+    if (!big) return;
+    const wrap = document.createElement("div");
+    wrap.className = "chart-modal";
+    wrap.innerHTML = '<div class="inner"><button class="close" title="Close">&times;</button><h3></h3>'
+      + '<div class="big"></div></div>';
+    wrap.querySelector("h3").textContent = title;
+    wrap.querySelector(".big").innerHTML = big;
+    const shut = () => { wrap.remove(); document.removeEventListener("keydown", onKey); };
+    const onKey = e => { if (e.key === "Escape") shut(); };
+    wrap.addEventListener("click", e => { if (e.target === wrap) shut(); });
+    wrap.querySelector(".close").addEventListener("click", shut);
+    document.addEventListener("keydown", onKey);
+    document.body.appendChild(wrap);
+  }
+  document.addEventListener("click", e => {
+    const el = e.target.closest ? e.target.closest(".chart[data-zoomable]") : null;
+    if (el) openChart(el);
+  });
+})();
+
 function lineChart(opts){
   const all = (opts.series || []).filter(s => s.points && s.points.length);
   const longest = all.reduce((m, s) => Math.max(m, s.points.length), 0);
   const body = longest < 2
     ? '<p class="muted small">' + esc(opts.empty || "Waiting for the first samples.") + "</p>"
     : lineChartSvg(opts, all);
-  return '<div class="chart"><h3>' + esc(opts.title || "") + "</h3>" + body + "</div>";
+  // The SVG is re-rendered at a wider viewport for the modal rather than being
+  // scaled up, so text and axes stay crisp instead of going blurry.
+  const zoomable = longest >= 2;
+  const big = zoomable
+    ? lineChartSvg(Object.assign({}, opts, { width: 1400, height: (opts.height || 200) * 2.1 }), all)
+    : "";
+  const note = opts.note ? '<p class="muted small chart-note">' + esc(opts.note) + "</p>" : "";
+  return '<div class="chart"' + (zoomable ? ' data-zoomable="1"' : "")
+    + (zoomable ? " data-big=\"" + esc(big) + '"' : "")
+    + ' data-title="' + esc(opts.title || "") + '">'
+    + (zoomable ? '<button class="zoom" title="Enlarge">&#9974;</button>' : "")
+    + "<h3>" + esc(opts.title || "") + "</h3>" + body + note + "</div>";
 }
 function lineChartSvg(opts, all){
-  const W = 640, H = opts.height || 200, L = 54, R = opts.rightAxis ? 54 : 14, T = 26, B = 26;
+  const W = opts.width || 640, H = opts.height || 200, L = 54, R = opts.rightAxis ? 54 : 14, T = 26, B = 26;
   let xMax = opts.xMax || 0;
   all.forEach(s => s.points.forEach(p => { if (p[0] > xMax) xMax = p[0]; }));
   xMax = Math.max(xMax, 1);
@@ -1374,7 +1420,8 @@ function runCharts(r, live){
     ].concat(!num(ceiling) && rows.length ? [{ label: "ceiling " + ceiling, color: "var(--bad)", dashed: true, axis: "right", points: [[0, ceiling], [xMax, ceiling]] }] : []),
   }));
   charts.push(lineChart({
-    title: "Latency, ms (interval, and cumulative p95 dashed)", xMax: xMax, markers: markers, leftKind: "ms", empty: empty,
+    title: "Search latency, ms (interval, and cumulative p95 dashed)", xMax: xMax, markers: markers, leftKind: "ms", empty: empty,
+    note: "Total search time. Time to first result (TTFR) is tracked separately in the table above: it is when the first row comes back, which is what a user feels.",
     series: [
       { label: "p50", color: PALETTE[0], points: pts(rows, s => iv(s).p50_ms) },
       { label: "p95", color: PALETTE[1], points: pts(rows, s => iv(s).p95_ms) },
