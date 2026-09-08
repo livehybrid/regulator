@@ -325,3 +325,22 @@ def test_the_evict_endpoint_refuses_a_get(env):
     finally:
         splunkd.close()
 
+
+def test_an_explicit_indexer_credential_replaces_the_targets_token():
+    """A token-based target must not hand its JWT to the peers.
+
+    A Splunk auth token is instance-scoped: one minted on the search head is
+    unknown to the indexers. Before this, `token=indexer_token or target.token`
+    meant the JWT survived even when an indexer username/password was supplied,
+    and _auth_header prefers a token, so the peers were handed a credential they
+    could never accept and every cache read came back empty.
+    """
+    from regulator_agent import smartstore as ss
+    import inspect
+
+    src = inspect.getsource(ss)
+    assert "token=indexer_token or target.token" not in src, (
+        "per-field fallback reintroduced: an explicit indexer credential must "
+        "replace the target's, not merge with it"
+    )
+

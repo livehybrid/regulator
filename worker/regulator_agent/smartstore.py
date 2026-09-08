@@ -296,11 +296,30 @@ async def discover_indexers(
     if not urls:
         return [Indexer(name=target.url, client=client, owned=False)], notes
 
-    credential = dict(
-        token=indexer_token or target.token,
-        username=indexer_username or target.username,
-        password=indexer_password or target.password,
-    )
+    # An EXPLICIT indexer credential replaces the target's outright; it does not
+    # merge with it. Falling back per-field looks harmless and is not: on a
+    # token-based target `token` would keep resolving to the search head's JWT,
+    # and SplunkClient._auth_header prefers a token over username/password, so
+    # the peers would still be handed a token they have never seen and the
+    # supplied username/password would never be used.
+    #
+    # This matters because a Splunk auth token is INSTANCE-scoped. One minted on
+    # the search head is unknown to the indexers, so a token-only target reads no
+    # SmartStore state at all ("no cache manager entries ... the account cannot
+    # read /services/admin/cacheman"), while a username/password target works
+    # because the same admin password exists on every instance.
+    if indexer_token or (indexer_username and indexer_password):
+        credential = dict(
+            token=indexer_token,
+            username=indexer_username,
+            password=indexer_password,
+        )
+    else:
+        credential = dict(
+            token=target.token,
+            username=target.username,
+            password=target.password,
+        )
     if not indexer_token and not (indexer_username and indexer_password):
         notes.append(
             "reaching the indexers with the search head's own credential: set the "
