@@ -160,6 +160,10 @@ dialog::backdrop{background:rgba(0,0,0,.6)}
 .charts{display:grid;grid-template-columns:repeat(auto-fit,minmax(340px,1fr));gap:12px;margin-bottom:14px}
 .charts .chart{margin-bottom:0}
 .chart h3{margin:0 0 6px}
+details.probe>summary{cursor:pointer;user-select:none}
+details.probe[open]>summary{margin-bottom:6px}
+.probe-rows{max-height:320px;overflow:auto;border:1px solid var(--line);border-radius:4px;background:var(--bg);padding:6px}
+.probe-rows table{width:100%}
 .chart{position:relative}
 .chart .zoom{position:absolute;top:8px;right:8px;opacity:0;transition:opacity .12s;background:var(--panel);border:1px solid var(--line);border-radius:4px;color:inherit;cursor:pointer;font-size:11px;line-height:1;padding:4px 6px}
 .chart:hover .zoom,.chart .zoom:focus{opacity:1}
@@ -1240,16 +1244,40 @@ async function actFleetLogs(btn, id){
 // What the cluster itself said about the run. This is the half no client-side
 // timing can produce: whether the time went to the indexers, whether somebody
 // else's scheduled searches were skipped to make room, and how hot the box got.
+function probeTable(rows){
+  if (!rows || !rows.length) return "";
+  const cols = [];
+  rows.forEach(r => Object.keys(r || {}).forEach(k => { if (cols.indexOf(k) < 0) cols.push(k); }));
+  const head = cols.map(c => "<th>" + esc(c) + "</th>").join("");
+  const body = rows.slice(0, 200).map(r =>
+    "<tr>" + cols.map(c => {
+      const v = (r || {})[c];
+      const t = (v === null || v === undefined) ? "" : (typeof v === "object" ? JSON.stringify(v) : String(v));
+      return "<td class='mono small'>" + esc(t) + "</td>";
+    }).join("") + "</tr>").join("");
+  const more = rows.length > 200
+    ? "<p class='muted small' style='margin:6px 0 0'>Showing the first 200 of " + fmtInt(rows.length) + " rows.</p>"
+    : "";
+  return "<div class='probe-rows'><table><thead><tr>" + head + "</tr></thead><tbody>"
+    + body + "</tbody></table>" + more + "</div>";
+}
 function sutSection(sut){
   if (!sut) return "";
   const findings = (sut.findings || []).map(f => "<li>" + esc(f) + "</li>").join("");
   const probes = sut.probes || {};
   const rows = Object.keys(probes).map(name => {
     const p = probes[name] || {};
+    const has = p.available && p.rows && p.rows.length;
+    // The rows were fetched and then only counted. "5 row(s)" tells you a probe
+    // matched but not WHAT it matched, which is the whole point of running it,
+    // so the count now opens the rows themselves.
     const state = p.available
-      ? (p.rows && p.rows.length ? fmtInt(p.rows.length) + " row(s)" : "no matching events")
+      ? (has ? fmtInt(p.rows.length) + " row(s)" : "no matching events")
       : "unavailable";
-    return "<tr><td class='mono'>" + esc(name) + "</td><td>" + esc(state) + "</td>" +
+    const cell = has
+      ? "<details class='probe'><summary>" + esc(state) + "</summary>" + probeTable(p.rows) + "</details>"
+      : esc(state);
+    return "<tr><td class='mono'>" + esc(name) + "</td><td>" + cell + "</td>" +
       "<td class='muted small'>" + esc(p.available ? (p.description || "") : (p.reason || "")) + "</td></tr>";
   }).join("");
 
