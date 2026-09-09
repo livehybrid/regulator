@@ -104,6 +104,8 @@ def create_baseline(
         note=body.note,
     )
     session.add(baseline)
+    # As with targets: the response says the baseline exists, so it has to.
+    session.commit()
     log.info("baseline %r now points at run %s", body.label, run.id)
     return {"label": baseline.label, "run_id": baseline.run_id, "scenario": baseline.scenario}
 

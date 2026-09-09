@@ -499,3 +499,79 @@ def test_a_credential_embedded_in_a_url_is_refused(client):
     )
     assert response.status_code == 422
     assert "username or password" in response.text
+
+
+def test_a_created_target_is_durable_before_the_201_is_returned(client):
+    """A 201 hands back an id, so the row behind it has to exist.
+
+    This used to return after a flush and leave the commit to the request
+    teardown, which meant the id came out of a transaction that had not landed.
+    A client that created a target and immediately read it back could be given
+    a 404 for the id it had just been handed. Runs already committed inside the
+    handler; targets did not, and that difference was the bug.
+
+    Checked from a session this request does not own, so a flushed-but-
+    uncommitted row cannot satisfy it.
+    """
+    from sqlalchemy import select as sa_select
+
+    from regulator_server.db import session_scope
+    from regulator_server.models import Target
+
+    created = client.post(
+        "/api/targets",
+        json={
+            "name": "durability",
+            "mgmt_url": "https://splunk.example:8089",
+            "token": "a-token",
+        },
+    )
+    assert created.status_code == 201
+    target_id = created.json()["id"]
+
+    with session_scope() as fresh:
+        row = fresh.scalars(
+            sa_select(Target).where(Target.id == target_id)
+        ).one_or_none()
+        assert row is not None, "the 201 named an id that was never committed"
+        assert row.name == "durability"
+
+    # And the id the client was given is immediately readable through the API,
+    # which is what a caller actually does next.
+    assert client.get("/api/targets").status_code == 200
+    assert any(t["id"] == target_id for t in client.get("/api/targets").json())
+
+
+def test_a_404_for_a_target_says_which_kind_of_missing_it_is(client):
+    """An id below the high-water mark existed; one above never did.
+
+    A bare "no target with id 7" cannot be acted on, and this endpoint has
+    produced a 404 for an id a caller had just been given a 201 for. The two
+    explanations need different fixes, and after the fact neither is guessable.
+    """
+    created = client.post(
+        "/api/targets",
+        json={"name": "gone", "mgmt_url": "https://splunk.example:8089", "token": "t"},
+    )
+    target_id = created.json()["id"]
+    assert client.delete(f"/api/targets/{target_id}").status_code == 204
+
+    # With that one deleted there are no targets left, and the hint says so
+    # rather than pretending to know whether the id was ever issued.
+    empty = client.get(f"/api/targets/{target_id}/samples")
+    assert empty.status_code == 404
+    assert "no targets at all" in empty.json()["detail"]
+
+    # With one present, an id within range reads differently from one beyond it.
+    kept = client.post(
+        "/api/targets",
+        json={"name": "kept", "mgmt_url": "https://splunk.example:8089", "token": "t"},
+    ).json()["id"]
+
+    beyond = client.get(f"/api/targets/{kept + 5000}/samples")
+    assert beyond.status_code == 404
+    assert "beyond anything this control plane has" in beyond.json()["detail"]
+
+    within = client.get(f"/api/targets/{max(1, kept - 1)}/samples")
+    if within.status_code == 404:
+        assert "within range" in within.json()["detail"]

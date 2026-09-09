@@ -36,6 +36,20 @@ with SmartStore enabled rather than taken from documentation:
     ``hotlist_recency_secs``. This is what turns "48 GB local" into "62% full",
     which is the number anyone actually wants.
 
+**Two routes to the same endpoint, and the reason for both.** The cache manager
+lives on the indexers. Reading it directly means a credential that is valid on
+the indexers and a network path to port 8089 on each of them, and on a real
+estate that is often exactly what an operator cannot provide: the indexers are
+private, the account only exists on the search tier, and the reading comes back
+"0 of 1 peers answered" while every search over that data plainly works.
+
+So the preferred route asks the search head instead, with
+``| rest splunk_server=* /services/admin/cacheman``, which the search head
+dispatches to its peers over the trust the cluster is already built on. No
+second credential, no second network path. The direct route stays as the
+fallback, and as the only way to *evict*: eviction is a POST per bucket and the
+search language cannot make one.
+
 **Eviction is not free and not hidden.** It is opt-in, it logs loudly, and it
 is never the default. Throwing away a warm cache means the next run pays to
 re-download everything it touches, which on a cloud object store costs real
@@ -47,12 +61,14 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 import urllib.parse
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Sequence, Set
 
 from .config import TargetConfig
 from .splunk import SplunkClient, SplunkError
+from .timepolicy import TimeWindow
 
 log = logging.getLogger("regulator.smartstore")
 
@@ -60,6 +76,26 @@ log = logging.getLogger("regulator.smartstore")
 # Paged, so a single response is never hundreds of megabytes of JSON built
 # synchronously by an instance that has just finished a load test.
 CACHEMAN_PAGE = 5000
+
+# Reading the cache manager through the search head instead of through each
+# indexer's management port. `| rest` with splunk_server=* is dispatched to the
+# search peers by the search head itself, so this needs no indexer credential,
+# no route to port 8089 on the indexers, and no knowledge of who the peers are.
+#
+# The fields carry colons, which SPL only accepts inside single quotes, so they
+# are renamed before anything else touches them. estimated_size is the honest
+# figure and journal_size the fallback, the same order the direct path uses.
+CACHEMAN_SPL = (
+    "| rest splunk_server=* /services/admin/cacheman count=0 "
+    "| eval bid=title, status='cm:bucket.status', "
+    "size=coalesce('cm:bucket.estimated_size', 'cm:bucket.journal_size') "
+    "| fields splunk_server, bid, status, size"
+)
+
+# A ceiling on what the search route will accept. Past this the reading is not
+# worth the load it puts on the thing being measured, and the direct route,
+# which pages per indexer, is the better tool.
+CACHEMAN_SEARCH_MAX_ROWS = 200_000
 PEERS_PATH = "/services/search/distributed/peers"
 
 CACHEMAN_PATH = "/services/admin/cacheman"
@@ -350,15 +386,137 @@ async def _close(indexers: Sequence[Indexer]) -> None:
                 pass
 
 
+async def _cacheman_via_search(
+    client: SplunkClient,
+) -> Optional[List[Dict[str, Any]]]:
+    """Read every peer's cache manager in one search, or None if that cannot work.
+
+    This is the route to prefer, and it exists because the direct one asks for
+    something operators frequently cannot give. Reading each indexer's
+    management port means Regulator needs a credential that is valid on the
+    indexers and a network path to port 8089 on every one of them. On a search
+    head cluster behind a load balancer, with the indexers on a private subnet
+    and an account that only exists on the search tier, neither is true, and
+    the symptom is a cache reading that says "0 of 1 peers answered" while
+    every search over that data is plainly working.
+
+    A search head already has both. `| rest splunk_server=*` is dispatched to
+    the search peers the same way any distributed search is, using the trust
+    the cluster is already built on, so this needs no second credential and no
+    second network path.
+
+    Returns None, not an empty list, when the route is unavailable, so the
+    caller can tell "this target cannot be read this way" from "this target has
+    no cached buckets".
+
+    Reads only. Eviction is a POST to /services/admin/cacheman/<bid>/evict on
+    the indexer that owns the bucket, and the search language has no way to
+    make it, so evicting still takes the direct route.
+    """
+    now = time.time()
+    # A rest search reads the current state of an endpoint; the window is
+    # required by the API and means nothing here.
+    window = TimeWindow(earliest=now - 60, latest=now)
+    try:
+        rows, _ = await client.oneshot(
+            CACHEMAN_SPL, window, count=CACHEMAN_SEARCH_MAX_ROWS
+        )
+    except SplunkError:
+        return None
+    except Exception:  # noqa: BLE001 - any failure here just means "use the other route"
+        return None
+    if not rows:
+        return None
+    # A search head with no cacheman anywhere answers with rows that carry no
+    # bid at all; that is not a cache reading, it is an empty rest result.
+    if not any(row.get("bid") for row in rows):
+        return None
+    return rows
+
+
+def _state_from_search_rows(rows: Sequence[Dict[str, Any]]) -> CacheState:
+    """Fold the search rows into the same CacheState the direct route builds."""
+    state = CacheState()
+    servers: Dict[str, Dict[str, Any]] = {}
+    multi = len({str(row.get("splunk_server") or "") for row in rows}) > 1
+
+    for row in rows:
+        bid = str(row.get("bid") or "")
+        if not bid:
+            continue
+        server = str(row.get("splunk_server") or "unknown")
+        # Namespaced per indexer for the same reason as the direct route: a
+        # replicated bucket exists on several peers and its cache state
+        # differs on each.
+        name = f"{server}|{bid}" if multi else bid
+        index = _index_of(bid)
+        size = _int(row.get("size"))
+        per = state.per_index.setdefault(index, IndexCache(index=index))
+        per.total_bytes += size
+        state.total_bytes += size
+
+        peer = servers.setdefault(
+            server, {"available": True, "buckets": 0, "local_buckets": 0, "local_bytes": 0}
+        )
+        peer["buckets"] += 1
+
+        if str(row.get("status", "")).lower() == STATUS_LOCAL:
+            state.local_buckets += 1
+            state.local_bytes += size
+            state.local_ids.add(name)
+            state.local_bytes_by_id[name] = size
+            per.local_buckets += 1
+            per.local_bytes += size
+            peer["local_buckets"] += 1
+            peer["local_bytes"] += size
+        else:
+            state.remote_buckets += 1
+            per.remote_buckets += 1
+
+    state.peers = servers
+    state.available = bool(servers)
+    return state
+
+
 async def cache_state(client: SplunkClient, **where: Any) -> CacheState:
     """Read the cache manager on every indexer. Never raises: absence is an answer.
 
     ``where`` is the indexer location and credential, as keyword arguments
     matching :func:`discover_indexers`.
     """
+    # The search head first: it needs no indexer credential and no route to
+    # the indexers' management ports, which is what the direct route below
+    # asks for and frequently cannot get. See _cacheman_via_search.
+    rows = await _cacheman_via_search(client)
+    if rows is not None:
+        state = _state_from_search_rows(rows)
+        state.notes.append(
+            f"read through the search head with `| rest splunk_server=*`: "
+            f"{len(state.peers)} peer(s) answered, no indexer credential needed"
+        )
+        if len(rows) >= CACHEMAN_SEARCH_MAX_ROWS:
+            state.notes.append(
+                f"the search returned the {CACHEMAN_SEARCH_MAX_ROWS} row ceiling, so this "
+                "reading is partial; set the indexer URLs on the target to read them "
+                "directly instead"
+            )
+        config = await _cache_config(client)
+        state.max_cache_size_mb = config.get("max_cache_size")
+        state.eviction_policy = config.get("eviction_policy")
+        state.hotlist_recency_secs = config.get("hotlist_recency_secs")
+        if state.max_cache_size_mb is not None and len(state.peers) > 1:
+            # max_cache_size is per indexer and the fill figure is against the
+            # estate's total, the same scaling the direct route does.
+            state.max_cache_size_mb = state.max_cache_size_mb * len(state.peers)
+        return state
+
     state = CacheState()
     indexers, notes = await discover_indexers(client, **where)
     state.notes.extend(notes)
+    state.notes.append(
+        "could not read the cache manager through the search head, so each indexer "
+        "was read directly; this is the path that needs an indexer credential"
+    )
     answered = 0
     try:
         for indexer in indexers:

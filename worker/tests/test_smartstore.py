@@ -22,6 +22,7 @@ import pytest
 
 from conftest import run_async
 from regulator_agent.config import load_config
+from regulator_agent import smartstore
 from regulator_agent.smartstore import (
     CacheState,
     cache_size_gb,
@@ -30,7 +31,7 @@ from regulator_agent.smartstore import (
     evict_all,
     render,
 )
-from regulator_agent.splunk import SplunkClient
+from regulator_agent.splunk import SplunkClient, SplunkError
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
@@ -74,6 +75,129 @@ def test_the_configured_ceiling_is_converted_from_mebibytes():
 
 
 # --------------------------------------------------------------- reading
+
+
+# ----------------------------------------------- reading via the search head
+
+
+def _search_rows(server_name="idx1", local=3, remote=2, index="main", size=1024):
+    """cacheman rows shaped as `| rest splunk_server=*` returns them."""
+    rows = []
+    for i in range(local + remote):
+        rows.append(
+            {
+                "splunk_server": server_name,
+                "bid": f"bid|{index}~{i}~GUID|",
+                "status": "local" if i < local else "remote",
+                "size": str(size),
+            }
+        )
+    return rows
+
+
+def test_the_cache_is_read_through_the_search_head_when_it_can_be(env, monkeypatch):
+    """The route that needs no indexer credential is the one that gets used.
+
+    Reading each indexer's management port needs a credential valid on the
+    indexers and a path to port 8089 on each of them. A search head already has
+    both, so `| rest splunk_server=*` is tried first and the direct route is
+    never reached.
+    """
+    splunkd = server(smartstore_buckets=100, smartstore_local_pct=40)
+
+    async def fake_oneshot(self, spl, window, count=100):
+        assert "/services/admin/cacheman" in spl
+        assert "splunk_server=*" in spl
+        return _search_rows(local=3, remote=2), 0
+
+    monkeypatch.setattr(SplunkClient, "oneshot", fake_oneshot)
+
+    # If the direct route were reached this would fire; it must not.
+    def refuse(*_args, **_kwargs):
+        raise AssertionError("the direct indexer route should not have been used")
+
+    monkeypatch.setattr(smartstore, "discover_indexers", refuse)
+
+    try:
+        state = with_client(splunkd, env, cache_state)
+    finally:
+        splunkd.close()
+
+    assert state.available is True
+    assert state.local_buckets == 3
+    assert state.remote_buckets == 2
+    assert state.per_index["main"].local_buckets == 3
+    assert any("through the search head" in note for note in state.notes)
+
+
+def test_a_replicated_bucket_is_counted_per_peer_not_once(env, monkeypatch):
+    """The same bucket on two peers has two independent cache states.
+
+    Collapsing them would under-report the local set, and the local set is what
+    the before/after delta compares to decide whether a run read cold.
+    """
+    splunkd = server(smartstore_buckets=100, smartstore_local_pct=40)
+
+    async def fake_oneshot(self, spl, window, count=100):
+        rows = _search_rows("idx1", local=2, remote=0)
+        rows += _search_rows("idx2", local=2, remote=0)
+        return rows, 0
+
+    monkeypatch.setattr(SplunkClient, "oneshot", fake_oneshot)
+    try:
+        state = with_client(splunkd, env, cache_state)
+    finally:
+        splunkd.close()
+
+    assert state.local_buckets == 4
+    assert set(state.peers) == {"idx1", "idx2"}
+    # Namespaced, so the two copies of bid 0 are distinct identities.
+    assert len(state.local_ids) == 4
+
+
+def test_it_falls_back_to_reading_the_indexers_directly(env, monkeypatch):
+    """When the search route cannot answer, the direct one still can.
+
+    A single instance with no search peers, an account without the capability
+    to run `| rest`, or a version that returns nothing useful: all of them have
+    to end up on the direct route rather than reporting an empty cache.
+    """
+    splunkd = server(smartstore_buckets=100, smartstore_local_pct=40)
+
+    async def refuse_oneshot(self, spl, window, count=100):
+        raise SplunkError("rest command not permitted for this account")
+
+    monkeypatch.setattr(SplunkClient, "oneshot", refuse_oneshot)
+    try:
+        state = with_client(splunkd, env, cache_state)
+    finally:
+        splunkd.close()
+
+    assert state.available is True
+    assert state.total_buckets == 100
+    assert any("read directly" in note for note in state.notes)
+
+
+def test_an_empty_rest_result_is_not_mistaken_for_an_empty_cache(env, monkeypatch):
+    """A search head with no cacheman anywhere returns rows with no bid.
+
+    Treating that as "the cache is empty" would report a warm estate as fully
+    evicted, so it has to fall through to the direct route instead.
+    """
+    splunkd = server(smartstore_buckets=100, smartstore_local_pct=40)
+
+    async def empty_oneshot(self, spl, window, count=100):
+        return [{"splunk_server": "sh1"}], 0
+
+    monkeypatch.setattr(SplunkClient, "oneshot", empty_oneshot)
+    try:
+        state = with_client(splunkd, env, cache_state)
+    finally:
+        splunkd.close()
+
+    assert state.available is True
+    assert state.total_buckets == 100
+    assert any("read directly" in note for note in state.notes)
 
 
 def test_a_non_smartstore_instance_says_so_rather_than_reporting_zeroes(env):

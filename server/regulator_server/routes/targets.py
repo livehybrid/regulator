@@ -13,7 +13,7 @@ from typing import Any, Dict, List, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import PlainTextResponse
-from sqlalchemy import select
+from sqlalchemy import select, func
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
@@ -51,9 +51,36 @@ EVICT_TIMEOUT_S = 600.0
 
 def _get_target(session: Session, target_id: int) -> Target:
     target = session.get(Target, target_id)
-    if target is None:
-        raise HTTPException(status_code=404, detail=f"no target with id {target_id}")
-    return target
+    if target is not None:
+        return target
+    # A bare "no target with id 7" is not enough to act on, and this endpoint
+    # has produced a 404 for an id the caller had just been handed a 201 for.
+    # Whether that id is below or above the highest one this database has ever
+    # issued separates the two explanations, and neither is guessable after the
+    # fact: below means the row existed and is gone (deleted, or a different
+    # database is being read than was written), above means it was never here
+    # (the caller is talking to a different control plane than it created on).
+    # Only what can actually be known. The highest id is taken from the rows
+    # that survive, not from a sequence: SQLite reuses ids after a delete
+    # unless the column is AUTOINCREMENT, so "this id was never issued" is not
+    # something this can honestly claim.
+    highest = session.scalar(select(func.max(Target.id)))
+    if highest is None:
+        hint = (
+            "this control plane has no targets at all, so either every one was "
+            "deleted or this is not the database the target was created in"
+        )
+    elif target_id <= highest:
+        hint = (
+            f"targets up to id {highest} exist here, so this id is within range and "
+            "the target was deleted, or this is not the database it was created in"
+        )
+    else:
+        hint = (
+            f"the highest id here is {highest}, so this id is beyond anything this "
+            "control plane has: check it is the one the target was created on"
+        )
+    raise HTTPException(status_code=404, detail=f"no target with id {target_id}; {hint}")
 
 
 async def _with_client(target: Target, coro_factory, timeout_s: float):
@@ -122,6 +149,14 @@ def create_target(body: TargetCreate, session: Session = Depends(get_session)) -
     session.add(target)
     try:
         session.flush()
+        # Committed here rather than left to the request teardown. A 201 hands
+        # the caller an id and the caller immediately uses it, so the row has
+        # to exist by the time the response does. Returning after a flush meant
+        # the id came out of a transaction that had not landed yet, and a
+        # client that created a target and read it back could get its own id
+        # as a 404. Runs already commit here for the same reason; targets did
+        # not, and that is the difference the bug lived in.
+        session.commit()
     except IntegrityError:
         session.rollback()
         raise HTTPException(status_code=409, detail=f"a target named {body.name!r} already exists")
