@@ -163,7 +163,7 @@ export default function LineChart({
                 closeOnClickAway
                 style={{ width: 'min(1400px, 94vw)' }}
             >
-                <Modal.Header title={title} onRequestClose={() => setOpen(false)} />
+                <Modal.Header title={title} />
                 <Modal.Body>
                     {open && <SizedChart {...chartProps} height={Math.round(height * 2.1)} />}
                     {note ? <Muted $small>{note}</Muted> : null}

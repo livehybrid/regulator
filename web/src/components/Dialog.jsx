@@ -43,7 +43,10 @@ export default function Dialog({
             closeOnClickAway={dismissable}
             style={{ width: `min(${width}, 94vw)` }}
         >
-            <Modal.Header title={title} onRequestClose={onClose} />
+            {/* The close button belongs to Modal, not to its header: Modal
+                renders it because it was given onRequestClose above. Passing
+                the handler here too puts an unknown prop on a DOM node. */}
+            <Modal.Header title={title} />
             <Modal.Body style={{ maxHeight: 'min(70vh, 720px)' }}>{children}</Modal.Body>
             <Modal.Footer>
                 <Button appearance="secondary" onClick={onClose} label={closeLabel} />
