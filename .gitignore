@@ -12,9 +12,17 @@ htmlcov/
 dist/
 build/
 
-# Node, for the Phase 1 UI shell
+# Node
 node_modules/
 ui/dist/
+
+# The operator console is compiled from web/ into server/ui by `make ui`, and
+# the whole of server/ui is generated: an index.html naming a content-hashed
+# bundle, and the bundle itself. Committing a 1.5 MB minified artefact would
+# conflict on every branch and tell a reviewer nothing, so it is built rather
+# than tracked. The Docker image builds it in its own stage; running from a
+# checkout needs `make ui` once (the server says so if it is missing).
+server/ui/
 
 # Docs build output
 site/

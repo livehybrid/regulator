@@ -104,6 +104,41 @@ jobs:
       - name: Control-plane tests
         run: python -m pytest server/tests -q --timeout=300
 
+  ui:
+    runs-on: ubuntu-latest
+    concurrency:
+      group: ${{ github.workflow }}-test-${{ github.event.pull_request.number || github.ref }}-ui
+      cancel-in-progress: true
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+
+      # npm ci, not npm install: the lockfile is the input, so a dependency
+      # cannot drift under CI without someone committing the change.
+      - name: Install
+        working-directory: web
+        run: npm ci --no-audit --no-fund
+
+      - name: Lint
+        working-directory: web
+        run: npm run lint
+
+      - name: Build the console
+        working-directory: web
+        run: npm run build
+
+      # Loads the bundle this job just built into jsdom against a stubbed API
+      # and walks every route. It is the check that stops a console that
+      # compiles but throws on render from reaching an image.
+      - name: Render every page
+        working-directory: web
+        run: npm run smoke
+
   browser-test:
     runs-on: ubuntu-latest
     concurrency:
@@ -219,6 +254,16 @@ jobs:
           curl -fsS -c cookies.txt -H 'Content-Type: application/json' \
             -d '{"password":"ci-password"}' http://127.0.0.1:18080/api/auth/login
           curl -fsS -b cookies.txt http://127.0.0.1:18080/api/scenarios | python3 -c 'import json,sys; s=json.load(sys.stdin); assert len(s) >= 20, len(s); print(len(s), "scenarios in the image")'
+          # The console is compiled in the image's first stage and copied into
+          # the second. That COPY is easy to break and nothing else notices:
+          # the API keeps answering and only the page is gone. So the page is
+          # fetched, the bundle it names is read out of it, and the bundle is
+          # fetched too.
+          curl -fsS http://127.0.0.1:18080/ -o index.html
+          BUNDLE="$(python3 -c 'import re,sys; m=re.search(r"src=\"?(/assets/[^\" >]+)", open("index.html").read()); print(m.group(1) if m else "")')"
+          test -n "$BUNDLE" || { echo "the served page names no bundle"; cat index.html; exit 1; }
+          echo "console bundle: $BUNDLE"
+          curl -fsS "http://127.0.0.1:18080${BUNDLE}" -o /dev/null
           docker logs cp | tail -20
           docker rm -f cp
 
@@ -347,7 +392,7 @@ jobs:
         run: cosign sign --yes "${IMAGE_NAME}@${{ steps.push.outputs.digest }}"
 
   cp-build:
-    needs: [test, server-test, smoke, image-smoke]
+    needs: [test, server-test, ui, smoke, image-smoke]
     if: github.event_name == 'push'
     runs-on: ubuntu-latest
     concurrency:

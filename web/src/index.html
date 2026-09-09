@@ -1,0 +1,23 @@
+<!doctype html>
+<html lang="en-GB">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="referrer" content="same-origin">
+<title>Regulator</title>
+<style>
+  /* Only what has to exist before React mounts. Everything else is themed by
+     @splunk/themes, so this must not fight it: the background is the one the
+     enterprise dark theme paints, and it is replaced the moment the app
+     renders. */
+  html, body { height: 100%; }
+  body { margin: 0; background: #0e1114; color: #c3cbd4;
+         font-family: "Splunk Platform Sans", Roboto, Droid, "Helvetica Neue", Helvetica, Arial, sans-serif; }
+  #boot { display: flex; align-items: center; justify-content: center; height: 100vh;
+          font-size: 13px; letter-spacing: .04em; opacity: .6; }
+</style>
+</head>
+<body>
+<div id="regulator-root"><div id="boot">Loading Regulator&hellip;</div></div>
+</body>
+</html>

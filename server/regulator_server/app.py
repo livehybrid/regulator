@@ -5,11 +5,26 @@ themselves by being imported, so adding a feature never means editing this file
 (a convention taken from Stoker, where it kept a 2000-line router file from
 becoming a 2000-line app file as well).
 
-**The UI is one self-contained HTML file with no build step.** That is a
-deliberate choice rather than a stopgap: no npm, no node_modules in the image,
-no build stage in CI, and nothing to go stale. It buys a page an operator can
-read the source of. If the UI ever needs real charting libraries, that is the
-point to reconsider, not before.
+**The UI is built from Splunk's own React component library** (@splunk/react-ui
+and @splunk/themes) and lives in web/. `make ui` compiles it into server/ui as
+an index.html and one hashed bundle under server/ui/assets, both of which this
+module serves and neither of which is hand-edited.
+
+This replaced a single hand-written HTML file that had no build step at all.
+That was a real property to give up, and it was given up on purpose: an
+operator console for Splunk that does not look like Splunk makes people read
+its numbers with the wrong instincts, and the component library is what buys
+the tables, dialogs, form controls, empty states and light/dark theming that
+a hand-rolled page keeps almost, but not quite, right.
+
+The charts are @splunk/visualizations, the same Line component Dashboard
+Studio renders, so their axes, legends, tooltips and palette are Splunk's too.
+
+What was kept is the part that mattered: the bundle is entirely self-hosted.
+No CDN, no external font, no runtime fetch of a library, because Regulator is
+routinely pointed at production clusters from networks with no route out. That
+is what makes the bundle large; it is served once, from the same host as the
+API, and being large is a better problem than not loading at all.
 """
 
 from __future__ import annotations
@@ -20,6 +35,7 @@ from typing import Any, Dict
 
 from fastapi import FastAPI, Request, Response
 from fastapi.responses import FileResponse, JSONResponse
+from fastapi.staticfiles import StaticFiles
 
 from . import auth
 from .adapters import scenarios_dir, user_scenarios_dir
@@ -41,6 +57,7 @@ log = logging.getLogger("regulator.server")
 
 UI_DIR = Path(__file__).resolve().parents[1] / "ui"
 UI_INDEX = UI_DIR / "index.html"
+UI_ASSETS = UI_DIR / "assets"
 
 __version__ = "0.1.0"
 
@@ -161,15 +178,27 @@ def create_app() -> FastAPI:
 
     # ------------------------------------------------------------------- ui
 
+    # The bundle is content-hashed by the build, so its name changes whenever
+    # its contents do and it can be cached hard and for ever. index.html is the
+    # opposite: it names the current bundle, so it must never be cached.
+    if UI_ASSETS.is_dir():
+        app.mount("/assets", StaticFiles(directory=UI_ASSETS), name="assets")
+    else:
+        log.warning(
+            "no UI assets at %s: the console will not load. Run `make ui` "
+            "(or build the image, which does it in its own stage).",
+            UI_ASSETS,
+        )
+
     @app.get("/")
     async def index() -> Response:
         if not UI_INDEX.is_file():
             return JSONResponse(
-                {"detail": "the UI is not present in this build", "api": "/docs"},
+                {"detail": "the UI is not present in this build", "api": "/api/docs"},
                 status_code=404,
             )
-        # No-store rather than a cache header: the page is small, and an
-        # operator reloading after an upgrade must never get the old one.
+        # No-store rather than a cache header: an operator reloading after an
+        # upgrade must never get a page pointing at a bundle that has gone.
         return FileResponse(UI_INDEX, media_type="text/html", headers={"Cache-Control": "no-store"})
 
     return app

@@ -1,9 +1,32 @@
 # syntax=docker/dockerfile:1
 # Build from the repo root: docker buildx build -f server/Dockerfile -t regulator .
 #
-# One stage, because there is nothing to build. The UI is a single
-# self-contained HTML file with no bundler, so this image has no Node in it at
-# all: nothing to install, nothing to cache, nothing to go stale.
+# Two stages. The first compiles the operator console from web/ with Node; the
+# second is the image that actually runs, and has no Node, no npm and no
+# node_modules in it at all. Only the built bundle crosses between them.
+#
+# The console is built here rather than committed because a 1.5 MB minified
+# artefact in git conflicts on every branch and tells a reviewer nothing. The
+# cost is that this image cannot be built without a network the first time;
+# the benefit is that the bundle can never be out of step with its sources,
+# which is the failure the old committed-HTML arrangement invited.
+
+# ----------------------------------------------------------------- ui build
+FROM node:20-slim AS ui
+
+WORKDIR /ui
+
+# Dependencies first, and only the manifests, so a change to the console's
+# source does not re-download the Splunk component library.
+COPY web/package.json web/package-lock.json web/.npmrc ./
+RUN npm ci --no-audit --no-fund
+
+COPY web/ ./
+# The build writes to ../server/ui, which is outside this WORKDIR by design:
+# it is where the control plane looks for the console.
+RUN mkdir -p /server/ui && npm run build
+
+# ------------------------------------------------------------------ runtime
 FROM python:3.12-slim
 
 ENV PYTHONUNBUFFERED=1 \
@@ -22,8 +45,11 @@ RUN pip install --no-cache-dir -r /app/worker-requirements.txt -r /app/server-re
 
 COPY worker/regulator_agent /app/regulator_agent
 COPY server/regulator_server /app/regulator_server
-COPY server/ui /app/ui
 COPY scenarios /app/scenarios
+
+# The console, from the Node stage. index.html plus one content-hashed bundle
+# under assets/; app.py serves the first and mounts the second.
+COPY --from=ui /server/ui /app/ui
 
 ENV PYTHONPATH=/app \
     REG_BUILTIN_SCENARIOS_DIR=/app/scenarios \

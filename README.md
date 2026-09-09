@@ -361,10 +361,76 @@ the environment; everything downstream of the claim is the standalone code.
 | `REG_MAX_RUN_DURATION_S` | `14400` | The longest run accepted, so a mistyped duration cannot hold a slot for ever |
 | `REG_SESSION_TTL_S` | `43200` | Sessions are bound to the password as well as the key: changing the password signs everyone out |
 
-**The UI is one self-contained HTML file with no build step.** No npm, no
-node_modules in the image, no build stage in CI, nothing to go stale, and an
-operator can read its source. The control-plane image has no Node in it at all.
-If the UI ever needs real charting libraries, that is the point to reconsider.
+### The operator console
+
+The console is built from **Splunk's own React component library**
+(`@splunk/react-ui`, `@splunk/themes`), so it uses the same tables, dialogs,
+form controls, chips and messages as Splunk Web, and follows the light and dark
+themes with it. That matters more than it sounds: this is a tool for reading
+numbers about a Splunk cluster, and a page that looks like Splunk is a page
+people read with the right instincts.
+
+The sources are in `web/` and compile into `server/ui`, which is **generated
+and not tracked in git**. Running the control plane from a checkout therefore
+needs one build first:
+
+```bash
+make ui            # install and compile, into server/ui
+make ui-watch      # rebuild on every change, while you work on it
+make ui-lint       # Splunk's eslint config, the same set CIMplicity uses
+make ui-smoke      # build, then render every page of it in jsdom
+```
+
+The Docker image builds it in its own Node stage and copies out only the
+result, so the image that runs has no Node, no npm and no `node_modules` in it.
+CI lints it, builds it, renders every page, and then checks the packaged image
+actually serves the bundle its page names.
+
+The charts are `@splunk/visualizations` **Line** charts, the same component
+Dashboard Studio renders, so the axes, gridlines, legend, tooltips, hover
+behaviour and series palette are the ones people already know:
+
+- A second y-axis is `overlayFields` + `showOverlayY2Axis`, which is how Studio
+  does an overlay. That is the "in flight against the concurrency ceiling"
+  chart.
+- Evictions, stops and lost workers are chart annotations, so the library draws
+  each as a dashed rule in the marker's colour with its label on hover. Pass
+  them as plain `annotationX`/`annotationLabel`/`annotationColor` arrays: the
+  dataSource-plus-DSL form from Splunk's examples is how a Studio dashboard
+  binds a search to them, and outside a dashboard it silently draws nothing.
+- Gaps are `nullValueDisplay: gaps`, so a worker that went quiet looks like a
+  hole rather than like steady throughput.
+- The x field is `_time`, in ISO 8601, so the axis is a real time axis. A spike
+  on a run chart therefore lines up with wall-clock time in the customer's own
+  dashboards, which is most of the point of running the test beside their
+  Splunk.
+
+`web/src/components/LineChart.jsx` is the only file that knows about Splunk's
+dataSource contract. Everything upstream still passes plain
+`[epochSeconds, value]` arrays, so pages stay readable.
+
+The one exception is the p95 sparkline in the runs table, which is still a
+hand-drawn SVG: it is a 120x26 glyph in a table cell, one per row, and a chart
+instance per row of a fifty-row table is a real cost for something that has no
+axes, legend or tooltip to be inconsistent about.
+
+Two other things are worth knowing:
+
+- **Everything is self-hosted.** No CDN, no external font, no runtime fetch of
+  a library. Regulator is routinely pointed at production clusters from
+  networks with no route out, and a console that needs the internet to render
+  is a console that does not render. That is what makes the bundle large. It is
+  served once, from the same host as the API.
+- **The chart library expects Splunk Web's page globals.** The charting bundle
+  underneath it is the same code Splunk Web ships, and it reads `locale_name`
+  and `$C` off `window` while it is being evaluated. `web/src/splunk-web-globals.js`
+  defines them, and is imported before anything that reaches a chart; without
+  it the bundle throws `window.locale_name is not a function` on load.
+
+This replaced a single hand-written HTML file with no build step at all. That
+was a real property to give up and it was given up on purpose: the component
+library is what buys the tables, dialogs, empty states, keyboard behaviour and
+theming that a hand-rolled page keeps almost, but never quite, right.
 
 ## Quick start
 
