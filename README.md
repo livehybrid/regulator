@@ -103,6 +103,40 @@ The Secret is a separate, ignored file on purpose: a placeholder key is a fatal
 boot error rather than a quiet default, and a real one must never be one
 careless `git add` away from a public repository.
 
+### Deploying it without touching files
+
+Everything a Regulator instance needs can arrive through the environment, so
+the people who run it need no shell on the box and no second setup pass. Three
+variables do it:
+
+| Variable | What it removes |
+|---|---|
+| `REG_MASTER_KEY` | The reason a restore would not work. It is the one thing that must survive a teardown, which in Kubernetes it already does: a Secret outlives a volume |
+| `REG_CONFIG_IMPORT` | The targets step. Point it at a mounted JSON file (or paste the JSON in) and the instance comes up with its targets and your own scenarios already registered. The file is what the console's **Configuration** page downloads |
+| `REG_SCENARIO_SOURCE` | The scenario step, for a library shared between instances. Point it at `s3://bucket/prefix` (or a mounted directory) and every instance pulls the same scenarios at boot. Add `REG_SCENARIO_SOURCE_WRITE=1` on the one instance that should be allowed to push back |
+
+The two are complementary rather than alternatives. A config document carries
+the scenarios you had when you took it, which is what you want for "bring this
+instance back". A scenario source is live and shared, which is what you want
+for "everybody runs the same library", and it is also how a scenario authored
+on one instance reaches the others without a config round trip.
+
+[Stoker](https://github.com/livehybrid/stoker), the data-load half of the pair,
+takes the same three in its own spelling - `STOKER_MASTER_KEY`,
+`STOKER_CONFIG_IMPORT` and `STOKER_PACK_SOURCE` (plus
+`STOKER_PACK_SOURCE_WRITE`) - so a combined deployment is one chart with two
+config documents and two prefixes, and neither product needs anybody to log in
+and configure it by hand before the first run.
+
+One thing worth stating plainly: a config document's credentials are the stored
+ciphertext, not plain text. That is deliberate (the file is destined for a
+ConfigMap or a git repo, and live splunkd credentials do not belong in either),
+and it means a restore under a different master key restores the configuration
+but not the credentials. The document records an eight-character fingerprint of
+the key it was made under, so that case reports itself immediately instead of
+turning up later as a pile of authentication failures. Download with
+credentials excluded for a copy that is safe to commit.
+
 ## Running it on Docker Swarm through Portainer
 
 The homelab path, and the same shape as Stoker's:
@@ -356,6 +390,10 @@ the environment; everything downstream of the claim is the standalone code.
 | `REG_USER_SCENARIOS_DIR` | next to the database | Where scenarios created through the web interface or the API are written. Separate from the built-in library, so an image upgrade never overwrites yours |
 | `REG_HEC_URL` / `REG_HEC_TOKEN` / `REG_HEC_INDEX` / `REG_HEC_VERIFY_TLS` | off | Where every run launched here ships its telemetry, exactly as the worker's variables of the same name |
 | `REG_SEED_TARGET_URL` and friends | unset | A target registered or updated at boot (`_NAME`, `_WEB_URL`, `_TOKEN` or `_USERNAME` and `_PASSWORD`, `_VERIFY_TLS`). What makes a nightly-rebuilt deployment runnable with no web step |
+| `REG_CONFIG_IMPORT` | unset | A path to a mounted JSON file, or the JSON itself, restored at boot: the targets and scenarios the Configuration page downloads. Applied before any traffic is served and never fatal, because a typo in a ConfigMap must not stop the control plane starting. Credentials in it are the stored ciphertext, so it needs the **same `REG_MASTER_KEY`** |
+| `REG_SCENARIO_SOURCE` | unset | A shared scenario library: `s3://bucket/prefix`, or a mounted directory. Pulled at boot as one `.tar.gz` per scenario, in the format the console's Download and Upload already speak. Import is create-if-absent, so a local edit survives a restart, and one unreadable object is reported rather than aborting the sync |
+| `REG_SCENARIO_SOURCE_WRITE` | off | Also push scenarios created here back to that prefix. A separate switch because the common case is a curated library several instances read, and one of them silently overwriting it would be hard to notice |
+| `REG_SCENARIO_UPLOAD_MAX_ARCHIVE_BYTES` and friends | 16 MiB | Extraction-bomb caps for an uploaded scenario archive (`_MAX_MEMBERS` 2000, `_MAX_MEMBER_BYTES` 8 MiB, `_MAX_TOTAL_BYTES` 32 MiB). Enforced on the bytes produced while streaming, never on the sizes the archive declares |
 | `REG_MAX_VIRTUAL_USERS` | `500` | The in-process ceiling described above. The open model is held to the same ceiling of in-flight searches |
 | `REG_MAX_CONCURRENT_RUNS` | `2` | More at once would mean measuring contention between your own tests |
 | `REG_MAX_RUN_DURATION_S` | `14400` | The longest run accepted, so a mistyped duration cannot hold a slot for ever |

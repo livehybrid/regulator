@@ -11,6 +11,10 @@ of the control plane follow Stoker's design closely enough to say so:
 | `server/regulator_server/fleet.py` | `server/fleet.py` and the lease model | the claim protocol: leases fenced by a fresh id on every hand-over, one shared T0, heartbeats as the command channel, finals merged from raw histograms, lost leases on a lapsed heartbeat, a partial release at the provisioning timeout |
 | `server/regulator_server/drivers/{base,swarm,k8s,fake}.py` | `server/drivers/*` | the driver contract; the Swarm driver's digest pinning and scale-to-zero stop; the Kubernetes Indexed Job with the token in an adopted Secret. Regulator adds the run token as a swarm secret, engine-aware claims and per-group slot bases |
 | `worker/regulator_agent/managed.py` | the agent's managed mode | claim, ready, heartbeat, final, with the dead-man and the superseded exit; Regulator's heartbeats start at the claim and carry interval buckets |
+| `server/regulator_server/configio.py` | `server/configio.py` | the whole design: configuration exported as JSON, nothing addressed by id, secrets as the stored ciphertext with a master-key fingerprint, idempotent upsert on import, an env var applied at boot that never raises. Entities are Regulator's own (targets and the operator's scenario library, where Stoker has targets, repos and specs) |
+| `server/regulator_server/scenarioarchive.py` | `server/packupload.py` + `server/packexport.py` | the extraction guards verbatim in intent (traversal chokepoint, links and special files refused, caps on streamed bytes, staging directory removed on rejection, format from magic bytes) and the reproducible-archive recipe. Merged into one module and much smaller: a scenario is text, so there is no dataset fetch, no builder config and no arbitrary `source_path` to bound |
+| `server/regulator_server/scenariosource.py` | `server/packsource.py` | `Store`/`DirectoryStore`/`S3Store`, `open_store`, the two-env-var read/write split, create-if-absent import, best-effort publish, `describe()` for the console, and a boot hook that never raises. Regulator's scenarios are directories rather than database rows, so the sync writes files and keeps no index |
+| `server/regulator_server/routes/config.py` | `server/routes/config.py` | the two endpoints and their semantics (a download that is `no-store`, a sanitised variant, an import that reports rather than failing) |
 
 The distributed-execution skeleton was adapted in phase 7 and hardened in
 phase 8; the rest of this file is the original account of what was taken and
@@ -71,6 +75,11 @@ Stoker `e367ea1` (`e367ea148e8ad35d07622c7408ffd2ac8d877ca9`, 2026-09-02,
 the commit the Phase 1 plan was written against and the default source for
 every planned row below. Source tree on the build host:
 `/opt/aios/apps/stoker`.
+
+The configuration-backup and scenario-source rows above came later, from Stoker
+`7350966` (2026-10-08, "Sweep a backfill in order, and give the pack source a
+Push button"), which is the commit that added the Push affordance those three
+modules mirror.
 
 ## Inventory
 

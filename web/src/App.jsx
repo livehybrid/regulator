@@ -23,6 +23,7 @@ import styled, { createGlobalStyle } from 'styled-components';
 
 import Audit from './pages/Audit';
 import Baselines from './pages/Baselines';
+import Configuration from './pages/Configuration';
 import LaunchModal from './modals/LaunchModal';
 import Login from './pages/Login';
 import RunDetail from './pages/RunDetail';
@@ -105,6 +106,9 @@ const NAV = [
     { route: 'runs', label: 'Runs' },
     { route: 'baselines', label: 'Baselines' },
     { route: 'audit', label: 'Audit' },
+    // Last because it is the page you visit twice: once to take a backup, once
+    // to restore one onto a rebuilt instance.
+    { route: 'config', label: 'Configuration' },
 ];
 
 // A run page belongs under Runs, and a target's history under Targets, so the
@@ -279,6 +283,8 @@ function Page({ page, id, navigate, onLaunch }) {
             return <Baselines navigate={navigate} />;
         case 'audit':
             return <Audit />;
+        case 'config':
+            return <Configuration />;
         default:
             return <Targets navigate={navigate} onLaunch={onLaunch} />;
     }

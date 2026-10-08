@@ -5,6 +5,12 @@ own, written here. A scenario created through this API is a directory holding
 the pasted ``savedsearches.conf`` verbatim and a generated ``scenario.yaml``
 that points at it, so what runs is exactly what was pasted and a Splunk admin
 can read both files.
+
+A scenario also moves between instances as a single ``.tar.gz``: Download and
+Upload are the two directions, and a configured scenario source (S3 or a
+mounted directory, see :mod:`..scenariosource`) is the same artefact pulled at
+boot and pushed on save, so a second control plane needs no shell access to
+end up with the same library.
 """
 
 from __future__ import annotations
@@ -15,19 +21,45 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 import yaml
-from fastapi import APIRouter, HTTPException, Request
-from fastapi.responses import PlainTextResponse
+from fastapi import APIRouter, File, Form, HTTPException, Request, UploadFile
+from fastapi.responses import PlainTextResponse, Response
 
 from regulator_agent import savedsearches as ss
 from regulator_agent.scenario import ScenarioError, lint, load_scenario
 
+from .. import scenariosource
 from ..adapters import list_scenarios, scenario_path, scenario_summary, user_scenarios_dir
 from ..audit import record as audit_record
+from ..config import get_settings
+from ..scenarioarchive import (
+    ArchiveLimits,
+    ScenarioArchiveError,
+    archive_name,
+    export_scenario_bytes,
+    extract_scenario,
+)
 from ..schemas import SavedSearchPreview, ScenarioCreate, ScenarioOut
 
 log = logging.getLogger("regulator.server.scenarios")
 
 router = APIRouter(prefix="/api/scenarios", tags=["scenarios"])
+
+# A second router because the scenario SOURCE is not a scenario: hanging it off
+# /api/scenarios would put a literal path in the same space as /{name} and
+# leave the two depending on declaration order.
+source_router = APIRouter(prefix="/api", tags=["scenarios"])
+
+
+@source_router.get("/scenario-source")
+def get_scenario_source() -> Dict[str, Any]:
+    """Where scenarios are pulled from and pushed to, so the console can say so.
+
+    Reported because the feature is otherwise invisible: the library would be
+    synced at boot and mirrored on save because two environment variables
+    happened to be set, with nothing in the product to confirm it. Read only
+    and credential free (see :func:`..scenariosource.describe`).
+    """
+    return scenariosource.describe()
 
 
 @router.get("", response_model=List[ScenarioOut])
@@ -240,6 +272,10 @@ def create_scenario(body: ScenarioCreate, request: Request) -> Dict[str, Any]:
         raise HTTPException(status_code=422, detail=str(exc))
 
     audit_record("scenario_created", request=request, detail=f"{body.name}: {len(selected)} searches")
+    # Mirror to the scenario source when one is configured for writing, so a
+    # scenario written here reaches the other instances pulling from it. Best
+    # effort: a refused write must never fail the save that produced it.
+    scenariosource.publish_scenario(body.name, directory)
     summary = scenario_summary(scenario, "user")
     summary["saved_selected"] = selected
     summary["saved_skipped"] = dict(scenario.saved_skipped)
@@ -273,3 +309,142 @@ def get_scenario_conf(name: str) -> str:
     if not conf.is_file():
         raise HTTPException(status_code=404, detail="this scenario has no savedsearches.conf")
     return conf.read_text(encoding="utf-8")
+
+
+# --------------------------------------------------------------------------- #
+# Archives: one scenario in, one scenario out
+# --------------------------------------------------------------------------- #
+
+@router.get("/{name}/export")
+def export_scenario(name: str) -> Response:
+    """Download a scenario as the ``.tar.gz`` that Upload accepts elsewhere.
+
+    Works for a built-in scenario as well as an operator's own: copying one of
+    the shipped scenarios to another instance and editing it there is a
+    reasonable thing to want, and the archive is the same shape either way.
+    Reproducible, so re-exporting an unchanged scenario gives identical bytes
+    and a checksum is worth comparing.
+    """
+    try:
+        directory, _origin = scenario_path(name)
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
+    try:
+        payload = export_scenario_bytes(directory, name)
+    except ScenarioArchiveError as exc:
+        raise HTTPException(status_code=409, detail=str(exc))
+    filename = archive_name(name)
+    return Response(
+        content=payload,
+        media_type="application/gzip",
+        headers={
+            "Content-Disposition": f'attachment; filename="{filename}"',
+            "X-Regulator-Scenario": name,
+        },
+    )
+
+
+@router.post("/upload", status_code=201)
+async def upload_scenario(
+    request: Request,
+    file: UploadFile = File(..., description="a .tar.gz/.tgz/.tar or .zip of one scenario"),
+    name: Optional[str] = Form(default=None, description="override the scenario's name"),
+    replace: bool = Form(default=False, description="overwrite a scenario of the same name"),
+) -> Dict[str, Any]:
+    """Upload a scenario archive into the operator's library.
+
+    The mirror of Download, and the no-git, no-shell path onto an instance. The
+    archive is untrusted input, so extraction is the careful part and lives in
+    :mod:`..scenarioarchive`; what lands here is a scenario that has been
+    loaded and linted, because an archive that extracts but does not parse is a
+    scenario that would fail at launch instead of at upload.
+    """
+    settings = get_settings()
+    cap = settings.scenario_upload_max_archive_bytes
+    data = await file.read(cap + 1)
+    if len(data) > cap:
+        raise HTTPException(
+            status_code=413,
+            detail=f"the archive is larger than the {cap}-byte upload limit",
+        )
+    if not data:
+        raise HTTPException(status_code=422, detail="the upload is empty")
+
+    library = user_scenarios_dir()
+    try:
+        directory = extract_scenario(
+            data,
+            library,
+            limits=ArchiveLimits.from_settings(settings),
+            name_hint=name or None,
+            overwrite=bool(replace),
+        )
+    except ScenarioArchiveError as exc:
+        raise HTTPException(status_code=422, detail=str(exc))
+
+    # Loaded and linted AFTER extraction, with the directory removed again on
+    # failure: a scenario that does not parse must not sit in the library
+    # waiting to fail at launch.
+    try:
+        scenario = load_scenario(directory)
+        problems = [line for line in lint(scenario) if not line.startswith("advice: ")]
+    except Exception as exc:  # noqa: BLE001 - any parse failure at all is a 422
+        shutil.rmtree(directory, ignore_errors=True)
+        raise HTTPException(
+            status_code=422, detail=f"the archive extracted but does not load: {exc}"
+        )
+    if problems and any("does not lint" in p or "needs" in p for p in problems):
+        shutil.rmtree(directory, ignore_errors=True)
+        raise HTTPException(
+            status_code=422, detail="the scenario does not lint: " + "; ".join(problems[:5])
+        )
+
+    audit_record(
+        "scenario_uploaded",
+        request=request,
+        detail=f"{directory.name} ({len(data)} bytes, {len(scenario.steps)} step(s))",
+    )
+    scenariosource.publish_scenario(directory.name, directory)
+    summary = scenario_summary(scenario, "user")
+    summary["advice"] = [line for line in lint(scenario) if line.startswith("advice: ")]
+    return summary
+
+
+@router.post("/{name}/publish")
+def publish_scenario(name: str, request: Request) -> Dict[str, Any]:
+    """Push one scenario to the configured source, now.
+
+    Scenarios created here are mirrored automatically, so this exists for the
+    two cases that is not enough for: confirming that a push actually landed,
+    and mirroring a scenario that predates the source being configured. A
+    missing or read-only source is a 409, because each is configuration the
+    operator must change rather than a transient failure, and saying so is
+    more use than a silent success.
+    """
+    try:
+        directory, _origin = scenario_path(name)
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
+    info = scenariosource.describe()
+    if not info["configured"]:
+        raise HTTPException(
+            status_code=409,
+            detail=f"no scenario source is configured (set {scenariosource.SOURCE_ENV})",
+        )
+    if info.get("error"):
+        raise HTTPException(status_code=409, detail=info["error"])
+    if not info["writable"]:
+        raise HTTPException(
+            status_code=409,
+            detail=f"the scenario source is read-only (set {scenariosource.WRITE_ENV}=1)",
+        )
+    key = scenariosource.publish_scenario(name, directory)
+    if key is None:
+        # publish_scenario never raises, so an operator-initiated push has to
+        # turn its None back into something the console can show.
+        raise HTTPException(
+            status_code=502,
+            detail="the scenario source refused the write; see the control-plane log",
+        )
+    audit_record("scenario_published", request=request, detail=f"{name} -> {key}")
+    return {"published": True, "key": key, "location": info["location"]}

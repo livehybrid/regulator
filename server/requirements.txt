@@ -13,6 +13,16 @@ pydantic>=2.7,<3
 cryptography>=42,<47
 itsdangerous>=2.1,<3
 
+# Multipart form parsing, for uploading a scenario archive through the console.
+# FastAPI needs it present to even declare the route, so it is a hard runtime
+# dependency rather than an optional one.
+python-multipart>=0.0.9,<1
+
+# Reading and writing a shared scenario library in S3. Imported lazily, so an
+# instance that never points REG_SCENARIO_SOURCE at s3:// never loads it; in
+# the image so that pointing it there needs no rebuild.
+boto3>=1.34,<2
+
 # The Kubernetes fleet driver. Imported lazily, so a control plane that never
 # launches a Kubernetes fleet never loads it; in the image so EKS works.
 kubernetes>=29,<32

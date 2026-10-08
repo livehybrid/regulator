@@ -202,6 +202,16 @@ const SAMPLES = {
 
 const ROUTES = {
     '/auth/status': { authenticated: true, setup_needed: false },
+    // Configured AND writable, so the Scenarios page renders its source banner
+    // and its Push button: the states that only appear when a shared library
+    // is in play are the ones a render test is worth having for.
+    '/scenario-source': {
+        configured: true,
+        writable: true,
+        kind: 's3',
+        location: 's3://regulator-scenarios/shared',
+        error: null,
+    },
     '/targets': [
         {
             id: 1,
@@ -465,6 +475,9 @@ const go = async (hash) => {
     await go('#scenarios');
     await check('scenarios', 'dashboard-triage');
     await check('scenarios: lint on the card', 'no corpus check declared');
+    await check('scenarios: the archive buttons', 'Download');
+    await check('scenarios: the source banner', 's3://regulator-scenarios/shared');
+    await check('scenarios: push appears when the source is writable', 'Push');
 
     await go('#runs');
     await check('runs', 'smoke run');
@@ -525,6 +538,14 @@ const go = async (hash) => {
 
     await go('#audit');
     await check('audit', 'run_launched');
+
+    await go('#config');
+    await check('configuration', 'Download config');
+    await check('configuration: the restore half', 'Choose a config file');
+    // The master-key warning is the whole reason the download is worth
+    // explaining, so it must survive a refactor of the page.
+    await check('configuration: master key note', 'REG_MASTER_KEY');
+    await check('configuration: names the shared source', 's3://regulator-scenarios/shared');
 
     // Dialogs are where a component library is most easily misused (a Modal
     // without returnFocus, a Select given children it will not accept), so the

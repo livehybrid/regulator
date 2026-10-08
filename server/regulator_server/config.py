@@ -256,6 +256,14 @@ class ServerConfig:
     # How often a run's time series takes a sample (the graphs, and the
     # regulator:sample events). A few thousand rows for the longest run.
     sample_interval_s: float = 5.0
+    # Extraction-bomb caps for an uploaded scenario archive. Deliberately small:
+    # a scenario is a YAML file and a conf, so a cap that reflects that is a cap
+    # that actually bounds the damage. Enforced on the bytes produced while
+    # streaming, never on the sizes the archive declares.
+    scenario_upload_max_archive_bytes: int = 16 * 1024 * 1024
+    scenario_upload_max_members: int = 2000
+    scenario_upload_max_member_bytes: int = 8 * 1024 * 1024
+    scenario_upload_max_total_bytes: int = 32 * 1024 * 1024
 
     @property
     def auth_enabled(self) -> bool:
@@ -418,6 +426,18 @@ def load_server_config(env: Optional[Mapping[str, str]] = None) -> ServerConfig:
         api_tokens=tokens,
         allow_unauthenticated=_boolean(env, "REG_ALLOW_UNAUTHENTICATED", False),
         sample_interval_s=float(_integer(env, "REG_SAMPLE_INTERVAL_S", 5, minimum=1)),
+        scenario_upload_max_archive_bytes=_integer(
+            env, "REG_SCENARIO_UPLOAD_MAX_ARCHIVE_BYTES", 16 * 1024 * 1024, minimum=1024
+        ),
+        scenario_upload_max_members=_integer(
+            env, "REG_SCENARIO_UPLOAD_MAX_MEMBERS", 2000, minimum=1
+        ),
+        scenario_upload_max_member_bytes=_integer(
+            env, "REG_SCENARIO_UPLOAD_MAX_MEMBER_BYTES", 8 * 1024 * 1024, minimum=1024
+        ),
+        scenario_upload_max_total_bytes=_integer(
+            env, "REG_SCENARIO_UPLOAD_MAX_TOTAL_BYTES", 32 * 1024 * 1024, minimum=1024
+        ),
         hec=hec,
         seed_target=seed,
         fleet=fleet,

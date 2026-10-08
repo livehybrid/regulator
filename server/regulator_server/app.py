@@ -38,6 +38,8 @@ from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 
 from . import auth
+from . import configio
+from . import scenariosource
 from .adapters import scenarios_dir, user_scenarios_dir
 from .audit import record as audit_record
 from .config import get_settings
@@ -46,6 +48,7 @@ from .db import init_engine, session_scope
 from .models import Target
 from .routes import agent as agent_routes
 from .routes import baselines as baselines_routes
+from .routes import config as config_routes
 from .routes import fleets as fleets_routes
 from .routes import runs as runs_routes
 from .routes import scenarios as scenarios_routes
@@ -96,6 +99,11 @@ def create_app() -> FastAPI:
             log.warning("could not sweep stray worker groups", exc_info=True)
     _seed_target_from_env()
     user_scenarios_dir().mkdir(parents=True, exist_ok=True)
+    # Both of these make a rebuilt environment usable with no operator step,
+    # and neither may stop the boot: a typo in a ConfigMap must not take the
+    # deployment down and leave no way in to fix the typo.
+    _import_config_from_env()
+    scenariosource.load_from_env()
 
     @app.middleware("http")
     async def require_session(request: Request, call_next):
@@ -173,6 +181,8 @@ def create_app() -> FastAPI:
     app.include_router(runs_routes.router)
     app.include_router(baselines_routes.router)
     app.include_router(scenarios_routes.router)
+    app.include_router(scenarios_routes.source_router)
+    app.include_router(config_routes.router)
     app.include_router(fleets_routes.router)
     app.include_router(agent_routes.router)
 
@@ -202,6 +212,28 @@ def create_app() -> FastAPI:
         return FileResponse(UI_INDEX, media_type="text/html", headers={"Cache-Control": "no-store"})
 
     return app
+
+
+def _import_config_from_env() -> None:
+    """Restore ``REG_CONFIG_IMPORT`` at boot, before any traffic is served.
+
+    The other half of the Configuration page: an operator downloads the JSON,
+    mounts it, and a rebuilt instance comes up already configured. Runs after
+    the env-seeded target so an explicit single-target seed still wins for the
+    one target it names, and before the scenario source so a scenario the
+    document carries is in place when the sync decides what is already present.
+    """
+    with session_scope() as session:
+        report = configio.import_from_env(session, settings=get_settings())
+    if report and not report.get("error"):
+        audit_record(
+            "config_imported",
+            actor="system",
+            detail=(
+                f"{report['targets']} target(s) and {report['scenarios']} scenario(s) "
+                f"from {configio.IMPORT_ENV}"
+            ),
+        )
 
 
 def _seed_target_from_env() -> None:

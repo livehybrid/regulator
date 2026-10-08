@@ -54,6 +54,19 @@ services:
       - REG_SEED_TARGET_USERNAME=${REG_SEED_TARGET_USERNAME:-}
       - REG_SEED_TARGET_PASSWORD=${REG_SEED_TARGET_PASSWORD:-}
       - REG_SEED_TARGET_VERIFY_TLS=${REG_SEED_TARGET_VERIFY_TLS:-1}
+      # Everything else a fresh stack needs, through the environment rather
+      # than through a web step. REG_CONFIG_IMPORT restores the targets and
+      # scenarios the Configuration page downloads (mount the file, or paste
+      # the JSON straight in); REG_SCENARIO_SOURCE pulls a shared scenario
+      # library at boot, and the _WRITE switch pushes back to it.
+      - REG_CONFIG_IMPORT=${REG_CONFIG_IMPORT:-}
+      - REG_SCENARIO_SOURCE=${REG_SCENARIO_SOURCE:-}
+      - REG_SCENARIO_SOURCE_WRITE=${REG_SCENARIO_SOURCE_WRITE:-}
+      # S3 credentials for the scenario source come from the usual boto3
+      # chain, so they are passed through rather than configured here.
+      - AWS_REGION=${AWS_REGION:-}
+      - AWS_ACCESS_KEY_ID=${AWS_ACCESS_KEY_ID:-}
+      - AWS_SECRET_ACCESS_KEY=${AWS_SECRET_ACCESS_KEY:-}
       # The swarm fleet. Workers are launched as services on the network
       # below and reach this control plane by its service name, so no LAN
       # address is needed. The constraint keeps them off the node that runs

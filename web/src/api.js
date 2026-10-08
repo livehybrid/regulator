@@ -83,5 +83,62 @@ export async function apiText(path) {
     return res.text();
 }
 
+/**
+ * POST a file as multipart/form-data: the scenario-archive upload.
+ *
+ * Separate from api() because that one serialises its body as JSON and sets
+ * the content type; a multipart body has to let the browser set its own
+ * boundary, so the two cannot share a path.
+ */
+export async function apiUpload(path, file, fields = {}) {
+    const form = new FormData();
+    form.append('file', file);
+    Object.entries(fields).forEach(([k, v]) => {
+        if (v !== undefined && v !== null) {
+            form.append(k, String(v));
+        }
+    });
+    let res;
+    try {
+        res = await fetch(`/api${path}`, {
+            method: 'POST',
+            credentials: 'same-origin',
+            body: form,
+        });
+    } catch (e) {
+        throw new ApiError(`Cannot reach the Regulator server: ${e.message}`, 0);
+    }
+    if (res.status === 401) {
+        onUnauthorised();
+        throw new ApiError('Session expired, please sign in again', 401);
+    }
+    const text = await res.text();
+    let data = null;
+    if (text) {
+        try {
+            data = JSON.parse(text);
+        } catch (e) {
+            data = text;
+        }
+    }
+    if (!res.ok) {
+        let detail = data && typeof data === 'object' ? data.detail || data.error : data;
+        if (detail && typeof detail === 'object') {
+            detail = JSON.stringify(detail);
+        }
+        throw new ApiError(String(detail || res.statusText || `HTTP ${res.status}`), res.status);
+    }
+    return data;
+}
+
+/**
+ * The href for a download the browser should stream straight to disk.
+ *
+ * Deliberately not a fetch: the session is a same-origin cookie, so the
+ * browser sends it itself, the file never sits in a JavaScript string, and the
+ * server's own Content-Disposition names it. Use it as an <a href>.
+ */
+export const apiDownloadUrl = (path) => `/api${path}`;
+
 /** True for the one error that must never be shown to the user as a failure. */
 export const isAuthError = (e) => e instanceof ApiError && e.status === 401;
