@@ -147,6 +147,7 @@ def hec_config(settings: ServerConfig) -> Optional[HecConfig]:
         index=settings.hec.index,
         source=settings.hec.source,
         verify_tls=settings.hec.verify_tls,
+        ca_bundle=settings.ca_bundle,
         sourcetype_step=settings.hec.sourcetype_step,
         sourcetype_run=settings.hec.sourcetype_run,
         sourcetype_sample=settings.hec.sourcetype_sample,
@@ -167,6 +168,10 @@ def target_config(target: Target) -> TargetConfig:
         username=target.username,
         password=decrypt(target.password_encrypted),
         verify_tls=target.verify_tls,
+        # Instance-wide rather than per target: one estate, one private CA, and
+        # a per-target column would be a migration for a distinction nobody has
+        # yet needed.
+        ca_bundle=get_settings().ca_bundle,
         app=target.app,
         owner=target.owner,
         api_version=target.api_version,

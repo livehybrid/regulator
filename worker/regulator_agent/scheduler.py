@@ -88,6 +88,7 @@ from .results import (
     StepRecord,
 )
 from .scenario import LoadModel, Persona, RampStage, Scenario, Step
+from .targetguard import TargetGuard
 from .timepolicy import resolve_window
 
 import datetime as _dt
@@ -223,6 +224,13 @@ class Scheduler:
             self.stats.cold_window_s = float(config.cold_window_s)
         self.emitters: List[Any] = list(emitters or [])
         self.capabilities = capabilities
+        # The target-side abort guards. Built here so `status()` exists for the
+        # summary even when the scenario asked for neither and nothing polls.
+        self._target_guard = TargetGuard(
+            client=getattr(engine, "client", None),
+            guards=scenario.abort_if,
+            request_stop=self.request_stop,
+        )
         # One seed for every draw in the run: parameters, persona assignment,
         # think time, jitter. The resolver already honours an override, and
         # the rest used the scenario's own seed, so REG_SEED changed half the
@@ -383,6 +391,15 @@ class Scheduler:
             self.load.co_corrected,
         )
 
+        # The target-side ceilings (sut_cpu_pct, skipped_searches_delta). Takes
+        # its first reading inline, so an operator who asked for a CPU ceiling
+        # learns here that the account cannot read _introspection rather than
+        # finding out from the summary of a run they thought was guarded.
+        try:
+            await self._target_guard.start()
+        except Exception as exc:  # noqa: BLE001 - a guard never stops a run starting
+            log.warning("could not start the target guards: %s", exc)
+
         try:
             if self.load.model == "closed":
                 await self._run_closed()
@@ -397,6 +414,7 @@ class Scheduler:
             self._fatal = exc
             log.error("run failed: %s", exc)
         finally:
+            await self._target_guard.stop()
             await self._drain()
 
         return self._summarise()
@@ -926,6 +944,13 @@ class Scheduler:
 
         snapshot = self.stats.snapshot(include_histograms=self.wire_histograms)
         snapshot["arrivals_missed"] = self._arrivals_shed + self._arrivals_skipped
+        # What each requested target guard actually did. `unevaluated` is the
+        # field that stops a declared ceiling being a lie: a guard named there
+        # was asked for and never produced a reading, so the run was not
+        # protected by it.
+        guard_status = self._target_guard.status()
+        if guard_status:
+            snapshot["target_guards"] = guard_status
         snapshot["arrivals_shed"] = self._arrivals_shed
         snapshot["arrivals_skipped"] = self._arrivals_skipped
         if self.capabilities is not None:

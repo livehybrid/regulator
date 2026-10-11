@@ -367,6 +367,10 @@ async def discover_indexers(
             config = TargetConfig(
                 url=url,
                 verify_tls=target.verify_tls,
+                # The peers are in the same estate as the search head, so the
+                # same private CA signs them. Without this an indexer probe
+                # fails TLS on a target that verifies perfectly well.
+                ca_bundle=target.ca_bundle,
                 api_version=target.api_version,
                 **credential,
             )

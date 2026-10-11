@@ -46,6 +46,7 @@ from .params import ParameterResolver
 from .report import render, target_report
 from .smartstore import CacheState, cache_state, delta as cache_delta, evict_all
 from .sut import correlate, marker_prefix_for
+from .targetguard import guard_notes
 from .smartstore import render as render_cache
 from .results import NdjsonEmitter, RunStats, RunSummary
 from .scenario import ScenarioError, is_advice, lint, load_scenario, scenario_digest
@@ -488,6 +489,18 @@ async def _run(config: Config, args: argparse.Namespace) -> int:
             )
             for finding in summary.sut.get("findings", []):
                 log.info("target: %s", finding)
+
+        # A declared ceiling that was never in force is the one finding that
+        # must not be buried: the operator believed the run was guarded. Logged
+        # as a warning and carried into the SUT findings, so it survives into
+        # the report rather than scrolling past in the worker's output.
+        guard_status = (summary.stats or {}).get("target_guards") or {}
+        notes = guard_notes(guard_status)
+        if notes:
+            summary.sut = dict(summary.sut or {})
+            summary.sut["findings"] = list(summary.sut.get("findings") or []) + notes
+            for note in notes:
+                log.warning("guard: %s", note)
 
         await _report_summary(summary, hec, config)
         return _exit_code(summary)

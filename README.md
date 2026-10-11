@@ -128,6 +128,37 @@ takes the same three in its own spelling - `STOKER_MASTER_KEY`,
 config documents and two prefixes, and neither product needs anybody to log in
 and configure it by hand before the first run.
 
+### Pointing it at a cluster behind a private CA
+
+A customer's Splunk very often presents a certificate signed by their own
+internal CA. Until `REG_CA_BUNDLE` existed, that left two options and no good
+one: leave `verify_tls` on and fail the handshake, or turn it off and ship a
+splunkd admin credential over a connection nothing checked, to a production
+search head. The certificate was fine; there was nowhere to put it.
+
+```bash
+# swarm / compose
+REG_CA_BUNDLE=/etc/regulator/ca/customer-root-ca.pem
+
+# kubernetes: create the ConfigMap, then uncomment the three blocks in
+# infra/k8s/regulator.yaml (env, volumeMount, volume)
+kubectl -n regulator create configmap regulator-ca \
+  --from-file=ca-bundle.pem=./customer-root-ca.pem
+```
+
+Then leave `verify_tls` **on** for the target. The control plane reads the
+bundle once and projects it to every worker it launches, so a fleet needs no
+mount of its own: a path that resolves in the control plane would resolve to
+nothing inside a worker container, and asking a deployment to mount the same
+file in two places is a step that gets forgotten exactly once.
+
+Two things worth knowing. A file that is not PEM is refused at boot with the
+`openssl` command that converts it, because the thing an operator is usually
+holding is a `.der` from a Windows CA export. And the **browser** engine drives
+Chromium through Playwright, which does not read this bundle: a browser
+scenario against a private CA still needs `verify_tls: false`. The API engine,
+which is what search-load scenarios use, is fully covered.
+
 One thing worth stating plainly: a config document's credentials are the stored
 ciphertext, not plain text. That is deliberate (the file is destined for a
 ConfigMap or a git repo, and live splunkd credentials do not belong in either),
@@ -272,6 +303,18 @@ for an in-process run, with T0, stops, lost workers and evictions marked. The
 runs list carries a p95 sparkline per run, and each target has a history page
 of every cache reading taken on it.
 
+**Download** on the run page gives the whole run as one self-contained JSON
+file: the summary with its per-step aggregates, the full time series, the
+cluster's own account of what happened, the per-worker leases and - the part
+that makes it worth keeping - the scenario that produced it, inline. A latency
+number with no searches beside it is not a result anybody can check a year
+later, and a scenario can be edited after the run that used it (the digest on
+the run proves which version this was). It names the target and its management
+URI, because a result that does not say what it measured is not a result, and
+carries no credential of any kind. `GET /api/runs/{id}/export` is the same
+thing for a pipeline. *Copy JSON* beside it is the summary alone, which is the
+right thing to paste into a ticket and the wrong thing to send a customer.
+
 ```bash
 pip install -r worker/requirements.txt -r server/requirements.txt
 REG_ADMIN_PASSWORD=choose-one PYTHONPATH=worker:server \
@@ -391,6 +434,7 @@ the environment; everything downstream of the claim is the standalone code.
 | `REG_HEC_URL` / `REG_HEC_TOKEN` / `REG_HEC_INDEX` / `REG_HEC_VERIFY_TLS` | off | Where every run launched here ships its telemetry, exactly as the worker's variables of the same name |
 | `REG_SEED_TARGET_URL` and friends | unset | A target registered or updated at boot (`_NAME`, `_WEB_URL`, `_TOKEN` or `_USERNAME` and `_PASSWORD`, `_VERIFY_TLS`). What makes a nightly-rebuilt deployment runnable with no web step |
 | `REG_CONFIG_IMPORT` | unset | A path to a mounted JSON file, or the JSON itself, restored at boot: the targets and scenarios the Configuration page downloads. Applied before any traffic is served and never fatal, because a typo in a ConfigMap must not stop the control plane starting. Credentials in it are the stored ciphertext, so it needs the **same `REG_MASTER_KEY`** |
+| `REG_CA_BUNDLE` | unset | A PEM bundle (a file, or a directory of them) that verifies a target behind a **private or internal CA**. Used only where the target's own `verify_tls` is on, so it composes with that switch rather than replacing it. A path that does not exist is a **fatal boot error**, because a deployment that was handed a certificate and quietly verified against the public trust store instead is the exact failure this prevents. Projected to fleet workers automatically as PEM text, so they need no mount of their own |
 | `REG_SCENARIO_SOURCE` | unset | A shared scenario library: `s3://bucket/prefix`, or a mounted directory. Pulled at boot as one `.tar.gz` per scenario, in the format the console's Download and Upload already speak. Import is create-if-absent, so a local edit survives a restart, and one unreadable object is reported rather than aborting the sync |
 | `REG_SCENARIO_SOURCE_WRITE` | off | Also push scenarios created here back to that prefix. A separate switch because the common case is a curated library several instances read, and one of them silently overwriting it would be hard to notice |
 | `REG_SCENARIO_UPLOAD_MAX_ARCHIVE_BYTES` and friends | 16 MiB | Extraction-bomb caps for an uploaded scenario archive (`_MAX_MEMBERS` 2000, `_MAX_MEMBER_BYTES` 8 MiB, `_MAX_TOTAL_BYTES` 32 MiB). Enforced on the bytes produced while streaming, never on the sizes the archive declares |
@@ -936,7 +980,50 @@ abort_if:
   error_rate_pct: 10
   p95_ms: 90000
   generator_drift_ms: 3000
+  # The target's own limits, polled from its telemetry during the run:
+  sut_cpu_pct: 85
+  skipped_searches_delta: 50
 ```
+
+### Guard rails
+
+A load test is meant to find the limit, not cross it and take the cluster with
+it. Every `abort_if` predicate is checked continuously, and a breach ends the
+run as `aborted` with the predicate recorded, which is a result in its own
+right rather than a failure.
+
+| Predicate | Measured from | Protects |
+|---|---|---|
+| `error_rate_pct` | this worker's own records | the target |
+| `p95_ms` | this worker's own records | the target |
+| `sut_cpu_pct` | the target's `_introspection` | the target |
+| `skipped_searches_delta` | the target's `_internal` scheduler log | the target |
+| `generator_drift_ms` | this process's scheduling loop | **the result** |
+
+The last one is different in kind: a worker that cannot keep to its own
+schedule is measuring itself, so the run is stopped and marked **invalid**
+rather than reported as a Splunk result.
+
+The two target-side guards poll the cluster every 30 seconds, which is noise
+next to any real load test, and three rules keep them from being worse than
+their absence:
+
+- **A breach must be sustained.** Two consecutive readings over the line. A
+  search head spikes for reasons that have nothing to do with your test, and
+  killing a customer's run on one sample would be the worse bug.
+- **A poll failure never aborts.** The account running the test may have no
+  read access to `_introspection` or `_internal`, and a customer's RBAC is
+  their business. The run continues on the guards that do work.
+- **...but an unevaluable guard is never silent.** The first reading is taken
+  before the run starts, so you learn in the first seconds rather than at the
+  end, and the run summary carries `target_guards.unevaluated` plus a finding
+  saying in words that the ceiling you asked for was **not** in force. A
+  declared guard that quietly does nothing is worse than no guard at all,
+  which is precisely what these two used to be.
+
+`skipped_searches_delta` counts from a baseline taken at the start of the run,
+so a cluster that was already skipping scheduled searches before your test is
+not blamed on your test.
 
 ### Search classes
 

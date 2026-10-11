@@ -44,7 +44,7 @@ import {
     TileGrid,
     Toolbar,
 } from '../components/primitives';
-import { api, isAuthError } from '../api';
+import { api, apiDownloadUrl, isAuthError } from '../api';
 import { copyText } from '../clipboard';
 import { fmtBytes, fmtDur, fmtInt, fmtMs, fmtNum, fmtPct, isBlank } from '../format';
 import { useNotify } from '../Notifications';
@@ -416,6 +416,17 @@ export default function RunDetail({ runId, navigate }) {
                         )
                     )}
                     <BusyButton label="Copy JSON" onClick={copySummary} />
+                    {/* The whole run as one file: the summary, the time series,
+                        the cluster's own account of it and the scenario that
+                        produced it. "Copy JSON" next to it is the summary
+                        alone, which is the right thing to paste into a ticket
+                        but not the thing to send a customer. A plain link, so
+                        the browser streams it to disk with the session
+                        cookie it already has. */}
+                    <Button
+                        label="Download"
+                        to={apiDownloadUrl(`/runs/${encodeURIComponent(runId)}/export`)}
+                    />
                 </Toolbar>
             </PageHead>
 

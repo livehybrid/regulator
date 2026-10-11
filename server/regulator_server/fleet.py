@@ -39,6 +39,7 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 import yaml
 from sqlalchemy import select
 
+from regulator_agent.catrust import CA_BUNDLE_PEM_ENV, read_pem as read_ca_pem
 from regulator_agent.histogram import LatencyHistogram, merge_dicts
 from regulator_agent.results import merge_intervals
 from regulator_agent.scenario import Scenario, load_scenario
@@ -344,6 +345,15 @@ def _claim_env(run: Run, target: Target, settings: ServerConfig, share: Dict[str
         # The control plane evicts and reads the cache; workers never touch it.
         "REG_EVICT_CACHE": "0",
     }
+    # The CA bundle travels as PEM TEXT, not as a path. A worker is its own
+    # container, so the control plane's path means nothing there, and asking the
+    # deployment to mount the same file into every worker service is a step that
+    # gets forgotten exactly once. A CA certificate is public material, so an
+    # environment variable is the right carrier for it.
+    if cfg.verify_tls and cfg.ca_bundle:
+        pem = read_ca_pem(cfg.ca_bundle)
+        if pem:
+            env[CA_BUNDLE_PEM_ENV] = pem
     if cfg.web_url:
         env["REG_TARGET_WEB_URL"] = cfg.web_url
     if cfg.token:

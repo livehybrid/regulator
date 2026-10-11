@@ -25,6 +25,8 @@ import time
 from dataclasses import dataclass, field
 from typing import Mapping, Optional
 
+from . import catrust
+
 # Managed mode needs a control plane, which lands in Phase 1. The env contract
 # is already fixed here so the worker and the (future) control plane cannot
 # drift apart while they are written weeks apart.
@@ -200,6 +202,10 @@ class TargetConfig:
     username: Optional[str] = None
     password: Optional[str] = field(default=None, repr=False)
     verify_tls: bool = True
+    # PEM bundle that verifies this target's certificate where the public trust
+    # store will not: a Splunk behind a private or internal CA. Used only when
+    # verify_tls is on, so it composes with that switch. See catrust.py.
+    ca_bundle: Optional[str] = None
     # Namespace for dispatched searches. A search dispatched into the wrong app
     # sees different knowledge objects, so this is part of the test definition
     # rather than an incidental detail.
@@ -248,6 +254,7 @@ class HecConfig:
     sourcetype_health: str = "regulator:health"
     gzip: bool = True
     verify_tls: bool = True
+    ca_bundle: Optional[str] = None
     batch_bytes: int = 512 * 1024
     batch_ms: int = 200
 
@@ -372,6 +379,16 @@ def load_config(env: Optional[Mapping[str, str]] = None) -> Config:
         env, "REG_SCENARIO", "the scenario directory or scenario.yaml to run"
     )
 
+    # Resolved once and shared by the target and the telemetry HEC: both talk
+    # to Splunk instances in the same estate, so a private CA that signs one
+    # signs the other. A bad bundle raises here, at the point it is configured,
+    # rather than as a handshake error mid-run that names neither the file nor
+    # the reason.
+    try:
+        ca_bundle = catrust.resolve_bundle(env)
+    except catrust.CaBundleError as exc:
+        raise ConfigError(str(exc))
+
     target = TargetConfig(
         url=_url(env, "REG_TARGET_URL", _require(
             env, "REG_TARGET_URL", "the splunkd management URI of the system under test"
@@ -381,6 +398,7 @@ def load_config(env: Optional[Mapping[str, str]] = None) -> Config:
         username=_get(env, "REG_TARGET_USERNAME"),
         password=_get(env, "REG_TARGET_PASSWORD"),
         verify_tls=_boolean(env, "REG_TARGET_VERIFY_TLS", True),
+        ca_bundle=ca_bundle,
         app=_get(env, "REG_TARGET_APP", "search") or "search",
         owner=_get(env, "REG_TARGET_OWNER", "nobody") or "nobody",
         api_version=_get(env, "REG_TARGET_API_VERSION", "v2") or "v2",
@@ -405,6 +423,7 @@ def load_config(env: Optional[Mapping[str, str]] = None) -> Config:
             sourcetype_run=_get(env, "REG_HEC_SOURCETYPE_RUN", "regulator:run") or "regulator:run",
             gzip=_boolean(env, "REG_HEC_GZIP", True),
             verify_tls=_boolean(env, "REG_HEC_VERIFY_TLS", True),
+            ca_bundle=ca_bundle,
             batch_bytes=_integer(env, "REG_HEC_BATCH_BYTES", 512 * 1024, minimum=1024),
             batch_ms=_integer(env, "REG_HEC_BATCH_MS", 200, minimum=1),
         )

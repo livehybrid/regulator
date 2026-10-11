@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import json
 import logging
+import re
 import time
 from typing import Any, Dict, List, Optional
 
@@ -12,7 +14,9 @@ from sqlalchemy.orm import Session
 
 from fastapi import Request
 
-from ..adapters import load_named_scenario
+from regulator_agent.scenario import ScenarioError, load_scenario
+
+from ..adapters import load_named_scenario, scenario_path, scenario_summary
 from ..audit import record as audit_record
 from ..config import get_settings
 from ..db import get_session
@@ -145,6 +149,116 @@ def get_run_samples(
         "samples": rows,
         "markers": markers,
     }
+
+
+@router.get("/runs/{run_id}/export")
+def export_run(
+    run_id: int,
+    request: Request,
+    points: int = 5000,
+    session: Session = Depends(get_session),
+) -> Response:
+    """One run as a single self-contained JSON document, for download.
+
+    The thing a consultant hands a customer at the end of an engagement. Every
+    piece of this was already reachable over the API, but across four
+    endpoints, which in practice meant the answer to "can you send me those
+    numbers?" was a screenshot of the run page.
+
+    What travels: the run row and its headline stats, the full summary with its
+    per-step aggregates, the cluster's own account of what happened
+    (``summary.sut``), the whole time series at its native resolution, the
+    eviction markers, the per-worker leases, and - the part that makes it
+    worth keeping - **the scenario that produced it, inline**. A latency number
+    with no searches beside it is not a result anybody can check a year later,
+    and a scenario can be edited after the run that used it.
+
+    Deliberately NOT included: credentials of any kind. The target is named and
+    its management URI recorded, because a result that does not say what it
+    measured is not a result, but no token, password or CA material goes near
+    this file.
+    """
+    row = session.execute(
+        select(Run, Target)
+        .join(Target, Target.id == Run.target_id, isouter=True)
+        .where(Run.id == run_id)
+    ).first()
+    if row is None:
+        raise HTTPException(status_code=404, detail=f"no run with id {run_id}")
+    run, target = row
+
+    from ..samples import markers_for, samples_for
+
+    document: Dict[str, Any] = {
+        "regulator_run_export_version": 1,
+        "exported_at": time.time(),
+        "run": _serialise(run, target.name if target is not None else None),
+        "target": None,
+        "scenario": None,
+        "samples": samples_for(session, run_id, points=max(10, min(points, 100_000))),
+        "markers": markers_for(run),
+        "workers": [
+            {
+                "slot": lease.slot,
+                "engine": getattr(lease, "engine", None),
+                "state": lease.state,
+                "holder": lease.holder,
+                "last_seen": lease.last_seen,
+            }
+            for lease in sorted(run.leases, key=lambda candidate: candidate.slot)
+        ],
+    }
+    if target is not None:
+        # Named, never credentialed: a result has to say what it measured.
+        document["target"] = {
+            "name": target.name,
+            "mgmt_url": target.mgmt_url,
+            "web_url": target.web_url,
+            "app": target.app,
+            "owner": target.owner,
+            "api_version": target.api_version,
+            "verify_tls": target.verify_tls,
+        }
+    # The scenario inline, because it can be edited after the run that used it
+    # and a result nobody can reproduce is a screenshot with extra steps. The
+    # digest on the run row is what proves this is the version that ran.
+    try:
+        directory, origin = scenario_path(run.scenario)
+        scenario = load_scenario(directory)
+        files: Dict[str, str] = {}
+        for candidate in ("scenario.yaml", scenario.searches.file if scenario.searches else ""):
+            if candidate and (directory / candidate).is_file():
+                files[candidate] = (directory / candidate).read_text(encoding="utf-8")
+        document["scenario"] = {
+            **scenario_summary(scenario, origin),
+            "digest": run.scenario_digest,
+            "files": files,
+        }
+    except (FileNotFoundError, ScenarioError, OSError) as exc:
+        # A run outlives the scenario that made it, and that is not a reason to
+        # refuse the export. Say which version is missing instead.
+        document["scenario"] = {
+            "name": run.scenario,
+            "digest": run.scenario_digest,
+            "unavailable": str(exc),
+        }
+
+    audit_record(
+        "run_exported",
+        request=request,
+        target_id=run.target_id,
+        detail=f"run {run_id}: {len(document['samples'])} sample(s)",
+    )
+    label = re.sub(r"[^A-Za-z0-9._-]+", "-", f"regulator-run-{run_id}-{run.scenario}").strip("-")
+    return Response(
+        content=json.dumps(document, indent=2, default=str) + "\n",
+        media_type="application/json",
+        headers={
+            "Content-Disposition": f'attachment; filename="{label}.json"',
+            "X-Regulator-Run": str(run_id),
+            "X-Regulator-Run-Samples": str(len(document["samples"])),
+        },
+    )
 
 
 @router.get("/runs/{run_id}")

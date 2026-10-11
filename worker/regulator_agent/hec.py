@@ -24,6 +24,7 @@ from typing import Any, Dict, List, Optional
 
 import httpx
 
+from . import catrust
 from .config import HecConfig
 from .results import StepRecord
 
@@ -91,7 +92,8 @@ class HecEmitter:
             # nothing trusts. REG_HEC_VERIFY_TLS exists so telemetry does not
             # silently vanish into TLS failures the run never reports, because
             # this module swallows its own errors by design.
-            "verify": self.config.verify_tls,
+            "verify": catrust.verify_arg(
+                self.config.verify_tls, getattr(self.config, "ca_bundle", None)),
             "timeout": httpx.Timeout(connect=5.0, read=30.0, write=30.0, pool=5.0),
             "headers": {"Authorization": f"Splunk {self.config.token}"},
         }

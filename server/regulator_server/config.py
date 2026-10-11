@@ -37,6 +37,22 @@ def _get(env: Mapping[str, str], key: str, default: Optional[str] = None) -> Opt
     return value if value else default
 
 
+def _resolve_ca_bundle(env: Mapping[str, str]) -> Optional[str]:
+    """Validate REG_CA_BUNDLE at boot, or refuse to start.
+
+    Deliberately fatal. A deployment that was handed a certificate path and
+    silently verified against the public trust store instead is the exact
+    failure this setting exists to prevent, and it would surface only as every
+    target reading unreachable for a reason nothing names.
+    """
+    from regulator_agent.catrust import CaBundleError, resolve_bundle
+
+    try:
+        return resolve_bundle(env)
+    except CaBundleError as exc:
+        raise ServerConfigError(str(exc))
+
+
 def _boolean(env: Mapping[str, str], key: str, default: bool) -> bool:
     raw = _get(env, key)
     if raw is None:
@@ -256,6 +272,12 @@ class ServerConfig:
     # How often a run's time series takes a sample (the graphs, and the
     # regulator:sample events). A few thousand rows for the longest run.
     sample_interval_s: float = 5.0
+    # PEM bundle (a file, or a directory of them) that verifies a target's
+    # certificate where the public trust store will not: a Splunk behind a
+    # private or internal CA. Used only where the target's own verify_tls is
+    # on, and projected to fleet workers as PEM text, because a control-plane
+    # path means nothing inside a worker container. See the worker's catrust.py.
+    ca_bundle: Optional[str] = None
     # Extraction-bomb caps for an uploaded scenario archive. Deliberately small:
     # a scenario is a YAML file and a conf, so a cap that reflects that is a cap
     # that actually bounds the damage. Enforced on the bytes produced while
@@ -426,6 +448,7 @@ def load_server_config(env: Optional[Mapping[str, str]] = None) -> ServerConfig:
         api_tokens=tokens,
         allow_unauthenticated=_boolean(env, "REG_ALLOW_UNAUTHENTICATED", False),
         sample_interval_s=float(_integer(env, "REG_SAMPLE_INTERVAL_S", 5, minimum=1)),
+        ca_bundle=_resolve_ca_bundle(env),
         scenario_upload_max_archive_bytes=_integer(
             env, "REG_SCENARIO_UPLOAD_MAX_ARCHIVE_BYTES", 16 * 1024 * 1024, minimum=1024
         ),

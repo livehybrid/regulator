@@ -178,9 +178,27 @@ spec:
             #   value: https://hec.splunk.svc:8088
             # - name: REG_HEC_VERIFY_TLS
             #   value: "0"
+            #
+            # A Splunk behind a private or internal CA. Uncomment this, the
+            # volumeMount and the volume below, and create the ConfigMap from
+            # the customer's root certificate:
+            #
+            #   kubectl -n regulator create configmap regulator-ca \
+            #     --from-file=ca-bundle.pem=/path/to/customer-root-ca.pem
+            #
+            # Then leave verify_tls ON for the target. Without a bundle the
+            # only setting that works against a private CA is verify_tls off,
+            # which ships a splunkd credential over a connection nothing
+            # checked. The control plane projects this certificate to worker
+            # Jobs itself, so they need no mount of their own.
+            # - name: REG_CA_BUNDLE
+            #   value: /etc/regulator/ca/ca-bundle.pem
           volumeMounts:
             - name: data
               mountPath: /data
+            # - name: ca
+            #   mountPath: /etc/regulator/ca
+            #   readOnly: true
           readinessProbe:
             httpGet:
               path: /healthz
@@ -208,6 +226,9 @@ spec:
         - name: data
           persistentVolumeClaim:
             claimName: regulator-data
+        # - name: ca
+        #   configMap:
+        #     name: regulator-ca
 ---
 apiVersion: v1
 kind: Service

@@ -368,3 +368,100 @@ def test_publishing_an_unknown_scenario_is_a_404(client, monkeypatch, tmp_path):
     monkeypatch.setenv(scenariosource.SOURCE_ENV, str(tmp_path / "bucket"))
     monkeypatch.setenv(scenariosource.WRITE_ENV, "1")
     assert client.post("/api/scenarios/no-such-thing/publish").status_code == 404
+
+
+# --------------------------------------------------------------------------- #
+# Run export
+# --------------------------------------------------------------------------- #
+
+def _finished_run(client, session_factory=None):
+    """A completed run with a summary, the way the fleet leaves one."""
+    import sys as _sys
+
+    from regulator_server import db as _db
+    from regulator_server.models import Run
+
+    make_target(client, "export-target")
+    make_scenario(client, "exported")
+    with _db.session_scope() as session:
+        run = Run(
+            label="for the customer",
+            target_id=1,
+            scenario="exported",
+            state="completed",
+            virtual_users=4,
+            duration_s=60,
+            seed=1234,
+            scenario_digest="abc123",
+            started_at=1_700_000_000.0,
+            ended_at=1_700_000_060.0,
+            stats_json={"executions": 120, "p95_ms": 1450},
+            summary_json={
+                "outcome": "completed",
+                "valid": True,
+                "steps": [{"id": "one", "executions": 120}],
+                "sut": {"findings": ["peak user CPU on sh1 was 42%"]},
+            },
+        )
+        session.add(run)
+        session.flush()
+        return run.id
+
+
+def test_a_run_downloads_as_one_self_contained_file(client):
+    run_id = _finished_run(client)
+    response = client.get(f"/api/runs/{run_id}/export")
+    assert response.status_code == 200, response.text
+    assert f'filename="regulator-run-{run_id}-exported.json"' in (
+        response.headers["content-disposition"]
+    )
+    document = response.json()
+
+    assert document["regulator_run_export_version"] == 1
+    assert document["run"]["id"] == run_id
+    assert document["run"]["summary"]["steps"][0]["executions"] == 120
+    # The cluster's own account of the run travels with it.
+    assert document["run"]["summary"]["sut"]["findings"]
+    # And the scenario that produced it, inline: a latency number with no
+    # searches beside it is not a result anybody can check a year later.
+    assert document["scenario"]["name"] == "exported"
+    assert "scenario.yaml" in document["scenario"]["files"]
+    assert "savedsearches.conf" in document["scenario"]["files"]
+    assert document["scenario"]["digest"] == "abc123"
+    # Named target, so the result says what it measured.
+    assert document["target"]["name"] == "export-target"
+    assert document["target"]["mgmt_url"] == "https://sh.example:8089"
+
+
+def test_the_export_carries_no_credential(client):
+    run_id = _finished_run(client)
+    body = client.get(f"/api/runs/{run_id}/export").text
+    # The token the target was created with, and the field names that would
+    # carry one. A file handed to a customer must have neither.
+    assert "a-secret-bearer-token" not in body
+    for field_name in ("token_encrypted", "password_encrypted", "token", "password"):
+        assert f'"{field_name}"' not in body
+
+
+def test_the_export_survives_a_deleted_scenario(client):
+    """A run outlives the scenario that made it; that is not a reason to refuse."""
+    run_id = _finished_run(client)
+    assert client.delete("/api/scenarios/exported").status_code == 204
+
+    response = client.get(f"/api/runs/{run_id}/export")
+    assert response.status_code == 200, response.text
+    scenario = response.json()["scenario"]
+    assert scenario["name"] == "exported"
+    assert scenario["digest"] == "abc123"
+    assert scenario["unavailable"]
+
+
+def test_exporting_an_unknown_run_is_a_404(client):
+    assert client.get("/api/runs/99999/export").status_code == 404
+
+
+def test_an_export_appears_in_the_audit_log(client):
+    run_id = _finished_run(client)
+    client.get(f"/api/runs/{run_id}/export")
+    actions = [event["action"] for event in client.get("/api/audit").json()["events"]]
+    assert "run_exported" in actions

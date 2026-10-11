@@ -41,6 +41,7 @@ from urllib.parse import quote
 
 import httpx
 
+from . import catrust
 from .config import TargetConfig
 from .timepolicy import TimeWindow
 
@@ -303,7 +304,11 @@ class SplunkClient:
         if self._client is None:
             self._client = httpx.AsyncClient(
                 base_url=self._base_url,
-                verify=self._target.verify_tls,
+                # One SSLContext per client, not per request: a private CA is
+                # the normal case at a customer site, and rebuilding the
+                # context mid-run would churn the connection pool.
+                verify=catrust.verify_arg(
+                    self._target.verify_tls, self._target.ca_bundle),
                 timeout=self._timeout,
                 http2=self._http2,
                 transport=self._transport,

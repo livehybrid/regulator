@@ -60,6 +60,13 @@ services:
       # the JSON straight in); REG_SCENARIO_SOURCE pulls a shared scenario
       # library at boot, and the _WRITE switch pushes back to it.
       - REG_CONFIG_IMPORT=${REG_CONFIG_IMPORT:-}
+      # A Splunk behind a private or internal CA: point this at a PEM bundle
+      # mounted into the container. Used only where the target's own verify_tls
+      # is on, and projected to fleet workers automatically, so they need no
+      # mount of their own. Without it the only setting that works against a
+      # private CA is verify_tls off, which ships a credential over a
+      # connection nothing checked.
+      - REG_CA_BUNDLE=${REG_CA_BUNDLE:-}
       - REG_SCENARIO_SOURCE=${REG_SCENARIO_SOURCE:-}
       - REG_SCENARIO_SOURCE_WRITE=${REG_SCENARIO_SOURCE_WRITE:-}
       # S3 credentials for the scenario source come from the usual boto3
