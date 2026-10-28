@@ -1,0 +1,69 @@
+<form version="1.1">
+  <label>Triage overview</label>
+  <description>The light dashboard a browser run opens: four panels, three of them tstats over index-time fields. A healthy cluster paints the first one in well under three seconds. Regulator pins the index and the time range through the URL (form.index, form.range.earliest, form.range.latest), so this asks the same question of the same data as the API scenarios.</description>
+  <fieldset submitButton="false" autoRun="true">
+    <input type="text" token="index" searchWhenChanged="true">
+      <label>Index</label>
+      <default>main</default>
+    </input>
+    <input type="time" token="range" searchWhenChanged="true">
+      <label>Time range</label>
+      <default>
+        <earliest>-24h@h</earliest>
+        <latest>now</latest>
+      </default>
+    </input>
+  </fieldset>
+  <row>
+    <panel>
+      <title>Events by sourcetype</title>
+      <chart>
+        <search>
+          <query>| tstats prestats=t count where index=$index$ by _time span=5m, sourcetype | timechart span=5m count by sourcetype limit=10</query>
+          <earliest>$range.earliest$</earliest>
+          <latest>$range.latest$</latest>
+        </search>
+        <option name="charting.chart">area</option>
+        <option name="charting.chart.stackMode">stacked</option>
+        <option name="charting.legend.placement">bottom</option>
+      </chart>
+    </panel>
+    <panel>
+      <title>Web requests</title>
+      <single>
+        <search>
+          <query>| tstats count where index=$index$ sourcetype=access_combined</query>
+          <earliest>$range.earliest$</earliest>
+          <latest>$range.latest$</latest>
+        </search>
+        <option name="numberPrecision">0</option>
+        <option name="useThousandSeparators">1</option>
+      </single>
+    </panel>
+  </row>
+  <row>
+    <panel>
+      <title>Busiest hosts</title>
+      <chart>
+        <search>
+          <query>| tstats count where index=$index$ by host | sort - count | head 10</query>
+          <earliest>$range.earliest$</earliest>
+          <latest>$range.latest$</latest>
+        </search>
+        <option name="charting.chart">bar</option>
+        <option name="charting.legend.placement">none</option>
+      </chart>
+    </panel>
+    <panel>
+      <title>Server errors by status</title>
+      <table>
+        <search>
+          <query>index=$index$ sourcetype=access_combined status&gt;=500 | stats count by status | sort - count</query>
+          <earliest>$range.earliest$</earliest>
+          <latest>$range.latest$</latest>
+        </search>
+        <option name="drilldown">none</option>
+      </table>
+    </panel>
+  </row>
+</form>
