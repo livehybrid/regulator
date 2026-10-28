@@ -3,14 +3,18 @@
  * will mean.
  *
  * Every field left blank keeps the scenario's own default, so the quickest
- * path through this dialog is to change nothing.
+ * path through this dialog is to change nothing. Given an earlier run
+ * (``initial``) it opens filled in with what that run was launched with, seed
+ * included, so "Run again" repeats the same test unless something is changed.
  */
 import React, { useEffect, useState } from 'react';
 import PropTypes from 'prop-types';
 import Checkbox from '@splunk/react-ui/Checkbox';
 import ControlGroup from '@splunk/react-ui/ControlGroup';
 import Message from '@splunk/react-ui/Message';
-import Number from '@splunk/react-ui/Number';
+// Not imported as Number: that shadows the global, and Number(v) then calls
+// the component as a function, which React reports as error #321.
+import NumberInput from '@splunk/react-ui/Number';
 import P from '@splunk/react-ui/Paragraph';
 import Select from '@splunk/react-ui/Select';
 import Text from '@splunk/react-ui/Text';
@@ -23,30 +27,33 @@ import { api, isAuthError } from '../api';
 import { useNotify } from '../Notifications';
 
 const numOrUndefined = (v) => (v === '' || v === null || v === undefined ? undefined : Number(v));
+const asField = (v) => (v === null || v === undefined ? '' : v);
 
-export default function LaunchModal({ scenario, onClose, onLaunched }) {
+export default function LaunchModal({ scenario, initial, onClose, onLaunched }) {
+    const from = initial || {};
     const [loading, setLoading] = useState(true);
     const [targets, setTargets] = useState([]);
     const [scenarios, setScenarios] = useState([]);
     const [fleets, setFleets] = useState([]);
     const [blocked, setBlocked] = useState(null);
     const [form, setForm] = useState({
-        target_id: '',
-        scenario: scenario || '',
-        label: '',
-        virtual_users: '',
-        duration_s: '',
-        pacing_s: '',
-        arrival_rate_per_min: '',
-        seed: '',
-        fleet: '',
-        workers: '',
-        evict_every_s: '',
-        cold_window_s: '',
+        target_id: from.target_id ? String(from.target_id) : '',
+        scenario: scenario || from.scenario || '',
+        label: from.label || '',
+        virtual_users: asField(from.virtual_users),
+        duration_s: asField(from.duration_s),
+        pacing_s: asField(from.pacing_s),
+        arrival_rate_per_min: asField(from.arrival_rate_per_min),
+        seed: asField(from.seed),
+        fleet: from.fleet || '',
+        workers: asField(from.workers),
+        evict_every_s: asField(from.evict_every_s),
+        cold_window_s: asField(from.cold_window_s),
     });
-    const [evict, setEvict] = useState(false);
-    const [evictIndexes, setEvictIndexes] = useState([]);
-    const [evictAll, setEvictAll] = useState(false);
+    const fromIndexes = (from.evict_cache_indexes || '').split(',').filter((i) => i && i !== '*');
+    const [evict, setEvict] = useState(Boolean(from.evict_cache));
+    const [evictIndexes, setEvictIndexes] = useState(fromIndexes);
+    const [evictAll, setEvictAll] = useState((from.evict_cache_indexes || '').split(',').includes('*'));
     const [cacheIndexes, setCacheIndexes] = useState(null);
     const notify = useNotify();
 
@@ -84,7 +91,7 @@ export default function LaunchModal({ scenario, onClose, onLaunched }) {
                         prev.scenario ||
                         (scenarioList.find((x) => x.runnable_here !== false) || {}).name ||
                         '',
-                    fleet: defaultFleet ? defaultFleet.kind : '',
+                    fleet: prev.fleet || (defaultFleet ? defaultFleet.kind : ''),
                 }));
             } catch (e) {
                 if (!isAuthError(e)) {
@@ -178,7 +185,7 @@ export default function LaunchModal({ scenario, onClose, onLaunched }) {
 
     return (
         <Dialog
-            title="Launch a run"
+            title={initial ? `Run again: ${from.label || from.scenario || `run ${from.id}`}` : 'Launch a run'}
             width="860px"
             onClose={onClose}
             closeLabel="Cancel"
@@ -245,7 +252,7 @@ export default function LaunchModal({ scenario, onClose, onLaunched }) {
                                     : 'Blank keeps the scenario default.'
                             }
                         >
-                            <Number value={form.virtual_users} min={1} onChange={set('virtual_users')} />
+                            <NumberInput value={form.virtual_users} min={1} onChange={set('virtual_users')} />
                         </ControlGroup>
                         <ControlGroup
                             label="Duration in seconds"
@@ -256,13 +263,13 @@ export default function LaunchModal({ scenario, onClose, onLaunched }) {
                                     : 'Blank keeps the scenario default.'
                             }
                         >
-                            <Number value={form.duration_s} min={1} onChange={set('duration_s')} />
+                            <NumberInput value={form.duration_s} min={1} onChange={set('duration_s')} />
                         </ControlGroup>
                         <ControlGroup label="Pacing in seconds per iteration" labelPosition="top">
-                            <Number value={form.pacing_s} min={0} step={0.1} onChange={set('pacing_s')} />
+                            <NumberInput value={form.pacing_s} min={0} step={0.1} onChange={set('pacing_s')} />
                         </ControlGroup>
                         <ControlGroup label="Arrival rate per minute" labelPosition="top" help="Open model.">
-                            <Number
+                            <NumberInput
                                 value={form.arrival_rate_per_min}
                                 min={0}
                                 onChange={set('arrival_rate_per_min')}
@@ -273,7 +280,7 @@ export default function LaunchModal({ scenario, onClose, onLaunched }) {
                             labelPosition="top"
                             help="Blank keeps the scenario's, so runs stay comparable."
                         >
-                            <Number value={form.seed} min={1} onChange={set('seed')} />
+                            <NumberInput value={form.seed} min={1} onChange={set('seed')} />
                         </ControlGroup>
                         <ControlGroup label="Fleet" labelPosition="top">
                             <Select value={form.fleet} onChange={set('fleet')}>
@@ -292,7 +299,7 @@ export default function LaunchModal({ scenario, onClose, onLaunched }) {
                             labelPosition="top"
                             help="Blank sizes the fleet from the users per worker."
                         >
-                            <Number value={form.workers} min={1} onChange={set('workers')} />
+                            <NumberInput value={form.workers} min={1} onChange={set('workers')} />
                         </ControlGroup>
                     </Grid2>
 
@@ -352,14 +359,14 @@ export default function LaunchModal({ scenario, onClose, onLaunched }) {
                             labelPosition="top"
                             help="Blank: never."
                         >
-                            <Number value={form.evict_every_s} min={60} onChange={set('evict_every_s')} />
+                            <NumberInput value={form.evict_every_s} min={60} onChange={set('evict_every_s')} />
                         </ControlGroup>
                         <ControlGroup
                             label="Cold window in seconds after each eviction"
                             labelPosition="top"
                             help="Blank: half the interval."
                         >
-                            <Number value={form.cold_window_s} min={1} onChange={set('cold_window_s')} />
+                            <NumberInput value={form.cold_window_s} min={1} onChange={set('cold_window_s')} />
                         </ControlGroup>
                     </Grid2>
                     <Note>
@@ -376,6 +383,24 @@ export default function LaunchModal({ scenario, onClose, onLaunched }) {
 
 LaunchModal.propTypes = {
     scenario: PropTypes.string,
+    // An earlier run to repeat: the fields it was launched with.
+    initial: PropTypes.shape({
+        id: PropTypes.number,
+        target_id: PropTypes.number,
+        scenario: PropTypes.string,
+        label: PropTypes.string,
+        virtual_users: PropTypes.number,
+        duration_s: PropTypes.number,
+        pacing_s: PropTypes.number,
+        arrival_rate_per_min: PropTypes.number,
+        seed: PropTypes.number,
+        fleet: PropTypes.string,
+        workers: PropTypes.number,
+        evict_cache: PropTypes.bool,
+        evict_cache_indexes: PropTypes.string,
+        evict_every_s: PropTypes.number,
+        cold_window_s: PropTypes.number,
+    }),
     onClose: PropTypes.func.isRequired,
     onLaunched: PropTypes.func.isRequired,
 };

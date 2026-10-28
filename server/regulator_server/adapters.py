@@ -244,5 +244,6 @@ def worker_config(
         metrics_port=0,
         builtin_scenarios_dir=str(scenarios_dir()),
         cold_window_s=cold_window_s,
+        max_pause_s=float(get_settings().max_pause_s),
         **indexer_settings(target),
     )

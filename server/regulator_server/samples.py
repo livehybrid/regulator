@@ -135,6 +135,21 @@ def markers_for(run: Run) -> List[Dict[str, Any]]:
     for worker in summary.get("workers") or []:
         if worker.get("outcome") == "lost" and worker.get("lost_at"):
             markers.append({"at": worker["lost_at"], "kind": "lost", "label": f"slot {worker.get('slot')} lost"})
+    # Pauses and live load changes, so a number that moved says why.
+    for control in run.controls_json or []:
+        if not isinstance(control, dict) or not control.get("at"):
+            continue
+        kind = control.get("kind")
+        if kind == "pause":
+            markers.append({"at": control["at"], "kind": "pause", "label": "paused"})
+        elif kind == "resume":
+            markers.append({"at": control["at"], "kind": "resume", "label": "resumed"})
+        elif kind == "load":
+            if control.get("virtual_users") is not None:
+                label = f"{control['virtual_users']:g} users"
+            else:
+                label = f"{control.get('arrival_rate_per_min', 0):g}/min"
+            markers.append({"at": control["at"], "kind": "load", "label": label})
     if run.ended_at and run.state == "stopped":
         markers.append({"at": run.ended_at, "kind": "stop", "label": "stop"})
     return markers

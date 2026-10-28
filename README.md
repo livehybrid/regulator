@@ -439,7 +439,8 @@ the environment; everything downstream of the claim is the standalone code.
 | `REG_SCENARIO_SOURCE_WRITE` | off | Also push scenarios created here back to that prefix. A separate switch because the common case is a curated library several instances read, and one of them silently overwriting it would be hard to notice |
 | `REG_SCENARIO_UPLOAD_MAX_ARCHIVE_BYTES` and friends | 16 MiB | Extraction-bomb caps for an uploaded scenario archive (`_MAX_MEMBERS` 2000, `_MAX_MEMBER_BYTES` 8 MiB, `_MAX_TOTAL_BYTES` 32 MiB). Enforced on the bytes produced while streaming, never on the sizes the archive declares |
 | `REG_MAX_VIRTUAL_USERS` | `500` | The in-process ceiling described above. The open model is held to the same ceiling of in-flight searches |
-| `REG_MAX_CONCURRENT_RUNS` | `2` | More at once would mean measuring contention between your own tests |
+| `REG_MAX_CONCURRENT_RUNS` | `2` | Runs in flight at once, in-process and fleet together. More at once would mean measuring contention between your own tests; the shipped stack and Kubernetes manifest set it to `1` |
+| `REG_MAX_PAUSE_S` | `1800` | The longest a run may spend paused in total. Past it the run is **stopped**, not resumed: whoever paused it may have done so to protect the cluster. `0` removes the limit. Also added to a Kubernetes fleet Job's deadline, which is fixed when the Job is created |
 | `REG_MAX_RUN_DURATION_S` | `14400` | The longest run accepted, so a mistyped duration cannot hold a slot for ever |
 | `REG_SESSION_TTL_S` | `43200` | Sessions are bound to the password as well as the key: changing the password signs everyone out |
 
@@ -1003,6 +1004,31 @@ right rather than a failure.
 The last one is different in kind: a worker that cannot keep to its own
 schedule is measuring itself, so the run is stopped and marked **invalid**
 rather than reported as a Splunk result.
+
+### Changing a run after launch
+
+**Run again** opens the launch dialog filled in with what an earlier run was
+launched with, seed included, so it repeats the same test unless you change
+something. **Edit** changes a run's label and note at any time.
+
+While a run is going, **Pause** stops issuing searches and stops the run clock:
+searches already in flight finish and are recorded, an iteration with several
+steps stops between them, and the paused time does not count towards the
+duration, so the run still delivers all the load it was asked for. **Resume**
+re-anchors every schedule at now, so nothing that was due during the pause is
+reported as late; without that the pause would turn up as latency. Throughput
+leaves paused time out too. Each pause is drawn on the charts and listed in the
+summary (`configured_load.pauses`), because a run with a gap in it should say so.
+
+**Edit** on a running run also changes its load: virtual users for the closed
+model, arrivals per minute for the open one (the schedule model fires by cron
+and has no single figure). The change replaces the scenario's ramp from then
+on, is marked on the charts with the new figure, and is listed in
+`configured_load.load_changes`; the run keeps the figures it was launched with,
+and Run again repeats those. An in-process run keeps its virtual-user ceiling,
+and a fleet run can rise to what its workers were sized for. A fleet's workers
+pick up a pause or a load change in their next heartbeat reply, which carries
+both as state on every beat, so one lost in transit only delays it.
 
 A refused search (401 or 403) is a failed step with error class `auth`, and the
 run carries on: a search head under load can fail a token lookup, and a 403 can

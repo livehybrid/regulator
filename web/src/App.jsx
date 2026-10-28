@@ -251,6 +251,7 @@ function SignedIn({ session, colorScheme, onToggleTheme, onSignOut }) {
             {launchFor && (
                 <LaunchModal
                     scenario={launchFor.scenario}
+                    initial={launchFor.initial}
                     onClose={() => setLaunchFor(null)}
                     onLaunched={(runId) => {
                         setLaunchFor(null);
@@ -272,7 +273,7 @@ SignedIn.propTypes = {
 function Page({ page, id, navigate, onLaunch }) {
     switch (page) {
         case 'run':
-            return <RunDetail runId={id} navigate={navigate} />;
+            return <RunDetail runId={id} navigate={navigate} onLaunch={onLaunch} />;
         case 'target':
             return <TargetDetail targetId={id} navigate={navigate} />;
         case 'scenarios':

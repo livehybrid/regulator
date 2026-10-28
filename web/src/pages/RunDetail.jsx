@@ -25,6 +25,7 @@ import WaitSpinner from '@splunk/react-ui/WaitSpinner';
 import BusyButton from '../components/BusyButton';
 import ComparisonPanel from '../components/ComparisonPanel';
 import CompareModal from '../modals/CompareModal';
+import EditRunModal from '../modals/EditRunModal';
 import FleetLogsModal from '../modals/FleetLogsModal';
 import PromoteBaselineModal from '../modals/PromoteBaselineModal';
 import PurgeModal from '../modals/PurgeModal';
@@ -64,7 +65,7 @@ const freshSeries = (id) => ({
     loaded: false,
 });
 
-export default function RunDetail({ runId, navigate }) {
+export default function RunDetail({ runId, navigate, onLaunch }) {
     const [run, setRun] = useState(null);
     const [error, setError] = useState(null);
     const [comparison, setComparison] = useState(null);
@@ -204,6 +205,18 @@ export default function RunDetail({ runId, navigate }) {
         notify('Stop requested', 'success');
     };
 
+    const pauseOrResume = async () => {
+        const action = run.paused ? 'resume' : 'pause';
+        const r = await api(`/runs/${encodeURIComponent(run.id)}/${action}`, { method: 'POST' });
+        setRun((current) => ({ ...current, ...r, stats: current.stats }));
+        notify(
+            action === 'pause'
+                ? 'Paused: no new searches, and the run clock has stopped'
+                : 'Resumed: the schedule restarts from now',
+            'success'
+        );
+    };
+
     const openLogs = async () => {
         setDialog({ kind: 'logs', loading: true, payload: null });
         try {
@@ -228,6 +241,16 @@ export default function RunDetail({ runId, navigate }) {
     /* ------------------------------------------------------------ banners */
 
     const banners = [];
+    if (run.paused) {
+        banners.push(
+            <Message appearance="fill" type="info" key="paused">
+                <Message.Title>Paused</Message.Title>
+                No new searches are being issued and the run clock is stopped, so the run still
+                delivers its full duration of load once resumed. A run paused for longer than the
+                control plane&apos;s limit in total is stopped rather than resumed.
+            </Message>
+        );
+    }
     if (summary.valid === false) {
         banners.push(
             <Message appearance="fill" type="error" key="invalid">
@@ -385,13 +408,25 @@ export default function RunDetail({ runId, navigate }) {
                         {summary.load_model ? ` · ${summary.load_model} model` : ''}
                         {isBlank(summary.effective_seed) ? '' : ` · seed ${summary.effective_seed}`}
                         {summary.scenario_digest ? ` · digest ${summary.scenario_digest}` : ''}
+                        {run.paused_s ? ` · paused ${fmtDur(run.paused_s)}` : ''}
                     </Muted>
+                    {run.note && (
+                        <P>
+                            <Muted>{run.note}</Muted>
+                        </P>
+                    )}
                 </div>
                 <Toolbar>
                     <Button label="All runs" onClick={() => navigate('runs')} />
                     {live ? (
                         <>
                             <BusyButton appearance="destructive" label="Stop" onClick={stop} />
+                            {run.state === 'running' && (
+                                <BusyButton
+                                    label={run.paused ? 'Resume' : 'Pause'}
+                                    onClick={pauseOrResume}
+                                />
+                            )}
                             {run.target_id && (
                                 <Tooltip
                                     content="Evict every cached bucket on the target now, so the searches that follow read cold"
@@ -415,6 +450,16 @@ export default function RunDetail({ runId, navigate }) {
                             </>
                         )
                     )}
+                    <Button label="Edit" onClick={() => setDialog({ kind: 'edit' })} />
+                    <Tooltip
+                        content="Open the launch dialog filled in with what this run was launched with, seed included"
+                        defaultPlacement="below"
+                    >
+                        <Button
+                            label="Run again"
+                            onClick={() => onLaunch({ scenario: run.scenario, initial: run })}
+                        />
+                    </Tooltip>
                     <BusyButton label="Copy JSON" onClick={copySummary} />
                     {/* The whole run as one file: the summary, the time series,
                         the cluster's own account of it and the scenario that
@@ -671,6 +716,16 @@ export default function RunDetail({ runId, navigate }) {
                 </Panel>
             )}
 
+            {dialog && dialog.kind === 'edit' && (
+                <EditRunModal
+                    run={run}
+                    onClose={() => setDialog(null)}
+                    onSaved={(updated) => {
+                        setRun((current) => ({ ...current, ...updated, stats: current.stats }));
+                        setDialog(null);
+                    }}
+                />
+            )}
             {dialog && dialog.kind === 'promote' && (
                 <PromoteBaselineModal runId={run.id} onClose={() => setDialog(null)} />
             )}
@@ -704,4 +759,5 @@ export default function RunDetail({ runId, navigate }) {
 RunDetail.propTypes = {
     runId: PropTypes.string.isRequired,
     navigate: PropTypes.func.isRequired,
+    onLaunch: PropTypes.func.isRequired,
 };

@@ -91,6 +91,7 @@ export default function Runs({ navigate, onLaunch }) {
                             <Table.HeadCell align="right">Errors</Table.HeadCell>
                             <Table.HeadCell align="right">Queued</Table.HeadCell>
                             <Table.HeadCell>Validity</Table.HeadCell>
+                            <Table.HeadCell />
                         </Table.Head>
                         <Table.Body>
                             {runs.map((r) => {
@@ -127,6 +128,17 @@ export default function Runs({ navigate, onLaunch }) {
                                         </Table.Cell>
                                         <Table.Cell>
                                             <Validity run={r} headline={h} />
+                                        </Table.Cell>
+                                        <Table.Cell>
+                                            {/* Its own click: the row's opens the run. */}
+                                            <Button
+                                                appearance="subtle"
+                                                label="Run again"
+                                                onClick={(e) => {
+                                                    e.stopPropagation();
+                                                    onLaunch({ scenario: r.scenario, initial: r });
+                                                }}
+                                            />
                                         </Table.Cell>
                                     </Table.Row>
                                 );

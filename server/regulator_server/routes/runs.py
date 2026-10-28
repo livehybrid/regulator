@@ -8,6 +8,8 @@ import re
 import time
 from typing import Any, Dict, List, Optional
 
+from pydantic import BaseModel, Field
+
 from fastapi import APIRouter, Depends, HTTPException, Response
 from sqlalchemy import select
 from sqlalchemy.orm import Session
@@ -21,6 +23,8 @@ from ..audit import record as audit_record
 from ..config import get_settings
 from ..db import get_session
 from ..models import Run, Target, is_terminal
+from .. import runcontrol
+from ..fleet import paused_seconds
 from ..runner import RunRejected, manager
 from ..schemas import RunCreate, RunOut
 
@@ -77,6 +81,13 @@ def _serialise(run: Run, target_name: Optional[str] = None, full: bool = True) -
         "started_at": run.started_at,
         "ended_at": run.ended_at,
         "error": run.error,
+        "note": run.note,
+        "paused": run.paused_at is not None and not is_terminal(run.state),
+        "paused_s": round(paused_seconds(run), 1) if (run.paused_at or run.paused_s) else 0.0,
+        "load_override": run.load_override,
+        "arrival_rate_per_min": run.arrival_rate_per_min,
+        "pacing_s": run.pacing_s,
+        "evict_cache_indexes": run.evict_cache_indexes,
     }
     if full:
         from ..samples import markers_for
@@ -387,6 +398,80 @@ def stop_run(
             run.ended_at = run.ended_at or time.time()
             session.add(run)
     return _serialise(run) if run is not None else {}
+
+
+class RunUpdate(BaseModel):
+    """What can change once a run has launched. Only the fields sent change."""
+
+    label: Optional[str] = Field(default=None, max_length=128)
+    note: Optional[str] = Field(default=None, max_length=4000)
+    # The run's total load, by its model: users for closed, arrivals for open.
+    virtual_users: Optional[int] = Field(default=None, ge=0)
+    arrival_rate_per_min: Optional[float] = Field(default=None, ge=0)
+
+
+def _controlled(session: Session, run_id: int) -> Run:
+    run = session.get(Run, run_id)
+    if run is None:
+        raise HTTPException(status_code=404, detail=f"no run with id {run_id}")
+    return run
+
+
+@router.patch("/runs/{run_id}")
+def update_run(
+    run_id: int, body: RunUpdate, request: Request, session: Session = Depends(get_session)
+) -> Dict[str, Any]:
+    """Relabel or annotate any run; change the load of one that is running."""
+    run = _controlled(session, run_id)
+    sent = body.model_fields_set
+    if "virtual_users" in sent and "arrival_rate_per_min" in sent:
+        raise HTTPException(status_code=422, detail="send virtual_users or arrival_rate_per_min, not both")
+    runcontrol.edit(run, {name: getattr(body, name) for name in ("label", "note") if name in sent})
+    for figure in ("virtual_users", "arrival_rate_per_min"):
+        value = getattr(body, figure)
+        if figure in sent and value is not None:
+            try:
+                applied = runcontrol.set_load(session, run, float(value))
+            except runcontrol.ControlRefused as exc:
+                raise HTTPException(status_code=exc.status, detail=str(exc))
+            if applied != figure:
+                raise HTTPException(
+                    status_code=422,
+                    detail=f"this run's load is set by {applied}, not {figure}",
+                )
+            audit_record("run_load_changed", request=request, target_id=run.target_id,
+                         detail=f"run {run_id}: {figure} {value:g}")
+    session.add(run)
+    session.commit()
+    return _serialise(run, run.target.name if run.target is not None else None)
+
+
+@router.post("/runs/{run_id}/pause")
+def pause_run(run_id: int, request: Request, session: Session = Depends(get_session)) -> Dict[str, Any]:
+    """Stop issuing searches and stop the run clock; in-flight searches finish."""
+    run = _controlled(session, run_id)
+    try:
+        runcontrol.pause(session, run)
+    except runcontrol.ControlRefused as exc:
+        raise HTTPException(status_code=exc.status, detail=str(exc))
+    session.add(run)
+    session.commit()
+    audit_record("run_paused", request=request, target_id=run.target_id, detail=f"run {run_id}")
+    return _serialise(run, run.target.name if run.target is not None else None)
+
+
+@router.post("/runs/{run_id}/resume")
+def resume_run(run_id: int, request: Request, session: Session = Depends(get_session)) -> Dict[str, Any]:
+    """Start issuing searches again, with every schedule re-anchored at now."""
+    run = _controlled(session, run_id)
+    try:
+        runcontrol.resume(session, run)
+    except runcontrol.ControlRefused as exc:
+        raise HTTPException(status_code=exc.status, detail=str(exc))
+    session.add(run)
+    session.commit()
+    audit_record("run_resumed", request=request, target_id=run.target_id, detail=f"run {run_id}")
+    return _serialise(run, run.target.name if run.target is not None else None)
 
 
 @router.delete("/runs/{run_id}", status_code=204)

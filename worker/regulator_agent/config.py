@@ -317,6 +317,10 @@ class Config:
     # are abandoned. Abandoned work is recorded as a cancelled failure with
     # the time it had accrued, never silently dropped.
     drain_budget_s: float = 60.0
+    # The longest a run may stay paused, in total, before it is stopped. A
+    # forgotten pause must not hold a run slot forever, nor resume load
+    # unattended on a cluster somebody paused it to protect.
+    max_pause_s: float = 1800.0
     # How long to wait for the target's own logging to catch up before asking
     # it about the run.
     sut_settle_s: float = 8.0
@@ -494,6 +498,7 @@ def load_config(env: Optional[Mapping[str, str]] = None) -> Config:
         builtin_scenarios_dir=_get(env, "REG_BUILTIN_SCENARIOS_DIR"),
         lint_strict=_boolean(env, "REG_LINT_STRICT", True),
         drain_budget_s=_number(env, "REG_DRAIN_BUDGET_S", 60.0, minimum=1.0),
+        max_pause_s=_number(env, "REG_MAX_PAUSE_S", 1800.0, minimum=0.0),
         sut_settle_s=_number(env, "REG_SUT_SETTLE_S", 8.0, minimum=0.0),
         indexer_urls=tuple(
             _url(env, "REG_INDEXER_URLS", part.strip()) or ""

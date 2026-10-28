@@ -89,6 +89,11 @@ class RunManager:
         with self._lock:
             return run_id in self._active or run_id in self._fleets
 
+    def active_entry(self, run_id: int) -> Optional[ActiveRun]:
+        """An in-process run's entry, scheduler included, while it is in flight."""
+        with self._lock:
+            return self._active.get(run_id)
+
     def fleet_run(self, run_id: int) -> Optional[Any]:
         with self._lock:
             return self._fleets.get(run_id)
@@ -435,6 +440,12 @@ class RunManager:
                 capabilities=capabilities,
             )
             entry.scheduler = scheduler
+            # A pause asked for while the target was being probed is on the
+            # run row already; honour it now the scheduler exists.
+            with session_scope() as session:
+                row = session.get(Run, run_id)
+                if row is not None and row.paused_at is not None:
+                    scheduler.pause()
             if entry.stop_requested:
                 # Stopped between being queued and starting. Honour it rather
                 # than running a test nobody is waiting for any more.

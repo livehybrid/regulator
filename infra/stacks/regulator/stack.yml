@@ -38,6 +38,8 @@ services:
       - REG_MAX_VIRTUAL_USERS=${REG_MAX_VIRTUAL_USERS:-300}
       - REG_MAX_CONCURRENT_RUNS=${REG_MAX_CONCURRENT_RUNS:-1}
       - REG_MAX_RUN_DURATION_S=${REG_MAX_RUN_DURATION_S:-14400}
+      # Total time a run may stay paused before it is stopped (not resumed).
+      - REG_MAX_PAUSE_S=${REG_MAX_PAUSE_S:-1800}
       # Where every run launched from the web interface ships its telemetry.
       # Off when unset. REG_HEC_VERIFY_TLS=0 for a self-signed collector.
       - REG_HEC_URL=${REG_HEC_URL:-}

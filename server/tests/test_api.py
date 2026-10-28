@@ -534,3 +534,88 @@ def test_a_404_for_a_target_says_which_kind_of_missing_it_is(client):
     within = client.get(f"/api/targets/{max(1, kept - 1)}/samples")
     if within.status_code == 404:
         assert "within range" in within.json()["detail"]
+
+
+# --------------------------------------------------------------- run controls
+
+
+def _wait_running(client, run_id, timeout_s=30.0):
+    deadline = time.time() + timeout_s
+    while time.time() < deadline:
+        if client.get(f"/api/runs/{run_id}").json()["state"] == "running":
+            return
+        time.sleep(0.1)
+    raise AssertionError("the run never started")
+
+
+def test_a_run_can_be_paused_and_resumed_and_its_clock_stops(client, splunkd):
+    target = make_target(client, splunkd)
+    run_id = client.post(
+        "/api/runs",
+        json={"target_id": target["id"], "scenario": "smoke", "virtual_users": 2, "duration_s": 3},
+    ).json()["id"]
+    _wait_running(client, run_id)
+    deadline = time.time() + 10
+    while time.time() < deadline and not (client.get(f"/api/runs/{run_id}").json()["stats"] or {}).get("executions"):
+        time.sleep(0.1)
+
+    paused = client.post(f"/api/runs/{run_id}/pause")
+    assert paused.status_code == 200, paused.text
+    assert paused.json()["paused"] is True
+    time.sleep(2.0)  # in-flight searches land and the next snapshot is published
+    before = client.get(f"/api/runs/{run_id}").json()["stats"]["executions"]
+    time.sleep(3.0)  # longer than the whole duration: a running clock would end the run
+    held = client.get(f"/api/runs/{run_id}").json()
+    assert held["state"] == "running"
+    assert held["stats"]["executions"] == before
+
+    resumed = client.post(f"/api/runs/{run_id}/resume")
+    assert resumed.status_code == 200, resumed.text
+    assert resumed.json()["paused"] is False
+    finished = wait_for_terminal(client, run_id)
+    assert finished["state"] == "completed", finished.get("error")
+    assert finished["stats"]["executions"] > before
+    assert finished["paused_s"] >= 3.0
+    kinds = [m["kind"] for m in finished["markers"]]
+    assert "pause" in kinds and "resume" in kinds
+    assert finished["summary"]["configured_load"]["pauses"]
+
+
+def test_the_load_of_a_running_run_can_change(client, splunkd):
+    target = make_target(client, splunkd)
+    run_id = client.post(
+        "/api/runs",
+        json={"target_id": target["id"], "scenario": "smoke", "virtual_users": 1, "duration_s": 3},
+    ).json()["id"]
+    _wait_running(client, run_id)
+    deadline = time.time() + 10
+    changed = client.patch(f"/api/runs/{run_id}", json={"virtual_users": 3})
+    while changed.status_code == 409 and time.time() < deadline:
+        time.sleep(0.1)  # still probing the target
+        changed = client.patch(f"/api/runs/{run_id}", json={"virtual_users": 3})
+    assert changed.status_code == 200, changed.text
+    assert changed.json()["load_override"] == 3
+    # The other figure belongs to the open model.
+    assert client.patch(f"/api/runs/{run_id}", json={"arrival_rate_per_min": 60}).status_code == 422
+    # The in-process ceiling still holds.
+    assert client.patch(f"/api/runs/{run_id}", json={"virtual_users": 100000}).status_code == 422
+    finished = wait_for_terminal(client, run_id)
+    assert finished["virtual_users"] == 1  # launched as 1; the change is on top
+    assert any(m["kind"] == "load" and m["label"] == "3 users" for m in finished["markers"])
+    assert finished["summary"]["peak_virtual_users"] == 3
+
+
+def test_a_finished_run_can_be_relabelled_but_not_paused(client, splunkd):
+    target = make_target(client, splunkd)
+    run_id = client.post(
+        "/api/runs",
+        json={"target_id": target["id"], "scenario": "smoke", "virtual_users": 1, "duration_s": 1},
+    ).json()["id"]
+    wait_for_terminal(client, run_id)
+    edited = client.patch(f"/api/runs/{run_id}", json={"label": "after the fix", "note": "indexer 3 replaced"})
+    assert edited.status_code == 200, edited.text
+    run = client.get(f"/api/runs/{run_id}").json()
+    assert run["label"] == "after the fix" and run["note"] == "indexer 3 replaced"
+    assert client.post(f"/api/runs/{run_id}/pause").status_code == 409
+    assert client.post(f"/api/runs/{run_id}/resume").status_code == 409
+    assert client.patch(f"/api/runs/{run_id}", json={"virtual_users": 2}).status_code == 409
