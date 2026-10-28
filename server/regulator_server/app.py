@@ -39,6 +39,7 @@ from fastapi.staticfiles import StaticFiles
 
 from . import auth
 from . import configio
+from . import configsource
 from . import scenariosource
 from .adapters import scenarios_dir, user_scenarios_dir
 from .audit import record as audit_record
@@ -104,6 +105,11 @@ def create_app() -> FastAPI:
     # deployment down and leave no way in to fix the typo.
     _import_config_from_env()
     scenariosource.load_from_env()
+    # The shared config copy and run history in REG_CONFIG_SOURCE. After the
+    # scenario source, so the library is in place before the copy's own
+    # scenarios are compared with it; and with the same never-raises contract.
+    configsource.load_from_env(get_settings())
+    configsource.start_publisher(get_settings())
 
     @app.middleware("http")
     async def require_session(request: Request, call_next):

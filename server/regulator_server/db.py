@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import threading
+import uuid
 from contextlib import contextmanager
 from typing import Iterator, Optional
 
@@ -43,6 +44,7 @@ def init_engine(database_url: Optional[str] = None) -> Engine:
 
     Base.metadata.create_all(_engine)
     _add_missing_columns(_engine)
+    _backfill_run_uids(_engine)
     _session_factory = sessionmaker(bind=_engine, expire_on_commit=False, future=True)
     return _engine
 
@@ -68,6 +70,21 @@ def _add_missing_columns(engine: Engine) -> None:
                 connection.execute(
                     text(f'ALTER TABLE {table.name} ADD COLUMN "{column.name}" {kind}')
                 )
+
+
+def _backfill_run_uids(engine: Engine) -> None:
+    """Give every run that predates ``runs.uid`` one.
+
+    The column arrives empty on an existing database, and a run with no uid
+    cannot be archived, pulled back, or named by a baseline in the config.
+    """
+    with engine.begin() as connection:
+        ids = [row[0] for row in connection.execute(text("SELECT id FROM runs WHERE uid IS NULL"))]
+        for run_id in ids:
+            connection.execute(
+                text("UPDATE runs SET uid = :uid WHERE id = :id"),
+                {"uid": uuid.uuid4().hex, "id": run_id},
+            )
 
 
 _init_lock = threading.Lock()

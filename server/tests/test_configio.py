@@ -235,6 +235,27 @@ def test_a_different_master_key_warns_rather_than_failing(session, user_library)
     assert any("cannot be decrypted" in w for w in report["warnings"])
 
 
+def test_a_different_master_key_keeps_the_credentials_set_here(session, user_library):
+    """Ciphertext this instance cannot read must not replace one it can.
+
+    The config source pulls at every boot, so without this one copy made under
+    the wrong key would break every target on every instance that read it.
+    """
+    session.add(Target(name="prod-sh", mgmt_url="https://sh.example:8089",
+                       token_encrypted="readable-here"))
+    session.flush()
+    doc = {
+        "master_key_fingerprint": "deadbeef",
+        "includes_secrets": True,
+        "targets": [{"name": "prod-sh", "mgmt_url": "https://moved.example:8089",
+                     "token_encrypted": "unreadable-here"}],
+    }
+    configio.import_config(session, doc)
+    target = session.query(Target).filter(Target.name == "prod-sh").one()
+    assert target.token_encrypted == "readable-here"
+    assert target.mgmt_url == "https://moved.example:8089"
+
+
 def test_an_export_without_secrets_says_so_on_restore(session, user_library):
     report = configio.import_config(
         session, {"includes_secrets": False, "targets": [{"name": "t", "mgmt_url": "https://x:8089"}]}

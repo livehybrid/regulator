@@ -25,7 +25,7 @@ from fastapi.responses import Response
 from sqlalchemy.orm import Session
 from fastapi import Depends
 
-from .. import configio
+from .. import configio, configsource
 from ..audit import record as audit_record
 from ..config import get_settings
 from ..db import get_session
@@ -115,3 +115,72 @@ def import_config(
         ),
     )
     return report
+
+
+# --------------------------------------------------------------------------- #
+# The shared copy and run history (REG_CONFIG_SOURCE)
+# --------------------------------------------------------------------------- #
+
+def _require_source() -> configsource.Store:
+    try:
+        store = configsource.store_from_env()
+    except configsource.ConfigSourceError as exc:
+        raise HTTPException(status_code=409, detail=str(exc))
+    if store is None:
+        raise HTTPException(status_code=409, detail=f"{configsource.SOURCE_ENV} is not set")
+    return store
+
+
+@router.get("/source")
+def config_source() -> Dict[str, Any]:
+    """Where the shared copy lives, whether this instance writes it, and what
+    the last pull and push did."""
+    return configsource.describe()
+
+
+@router.post("/source/pull")
+def pull_config_source(request: Request, session: Session = Depends(get_session)) -> Dict[str, Any]:
+    """Apply the shared copy and import any archived runs this instance lacks."""
+    store = _require_source()
+    try:
+        report = configsource.pull(session, settings=get_settings(), store=store)
+    except configsource.ConfigSourceError as exc:
+        raise HTTPException(status_code=502, detail=str(exc))
+    session.commit()
+    audit_record(
+        "config_pulled",
+        request=request,
+        detail=(
+            f"{report['targets']} target(s), {report['scenarios']} scenario(s), "
+            f"{report['baselines']} baseline(s) and {report['runs']['imported']} run(s) "
+            "created from the config source"
+        ),
+    )
+    return report
+
+
+@router.post("/source/push")
+def push_config_source(request: Request, session: Session = Depends(get_session)) -> Dict[str, Any]:
+    """Archive finished runs and write the configuration to the shared copy now.
+
+    409 unless ``REG_CONFIG_SOURCE_WRITE`` is on: the switch exists so an
+    instance cannot overwrite a copy it was only meant to read, and a button
+    that went round it would make the switch meaningless.
+    """
+    store = _require_source()
+    if not configsource.writes_enabled():
+        raise HTTPException(
+            status_code=409,
+            detail=f"set {configsource.WRITE_ENV}=1 to let this instance write the shared copy",
+        )
+    try:
+        result = configsource.push(session, settings=get_settings(), store=store)
+    except configsource.ConfigSourceError as exc:
+        raise HTTPException(status_code=502, detail=str(exc))
+    session.commit()
+    audit_record(
+        "config_pushed",
+        request=request,
+        detail=f"{result['targets']} target(s), {result['runs']} run(s) archived",
+    )
+    return result

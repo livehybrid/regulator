@@ -21,13 +21,18 @@ What travels
     The built-in library is not exported: it ships in the image, so writing it
     into a restore would shadow the newer copy after an upgrade.
 
+``baselines``
+    Each label with the run it points at, named by the run's ``uid`` rather than
+    its id, because a rebuilt instance numbers its runs differently. A baseline
+    whose run is not on this instance is skipped and reported, not created
+    pointing at nothing; the config source (:mod:`.configsource`) pulls the
+    archived runs first, so on that path the run is normally there.
+
 What deliberately does not travel
 ---------------------------------
 Runs, worker leases, samples and audit events are history, not configuration.
-**Baselines** look like configuration but are not: a baseline is a label
-pointing at a run id, so on an instance with no runs there is nothing for it to
-point at and restoring one would create a label that resolves to nothing. They
-are left out rather than exported and silently skipped.
+The config source archives finished runs beside this document, one file each,
+which is where a rebuilt instance gets them back from.
 
 Nothing is addressed by id
 --------------------------
@@ -67,7 +72,7 @@ from sqlalchemy.orm import Session
 
 from .adapters import user_scenarios_dir
 from .config import get_settings
-from .models import Target
+from .models import Baseline, Run, Target
 
 log = logging.getLogger("regulator.server.configio")
 
@@ -184,6 +189,7 @@ def export_config(
         "master_key_fingerprint": master_key_fingerprint(settings),
         "targets": [],
         "scenarios": [],
+        "baselines": [],
     }
 
     for target in session.query(Target).order_by(Target.name).all():
@@ -194,9 +200,29 @@ def export_config(
 
     if include_scenarios:
         doc["scenarios"] = _export_scenarios(warnings)
+    doc["baselines"] = export_baselines(session)
     if warnings:
         doc["warnings"] = warnings
     return doc
+
+
+def export_baselines(session: Session) -> List[Dict[str, Any]]:
+    """Every baseline, naming its run and target by what survives a rebuild."""
+    out: List[Dict[str, Any]] = []
+    for baseline in session.query(Baseline).order_by(Baseline.label).all():
+        run = session.get(Run, baseline.run_id)
+        if run is None or not run.uid:
+            continue
+        target = session.get(Target, baseline.target_id) if baseline.target_id else None
+        out.append({
+            "label": baseline.label,
+            "run_uid": run.uid,
+            "scenario": baseline.scenario,
+            "target": target.name if target is not None else None,
+            "note": baseline.note,
+            "created_at": baseline.created_at,
+        })
+    return out
 
 
 # --------------------------------------------------------------------------- #
@@ -284,14 +310,15 @@ def import_config(
 
     want = doc.get("master_key_fingerprint")
     have = master_key_fingerprint(settings)
-    if want and have and want != have:
+    foreign_key = bool(want and have and want != have)
+    if foreign_key:
         # Not fatal: the configuration still restores and is still useful, but
         # every encrypted credential in it is unreadable, so say so loudly once
         # rather than let it surface later as a pile of auth failures.
         report["warnings"].append(
             f"this config was exported under master key {want} but this instance uses "
             f"{have}: the stored tokens and passwords cannot be decrypted and must be "
-            "re-entered"
+            "re-entered; ones already set here are kept"
         )
     if doc.get("includes_secrets") is False:
         report["warnings"].append(
@@ -309,6 +336,7 @@ def import_config(
             continue
         mgmt_url = str(row.get("mgmt_url") or "").strip()
         target = session.query(Target).filter(Target.name == name).one_or_none()
+        existing = target is not None
         if target is None:
             if not mgmt_url:
                 report["skipped"].append(f"target {name!r}: no mgmt_url to create it with")
@@ -320,6 +348,10 @@ def import_config(
             report["targets_updated"] += 1
         for field_name in TARGET_FIELDS + TARGET_SECRETS:
             if field_name in row and field_name != "name":
+                # Ciphertext under another key cannot be read here, so it must
+                # not replace a credential that can.
+                if foreign_key and existing and field_name in TARGET_SECRETS:
+                    continue
                 setattr(target, field_name, row[field_name])
 
     session.flush()
@@ -364,7 +396,52 @@ def import_config(
         else:
             report["scenarios"] += 1
 
+    import_baselines(session, doc, report)
     return report
+
+
+def import_baselines(session: Session, doc: Dict[str, Any], report: Dict[str, Any]) -> None:
+    """Apply the document's baselines whose runs are on this instance.
+
+    Separate from :func:`import_config` so the config source can apply them a
+    second time, after it has pulled the runs they point at. Repeating it is
+    harmless: a baseline already pointing at the right run is left alone.
+    """
+    report.setdefault("baselines", 0)
+    report.setdefault("baselines_updated", 0)
+    report.setdefault("baselines_waiting", [])
+    for row in doc.get("baselines") or []:
+        if not isinstance(row, dict):
+            report["skipped"].append("a baseline that is not an object")
+            continue
+        label = str(row.get("label") or "").strip()
+        uid = str(row.get("run_uid") or "").strip()
+        if not label or not uid:
+            report["skipped"].append("a baseline with no label or no run_uid")
+            continue
+        run = session.query(Run).filter(Run.uid == uid).one_or_none()
+        if run is None:
+            if label not in report["baselines_waiting"]:
+                report["baselines_waiting"].append(label)
+            continue
+        target_id = run.target_id
+        if row.get("target"):
+            named = session.query(Target).filter(Target.name == row["target"]).one_or_none()
+            target_id = named.id if named is not None else target_id
+        baseline = session.get(Baseline, label)
+        if baseline is None:
+            baseline = Baseline(label=label)
+            session.add(baseline)
+            report["baselines"] += 1
+        elif baseline.run_id != run.id:
+            report["baselines_updated"] += 1
+        baseline.run_id = run.id
+        baseline.scenario = str(row.get("scenario") or run.scenario)
+        baseline.target_id = target_id
+        baseline.note = row.get("note")
+        if row.get("created_at") is not None:
+            baseline.created_at = float(row["created_at"])
+    session.flush()
 
 
 def import_from_env(
