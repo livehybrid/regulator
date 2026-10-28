@@ -49,6 +49,7 @@ from ..results import (
 from ..scenario import PLACEHOLDER_RE, Scenario
 from ..splunk import (
     SplunkAuthError,
+    SplunkLoginRejected,
     SplunkClient,
     SplunkError,
     SplunkHttpError,
@@ -498,16 +499,25 @@ class ApiEngine:
             ctx.outcome.append(record)
             await self._tidy(record)
             raise
-        except SplunkAuthError as exc:
+        except SplunkLoginRejected as exc:
             record.ok = False
             record.error_class = ERROR_AUTH
             record.error_detail = str(exc)
-            # The one failure that is re-raised. Credentials do not fix
-            # themselves, so continuing would produce thousands of identical
-            # meaningless records and, on a real stack, an account lockout.
+            # The one failure that is re-raised. A refused login is the
+            # credential itself, and every retry is another failed login
+            # towards the account lockout.
             record.service_time_ms = (time.perf_counter() - started) * 1000.0
             await self._tidy(record)
             raise
+        except SplunkAuthError as exc:
+            # One refused request is a result, not the end of the run: a
+            # search head under load can fail a token lookup, and a 403 can be
+            # one search the account may not run. The scheduler ends a run
+            # whose every search is refused for long enough to mean it.
+            record.ok = False
+            record.http_status = exc.status
+            record.error_class = ERROR_AUTH
+            record.error_detail = str(exc)
         except SplunkTimeout as exc:
             record.ok = False
             record.error_class = ERROR_TIMEOUT

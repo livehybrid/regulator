@@ -20,7 +20,16 @@ authentication path that is one of the most expensive endpoints splunkd has,
 which is a self-inflicted denial of service in the middle of a measurement. The
 lock plus generation counter below turns that storm into a single login. Bearer
 tokens do not expire this way, which is why they are the recommended
-credential, and there a 401 is fatal rather than retryable.
+credential, and there a 401 is not retried.
+
+**A refused request is not a refused credential.** Splunk answers 401 under
+load for reasons that have nothing to do with the credential (a token is
+validated against the KV store, and a search head at its ceiling can fail that
+lookup), and 403 for one search the account may not run while every other
+search is fine. So a 401 or 403 on an ordinary request raises
+``SplunkAuthError``, which the engine files as one failed step. Only a LOGIN
+that is refused raises ``SplunkLoginRejected``: that is the credential itself
+being wrong, and repeating it is what trips an account lockout.
 
 **Failures are data, not exceptions to be logged and swallowed.** This module
 raises precise, typed errors and the engine above it turns them into error
@@ -59,12 +68,24 @@ class SplunkError(Exception):
 
 
 class SplunkAuthError(SplunkError):
-    """Credentials were rejected: a 401 or a 403.
+    """A request was refused: a 401 or a 403.
 
-    Unrecoverable by design. A load test that keeps hammering a target with a
-    credential it has already refused produces thousands of identical records
-    that say nothing, and on a real stack it will trip the account lockout that
-    then blocks the operator from logging in to investigate.
+    About one request, not the credential: the engine records it as a failed
+    step and the run carries on. The scheduler stops a run whose every search
+    is refused for long enough that the credential is plainly dead.
+    """
+
+    def __init__(self, message: str, status: Optional[int] = None) -> None:
+        super().__init__(message)
+        self.status = status
+
+
+class SplunkLoginRejected(SplunkAuthError):
+    """The login itself was refused, so the username or password is wrong.
+
+    Unrecoverable by design. Every further attempt is another failed login,
+    and on a real stack that trips the account lockout that then blocks the
+    operator from logging in to investigate.
     """
 
 
@@ -364,9 +385,10 @@ class SplunkClient:
                 raise SplunkError(f"could not reach {self._base_url}{_LOGIN_PATH}: {exc}") from exc
 
             if response.status_code in (401, 403):
-                raise SplunkAuthError(
+                raise SplunkLoginRejected(
                     f"login rejected for user {self._target.username!r}: "
-                    f"{_describe(response)}"
+                    f"{_describe(response)}",
+                    status=response.status_code,
                 )
             if response.status_code >= 400:
                 raise SplunkHttpError(response.status_code, response.text, context="login")
@@ -378,7 +400,7 @@ class SplunkClient:
                     f"login returned a body that is not JSON: {response.text[:200]!r}"
                 ) from exc
             if not key:
-                raise SplunkAuthError("login succeeded but returned no sessionKey")
+                raise SplunkLoginRejected("login succeeded but returned no sessionKey")
 
             self._session_key = key
             self._auth_generation += 1
@@ -451,17 +473,19 @@ class SplunkClient:
                 return response
 
             if self._target.token:
-                # A bearer token does not expire on the hour, so a 401 here
-                # means the token is wrong, revoked or lacks the capability.
-                # Retrying would generate noise forever without ever succeeding.
+                # A bearer token does not expire on the hour, so there is no
+                # session to refresh and nothing a retry would change. The
+                # caller decides whether one refusal ends anything.
                 raise SplunkAuthError(
                     f"{context or path}: bearer token rejected with HTTP "
-                    f"{response.status_code}: {_describe(response)}"
+                    f"{response.status_code}: {_describe(response)}",
+                    status=response.status_code,
                 )
             if response.status_code == 403 or retried:
                 raise SplunkAuthError(
                     f"{context or path}: rejected with HTTP {response.status_code} "
-                    f"after re-authenticating: {_describe(response)}"
+                    f"after re-authenticating: {_describe(response)}",
+                    status=response.status_code,
                 )
 
             # Session mode, first 401: assume the key aged out and refresh once.

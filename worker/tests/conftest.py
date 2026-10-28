@@ -51,10 +51,12 @@ class FakeEngine:
         fail_all: bool = False,
         raise_on: Optional[int] = None,
         capabilities: Optional[TargetCapabilities] = None,
+        error_class: str = ERROR_SERVER,
     ) -> None:
         self.latency = latency
         self.fail_every = fail_every
         self.fail_all = fail_all
+        self.error_class = error_class
         self.raise_on = raise_on
         self.capabilities = capabilities or TargetCapabilities(
             version="10.4.0", cpu_count=8, base_max_searches=6, max_searches_per_cpu=1
@@ -113,7 +115,7 @@ class FakeEngine:
         failed = self.fail_all or (self.fail_every and index % self.fail_every == 0)
         if failed:
             record.ok = False
-            record.error_class = ERROR_SERVER
+            record.error_class = self.error_class
             record.error_detail = "fake failure"
             record.dispatch_state = "FAILED"
         return record

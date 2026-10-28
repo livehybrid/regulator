@@ -24,10 +24,10 @@ from regulator_agent.config import load_config
 from regulator_agent.engines.api import ApiEngine
 from regulator_agent.engines.base import StepContext
 from regulator_agent.params import ParameterResolver
-from regulator_agent.results import ERROR_SEARCH_FAILED, ERROR_SERVER
+from regulator_agent.results import ERROR_AUTH, ERROR_SEARCH_FAILED, ERROR_SERVER
 from regulator_agent.scenario import Step, parse_scenario
 from regulator_agent.scheduler import Scheduler
-from regulator_agent.splunk import SplunkAuthError, SplunkClient
+from regulator_agent.splunk import SplunkAuthError, SplunkClient, SplunkLoginRejected
 from regulator_agent.timepolicy import TimeWindow
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
@@ -126,7 +126,7 @@ async def _pause():
     await asyncio.sleep(0.01)
 
 
-def test_a_bad_token_is_fatal_rather_than_retried_forever(splunkd, env):
+def test_a_bad_token_is_refused_rather_than_retried(splunkd, env):
     async def scenario():
         server = FakeSplunk(port=0, reject_token="rejected-token", base_latency_ms=5.0)
         try:
@@ -241,6 +241,47 @@ def test_a_failed_search_is_a_result_not_an_exception(env):
     assert record.ok is False
     assert record.error_class == ERROR_SEARCH_FAILED
     assert record.service_time_ms > 0
+
+
+def test_a_refused_search_is_a_result_not_an_exception(env):
+    """A 401 on one search used to be re-raised and end the whole run."""
+
+    async def scenario():
+        server = FakeSplunk(port=0, reject_token="rejected-token", base_latency_ms=5.0)
+        try:
+            engine = ApiEngine(make_config(server, env, REG_TARGET_TOKEN="rejected-token"))
+            await engine.start()
+            try:
+                return await engine.execute(context_for(search_step()))
+            finally:
+                await engine.close()
+        finally:
+            server.close()
+
+    record = run_async(scenario())
+    assert record.ok is False
+    assert record.error_class == ERROR_AUTH
+    assert record.http_status == 401
+
+
+def test_a_refused_login_is_still_fatal(splunkd, env):
+    """Retrying a wrong password is how an account gets locked out."""
+
+    async def scenario():
+        config = make_config(
+            splunkd, env,
+            REG_TARGET_TOKEN=None,
+            REG_TARGET_USERNAME="loadtest",
+            REG_TARGET_PASSWORD="not-the-password",
+        )
+        client = SplunkClient(config.target)
+        try:
+            with pytest.raises(SplunkLoginRejected):
+                await client.start()
+        finally:
+            await client.close()
+
+    run_async(scenario())
 
 
 def test_the_probe_computes_the_concurrency_ceiling(splunkd, env):

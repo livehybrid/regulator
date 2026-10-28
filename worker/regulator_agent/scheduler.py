@@ -78,6 +78,7 @@ from .params import (
 )
 from .savedsearches import Cron, parse_cron
 from .results import (
+    ERROR_AUTH,
     OUTCOME_ABORTED,
     OUTCOME_COMPLETED,
     OUTCOME_FAILED,
@@ -110,6 +111,15 @@ MIN_SAMPLES_FOR_GUARD = 20
 # thundering herd that attacks the target exactly when it is least able to
 # cope, which is both unrealistic and unkind.
 MAX_CATCHUP_S = 30.0
+
+# A refused search is a failed step and the run carries on, because Splunk
+# refuses individual requests under load (a token lookup against a busy KV
+# store) and per search (a 403 on one index). A credential that is plainly dead
+# is different: the run ends once every search has been refused for this long
+# and at least this many times in a row, rather than filing refusals until the
+# duration runs out.
+AUTH_REFUSED_ABORT_S = 60.0
+AUTH_REFUSED_ABORT_COUNT = 10
 
 # How long in-flight work is allowed to finish after a stop is requested, when
 # the configuration does not say. Config.drain_budget_s normally decides.
@@ -261,6 +271,9 @@ class Scheduler:
         self._fatal: Optional[BaseException] = None
         self._abort_reason: Optional[str] = None
         self._invalid_reason: Optional[str] = None
+        # The unbroken run of refused searches, if one is in progress.
+        self._auth_refused_since: Optional[float] = None
+        self._auth_refused_count = 0
         self._vu_tasks: Dict[int, asyncio.Task[None]] = {}
         self._retiring: set[int] = set()
         self._open_tasks: set[asyncio.Task[None]] = set()
@@ -823,7 +836,36 @@ class Scheduler:
                 emitter.emit(record)
             except Exception:  # noqa: BLE001 - telemetry must never break the run
                 log.warning("emitter failed", exc_info=True)
+        self._note_auth(record)
         return record
+
+    def _note_auth(self, record: StepRecord) -> None:
+        """End the run once every search has been refused for long enough.
+
+        Only a success breaks the streak. A timeout says nothing either way
+        about the credential, so it neither extends nor resets it.
+        """
+        if record.ok:
+            self._auth_refused_since = None
+            self._auth_refused_count = 0
+            return
+        if record.error_class != ERROR_AUTH:
+            return
+        now = time.perf_counter()
+        if self._auth_refused_since is None:
+            self._auth_refused_since = now
+        self._auth_refused_count += 1
+        refused_for = now - self._auth_refused_since
+        if (
+            refused_for >= AUTH_REFUSED_ABORT_S
+            and self._auth_refused_count >= AUTH_REFUSED_ABORT_COUNT
+        ):
+            self.request_stop(
+                f"authentication refusals exceeded the limit: the last "
+                f"{self._auth_refused_count} searches over {refused_for:.0f}s were all "
+                f"refused (latest: {record.error_detail}), so the credential is no "
+                f"longer accepted"
+            )
 
     async def _sleep_or_stop(self, delay: float) -> None:
         """Sleep, but wake immediately if the run is stopping."""
