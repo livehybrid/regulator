@@ -1,0 +1,149 @@
+<form version="1.1" theme="dark">
+  <label>Ingest vs search</label>
+  <description>Stoker's delivered ingest and Regulator's search latency on one timeline, for a test that drives both at once: did search latency move when ingest hit its rate, and did Splunk queue searches while it was indexing? Reads Stoker's dogfood telemetry (stoker:metrics, stoker:job) and Regulator's (regulator:sample, regulator:lifecycle); each tool's index is set separately.</description>
+  <fieldset submitButton="false" autoRun="true">
+    <input type="text" token="ridx" searchWhenChanged="true">
+      <label>Regulator index</label>
+      <default>regulator</default>
+    </input>
+    <input type="text" token="sidx" searchWhenChanged="true">
+      <label>Stoker index</label>
+      <default>stoker_telemetry</default>
+    </input>
+    <input type="time" token="tr" searchWhenChanged="true">
+      <label>Window</label>
+      <default>
+        <earliest>-4h</earliest>
+        <latest>now</latest>
+      </default>
+    </input>
+    <input type="dropdown" token="srun" searchWhenChanged="true">
+      <label>Stoker run</label>
+      <choice value="*">Every run</choice>
+      <default>*</default>
+      <fieldForLabel>label</fieldForLabel>
+      <fieldForValue>run_id</fieldForValue>
+      <search>
+        <query>index=$sidx$ sourcetype=stoker:metrics | stats latest(_time) as t, latest(spec_id) as spec_id by run_id | sort - t | eval label="run ".run_id." (spec ".spec_id.")"</query>
+        <earliest>$tr.earliest$</earliest>
+        <latest>$tr.latest$</latest>
+      </search>
+    </input>
+    <input type="dropdown" token="rrun" searchWhenChanged="true">
+      <label>Regulator run</label>
+      <choice value="*">Every run</choice>
+      <default>*</default>
+      <fieldForLabel>label</fieldForLabel>
+      <fieldForValue>run_no</fieldForValue>
+      <search>
+        <query>index=$ridx$ sourcetype=regulator:lifecycle kind=run_created | stats latest(_time) as t, latest(run_label) as run_label, latest(scenario) as scenario by run_no | sort - t | eval label=run_label." (".scenario.")"</query>
+        <earliest>$tr.earliest$</earliest>
+        <latest>$tr.latest$</latest>
+      </search>
+    </input>
+  </fieldset>
+
+  <!-- One 30 s grid for both: Stoker reports every 30 s per run (summed to the
+       fleet), Regulator every 5 s (the worst interval wins). -->
+  <search id="timeline">
+    <query>(index=$sidx$ sourcetype=stoker:metrics run_id=$srun$) OR (index=$ridx$ sourcetype=regulator:sample run_no=$rrun$ (NOT slot=* OR slot="null"))
+| eval ingest_eps=if(sourcetype="stoker:metrics", eps, null()),
+       ingest_mbps=if(sourcetype="stoker:metrics", bps/1048576, null()),
+       target_eps=if(sourcetype="stoker:metrics", target_eps, null()),
+       search_p95_ms=if(sourcetype="regulator:sample", 'interval.p95_ms', null()),
+       search_per_s=if(sourcetype="regulator:sample", 'interval.throughput_per_s', null()),
+       search_queued=if(sourcetype="regulator:sample", 'interval.queued', null()),
+       search_errors=if(sourcetype="regulator:sample", 'interval.errors', null())
+| bin _time span=30s
+| stats sum(ingest_eps) as ingest_eps, sum(target_eps) as target_eps, sum(ingest_mbps) as ingest_mbps,
+        max(search_p95_ms) as search_p95_ms, avg(search_per_s) as search_per_s,
+        sum(search_queued) as search_queued, sum(search_errors) as search_errors by _time</query>
+    <earliest>$tr.earliest$</earliest>
+    <latest>$tr.latest$</latest>
+  </search>
+
+  <row>
+    <panel>
+      <title>Ingest rate against search p95</title>
+      <chart>
+        <search base="timeline">
+          <query>table _time, ingest_eps, target_eps, search_p95_ms | rename ingest_eps as "ingest eps (Stoker)", target_eps as "target eps", search_p95_ms as "search p95 ms (Regulator)"</query>
+        </search>
+        <option name="charting.chart">line</option>
+        <option name="charting.axisY2.enabled">1</option>
+        <option name="charting.chart.overlayFields">"search p95 ms (Regulator)"</option>
+        <option name="charting.axisTitleY.text">events/s</option>
+        <option name="charting.axisTitleY2.text">ms</option>
+        <option name="charting.chart.nullValueMode">connect</option>
+        <option name="charting.legend.placement">bottom</option>
+      </chart>
+    </panel>
+  </row>
+
+  <row>
+    <panel>
+      <title>Ingest volume against search throughput</title>
+      <chart>
+        <search base="timeline">
+          <query>eval ingest_mbps=round(ingest_mbps, 2) | table _time, ingest_mbps, search_per_s | rename ingest_mbps as "ingest MB/s (Stoker)", search_per_s as "searches/s (Regulator)"</query>
+        </search>
+        <option name="charting.chart">line</option>
+        <option name="charting.axisY2.enabled">1</option>
+        <option name="charting.chart.overlayFields">"searches/s (Regulator)"</option>
+        <option name="charting.chart.nullValueMode">connect</option>
+        <option name="charting.legend.placement">bottom</option>
+      </chart>
+    </panel>
+    <panel>
+      <title>Searches queued in Splunk, and search failures</title>
+      <chart>
+        <search base="timeline">
+          <query>table _time, search_queued, search_errors | rename search_queued as "queued", search_errors as "failed"</query>
+        </search>
+        <option name="charting.chart">column</option>
+        <option name="charting.legend.placement">bottom</option>
+      </chart>
+    </panel>
+  </row>
+
+  <row>
+    <panel>
+      <title>Search p95 by ingest band</title>
+      <table>
+        <search base="timeline">
+          <query>where isnotnull(search_p95_ms) AND isnotnull(ingest_eps) | eval band=case(ingest_eps&lt;10000, "under 10k eps", ingest_eps&lt;50000, "10k to 50k eps", ingest_eps&lt;100000, "50k to 100k eps", true(), "100k eps and over") | stats count as intervals, median(search_p95_ms) as median_p95_ms, max(search_p95_ms) as worst_p95_ms, sum(search_queued) as queued by band | eval median_p95_ms=round(median_p95_ms, 0), worst_p95_ms=round(worst_p95_ms, 0)</query>
+        </search>
+        <option name="drilldown">none</option>
+      </table>
+    </panel>
+    <panel>
+      <title>Ingest delivery (Stoker)</title>
+      <table>
+        <search>
+          <query>index=$sidx$ sourcetype=stoker:metrics run_id=$srun$ | stats latest(state) as state, latest(eps) as eps, latest(target_eps) as target_eps, max(lag_s_max) as worst_lag_s, latest(live_workers) as live_workers, latest(hec_5xx) as hec_5xx, latest(hec_timeouts) as timeouts by run_id | eval achieved=if(target_eps&gt;0, round(100*eps/target_eps, 1)."%", "-"), eps=round(eps, 0)</query>
+          <earliest>$tr.earliest$</earliest>
+          <latest>$tr.latest$</latest>
+        </search>
+        <option name="drilldown">none</option>
+      </table>
+    </panel>
+  </row>
+
+  <row>
+    <panel>
+      <title>What started and stopped</title>
+      <table>
+        <search>
+          <query>(index=$sidx$ sourcetype=stoker:job run_id=$srun$) OR (index=$ridx$ sourcetype=regulator:lifecycle run_no=$rrun$ kind=run_*)
+| eval tool=if(sourcetype="stoker:job", "Stoker", "Regulator"),
+       run=if(tool="Stoker", "run ".run_id, run_label),
+       what=if(tool="Stoker", 'from'." to ".'to'.if(isnotnull(end_reason), " (".end_reason.")", ""), kind.if(isnotnull(outcome), " (".outcome.")", ""))
+| table _time, tool, run, what | sort - _time | head 100</query>
+          <earliest>$tr.earliest$</earliest>
+          <latest>$tr.latest$</latest>
+        </search>
+        <option name="drilldown">none</option>
+      </table>
+    </panel>
+  </row>
+</form>

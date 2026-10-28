@@ -1,0 +1,5 @@
+# Readable by everyone so whoever runs the tests can open the dashboards; the
+# extractions are exported so a search from any app sees the fields.
+[]
+access = read : [ * ], write : [ admin ]
+export = system

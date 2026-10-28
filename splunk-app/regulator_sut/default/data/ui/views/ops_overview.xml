@@ -1,0 +1,116 @@
+<form version="1.1">
+  <label>Ops overview</label>
+  <description>The heavy dashboard a browser run opens: eight panels across the search classes, dense aggregation over web access logs, sparse filters over authentication failures and CloudTrail errors, a rare CloudTrail term that on SmartStore is the panel most likely to pay for an object-storage fetch, and one transaction, which is the first thing to degrade when a search head is under concurrency pressure. Regulator pins the index and the time range through the URL.</description>
+  <fieldset submitButton="false" autoRun="true">
+    <input type="text" token="index" searchWhenChanged="true">
+      <label>Index</label>
+      <default>main</default>
+    </input>
+    <input type="time" token="range" searchWhenChanged="true">
+      <label>Time range</label>
+      <default>
+        <earliest>-24h@h</earliest>
+        <latest>now</latest>
+      </default>
+    </input>
+  </fieldset>
+  <row>
+    <panel>
+      <title>Web requests by status (dense)</title>
+      <chart>
+        <search>
+          <query>index=$index$ sourcetype=access_combined | timechart span=5m count by status limit=10</query>
+          <earliest>$range.earliest$</earliest>
+          <latest>$range.latest$</latest>
+        </search>
+        <option name="charting.chart">column</option>
+        <option name="charting.chart.stackMode">stacked</option>
+        <option name="charting.legend.placement">bottom</option>
+      </chart>
+    </panel>
+    <panel>
+      <title>Top paths by volume (dense)</title>
+      <table>
+        <search>
+          <query>index=$index$ sourcetype=access_combined | stats count, sum(bytes) as bytes by uri_path | sort - count | head 20</query>
+          <earliest>$range.earliest$</earliest>
+          <latest>$range.latest$</latest>
+        </search>
+        <option name="drilldown">none</option>
+      </table>
+    </panel>
+  </row>
+  <row>
+    <panel>
+      <title>Failed logins by source (sparse)</title>
+      <table>
+        <search>
+          <query>index=$index$ sourcetype=linux_secure "Failed password" | rex "from (?&lt;src_ip&gt;\d+\.\d+\.\d+\.\d+)" | stats count, dc(user) as users by src_ip | sort - count | head 20</query>
+          <earliest>$range.earliest$</earliest>
+          <latest>$range.latest$</latest>
+        </search>
+        <option name="drilldown">none</option>
+      </table>
+    </panel>
+    <panel>
+      <title>CloudTrail errors (sparse)</title>
+      <table>
+        <search>
+          <query>index=$index$ sourcetype=aws:cloudtrail errorCode=* | stats count by errorCode, eventName | sort - count | head 20</query>
+          <earliest>$range.earliest$</earliest>
+          <latest>$range.latest$</latest>
+        </search>
+        <option name="drilldown">none</option>
+      </table>
+    </panel>
+  </row>
+  <row>
+    <panel>
+      <title>Bucket policy changes (rare)</title>
+      <table>
+        <search>
+          <query>index=$index$ sourcetype=aws:cloudtrail eventName=PutBucketPolicy | table _time, eventName, sourceIPAddress, awsRegion</query>
+          <earliest>$range.earliest$</earliest>
+          <latest>$range.latest$</latest>
+        </search>
+        <option name="drilldown">none</option>
+      </table>
+    </panel>
+    <panel>
+      <title>CloudTrail activity (dense)</title>
+      <chart>
+        <search>
+          <query>index=$index$ sourcetype=aws:cloudtrail | timechart span=5m count by eventName limit=10</query>
+          <earliest>$range.earliest$</earliest>
+          <latest>$range.latest$</latest>
+        </search>
+        <option name="charting.chart">line</option>
+        <option name="charting.legend.placement">bottom</option>
+      </chart>
+    </panel>
+  </row>
+  <row>
+    <panel>
+      <title>API gateway server errors (sparse)</title>
+      <table>
+        <search>
+          <query>index=$index$ sourcetype=stoker:apigw status&gt;=500 | stats count by gw, path, status | sort - count | head 20</query>
+          <earliest>$range.earliest$</earliest>
+          <latest>$range.latest$</latest>
+        </search>
+        <option name="drilldown">none</option>
+      </table>
+    </panel>
+    <panel>
+      <title>Web sessions (transaction)</title>
+      <table>
+        <search>
+          <query>index=$index$ sourcetype=access_combined_wcookie | transaction JSESSIONID maxspan=30m maxpause=5m | stats count as sessions, avg(duration) as avg_session_s, avg(eventcount) as avg_events | eval avg_session_s=round(avg_session_s, 1), avg_events=round(avg_events, 1)</query>
+          <earliest>$range.earliest$</earliest>
+          <latest>$range.latest$</latest>
+        </search>
+        <option name="drilldown">none</option>
+      </table>
+    </panel>
+  </row>
+</form>

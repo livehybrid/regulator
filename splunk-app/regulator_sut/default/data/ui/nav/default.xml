@@ -1,0 +1,5 @@
+<nav search_view="search">
+  <view name="triage_overview" default="true" />
+  <view name="ops_overview" />
+  <view name="search" />
+</nav>

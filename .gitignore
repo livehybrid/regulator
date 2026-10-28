@@ -41,6 +41,11 @@ secrets/
 *.db
 *.sqlite
 data/
+# ...but a Splunk app keeps its dashboards and nav under default/data/ui, and
+# the rule above silently kept every one of them out of the repository: the
+# browser scenarios named dashboards that were never shipped.
+!splunk-app/**/data/
+!splunk-app/**/data/**
 
 # Local run artefacts. A Regulator run writes per-search latency samples, and
 # those are large, machine-specific and reproducible: they belong in object

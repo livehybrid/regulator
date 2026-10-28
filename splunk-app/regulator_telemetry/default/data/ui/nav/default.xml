@@ -1,0 +1,5 @@
+<nav search_view="search">
+  <view name="regulator_runs" default="true" />
+  <view name="ingest_vs_search" />
+  <view name="search" />
+</nav>
