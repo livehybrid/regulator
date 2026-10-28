@@ -380,6 +380,7 @@ jobs:
           tags: |
             type=raw,value=browser,enable={{is_default_branch}}
             type=sha,prefix=browser-
+            type=ref,event=tag,prefix=browser-
       # amd64 only: Playwright's base image has no arm64 variant, and building
       # Chromium under emulation to find that out takes half an hour.
       - uses: docker/build-push-action@v6
@@ -452,3 +453,60 @@ jobs:
       - uses: sigstore/cosign-installer@v3
       - name: Keyless sign the pushed digest
         run: cosign sign --yes "ghcr.io/livehybrid/regulator@${{ steps.push.outputs.digest }}"
+
+  release:
+    # A v* tag becomes a GitHub Release once every image for it is pushed and
+    # signed: the Splunk apps as installable packages with checksums, and the
+    # image references in the notes. The app version is the tag's, stamped at
+    # packaging time (tools/package_splunk_apps.py), so a tag that is not
+    # vMAJOR.MINOR.PATCH fails here rather than shipping an app Splunk rejects.
+    needs: [build, browser-build, cp-build]
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-24.04
+    concurrency:
+      group: ${{ github.workflow }}-release-${{ github.ref_name }}
+      cancel-in-progress: false
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Package the Splunk apps
+        run: |
+          SOURCE_DATE_EPOCH="$(git log -1 --format=%ct)" \
+            python tools/package_splunk_apps.py --version "$GITHUB_REF_NAME" --out dist
+      - name: Write the release notes
+        run: |
+          tag="$GITHUB_REF_NAME"
+          cat > notes.md <<NOTES
+          ## Images
+
+          | | |
+          |---|---|
+          | Control plane | \`ghcr.io/livehybrid/regulator:${tag}\` |
+          | Worker | \`ghcr.io/livehybrid/regulator-worker:${tag}\` |
+          | Browser worker (amd64) | \`ghcr.io/livehybrid/regulator-worker:browser-${tag}\` |
+
+          Each is keyless-signed with cosign.
+
+          ## Splunk apps
+
+          - \`regulator_sut-${tag#v}.tgz\`: the dashboards a browser run opens. Install on the Splunk under test.
+          - \`regulator_telemetry-${tag#v}.tgz\`: dashboards over Regulator's HEC telemetry, including Ingest vs search. Install where the telemetry index lives.
+
+          Install from Splunk Web (Apps, Install app from file) or \`splunk install app <file> -update 1\`. Checksums are in SHA256SUMS.
+
+          NOTES
+      - name: Publish the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
+            gh release upload "$GITHUB_REF_NAME" dist/*.tgz dist/SHA256SUMS --clobber
+          else
+            gh release create "$GITHUB_REF_NAME" dist/*.tgz dist/SHA256SUMS \
+              --verify-tag --title "$GITHUB_REF_NAME" \
+              --notes-file notes.md --generate-notes
+          fi

@@ -1198,6 +1198,22 @@ the worker and control-plane images without publishing them and smokes the
 packaged worker against the fake splunkd, so a broken Dockerfile fails the pull
 request rather than the merge.
 
+### Releases
+
+Push a `vMAJOR.MINOR.PATCH` tag on `main`:
+
+```bash
+git tag v0.2.0 && git push origin v0.2.0
+```
+
+CI tests the tag, publishes and signs the images (`regulator:v0.2.0`,
+`regulator-worker:v0.2.0`, `regulator-worker:browser-v0.2.0`), then creates
+the GitHub Release with both Splunk apps attached as installable packages
+(`regulator_sut-0.2.0.tgz`, `regulator_telemetry-0.2.0.tgz`) and their
+`SHA256SUMS`. The app version comes from the tag; `app.conf` in the tree is
+not edited. To build the packages locally:
+`python3 tools/package_splunk_apps.py --version 0.2.0 --out dist`.
+
 ---
 
 ## Roadmap
