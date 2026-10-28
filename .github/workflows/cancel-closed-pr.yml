@@ -1,0 +1,44 @@
+name: cancel-closed-pr
+
+# Stop a pull request's CI the moment the PR is merged or closed.
+#
+# ci.yml already cancels a run when a newer commit lands on the same PR or
+# branch, but closing a PR is not a new commit, so its checks used to run to the
+# end: minutes spent testing a branch that has just been merged (main's own run
+# tests the result) or abandoned. This cancels every run still in flight for
+# this PR's last commit, except this one.
+#
+# Matched on the head commit, not the PR number: GitHub empties a run's
+# pull_requests list once the PR is merged, so a number match finds nothing at
+# exactly the moment it is needed. Runs of the PR's earlier commits were already
+# cancelled by ci.yml when the later ones landed.
+#
+# A fork's PR gets a read-only token and cannot cancel anything; that is
+# tolerated rather than failed, because there is nothing to fix.
+
+on:
+  pull_request:
+    types: [closed]
+
+permissions:
+  actions: write
+
+jobs:
+  cancel:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Cancel this PR's runs still in flight
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          BRANCH: ${{ github.event.pull_request.head.ref }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          SELF: ${{ github.run_id }}
+        run: |
+          gh api -X GET "repos/$REPO/actions/runs" \
+            -f event=pull_request -f branch="$BRANCH" -f head_sha="$HEAD_SHA" -f per_page=100 \
+            --jq ".workflow_runs[] | select(.status != \"completed\" and .id != $SELF) | .id" |
+          while read -r id; do
+            echo "cancelling run $id"
+            gh run cancel "$id" -R "$REPO" || echo "could not cancel $id (already finished, or a fork's read-only token)"
+          done

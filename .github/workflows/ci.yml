@@ -35,6 +35,9 @@ env:
 # newer push cancels the older test job the build gated behind it never starts:
 # only a build that has already begun (and therefore already has a green test)
 # is permitted to run to completion.
+#
+# Closing or merging a PR is not a new commit, so it cancels nothing here;
+# cancel-closed-pr.yml stops that PR's runs instead.
 
 jobs:
   test:
