@@ -379,7 +379,7 @@ def _finished_run(client, session_factory=None):
     import sys as _sys
 
     from regulator_server import db as _db
-    from regulator_server.models import Run
+    from regulator_server.models import Run, WorkerLease
 
     make_target(client, "export-target")
     make_scenario(client, "exported")
@@ -404,6 +404,21 @@ def _finished_run(client, session_factory=None):
             },
         )
         session.add(run)
+        session.flush()
+        # A fleet run has a lease per slot, and the export lists them: with no
+        # lease here the export read a column that does not exist and every
+        # fleet run downloaded as a 500.
+        session.add(
+            WorkerLease(
+                run_id=run.id,
+                slot=0,
+                engine="api",
+                state="done",
+                holder="worker-0",
+                claimed_at=1_700_000_000.0,
+                last_heartbeat_at=1_700_000_059.0,
+            )
+        )
         session.flush()
         return run.id
 
@@ -431,6 +446,18 @@ def test_a_run_downloads_as_one_self_contained_file(client):
     # Named target, so the result says what it measured.
     assert document["target"]["name"] == "export-target"
     assert document["target"]["mgmt_url"] == "https://sh.example:8089"
+    # And who ran it, slot by slot.
+    assert document["workers"] == [
+        {
+            "slot": 0,
+            "engine": "api",
+            "state": "done",
+            "holder": "worker-0",
+            "restarts": 0,
+            "claimed_at": 1_700_000_000.0,
+            "last_heartbeat_at": 1_700_000_059.0,
+        }
+    ]
 
 
 def test_the_export_carries_no_credential(client):
