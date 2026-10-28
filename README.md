@@ -106,7 +106,7 @@ careless `git add` away from a public repository.
 ### Deploying it without touching files
 
 Everything a Regulator instance needs can arrive through the environment, so
-the people who run it need no shell on the box and no second setup pass. Three
+the people who run it need no shell on the box and no second setup pass. These
 variables do it:
 
 | Variable | What it removes |
@@ -114,6 +114,7 @@ variables do it:
 | `REG_MASTER_KEY` | The reason a restore would not work. It is the one thing that must survive a teardown, which in Kubernetes it already does: a Secret outlives a volume |
 | `REG_CONFIG_IMPORT` | The targets step. Point it at a mounted JSON file (or paste the JSON in) and the instance comes up with its targets and your own scenarios already registered. The file is what the console's **Configuration** page downloads |
 | `REG_SCENARIO_SOURCE` | The scenario step, for a library shared between instances. Point it at `s3://bucket/prefix` (or a mounted directory) and every instance pulls the same scenarios at boot. Add `REG_SCENARIO_SOURCE_WRITE=1` on the one instance that should be allowed to push back |
+| `REG_CONFIG_SOURCE` | Both of the above, kept current, plus the run history. Point it at `s3://bucket/prefix` (or a mounted directory) and the instance pulls its targets, your scenarios, its baselines and every archived run at boot. Add `REG_CONFIG_SOURCE_WRITE=1` and each change is pushed back within seconds and each run is archived as it finishes, so a rebuilt instance keeps the baselines its CI gate compares against |
 
 The two are complementary rather than alternatives. A config document carries
 the scenarios you had when you took it, which is what you want for "bring this
@@ -122,10 +123,10 @@ for "everybody runs the same library", and it is also how a scenario authored
 on one instance reaches the others without a config round trip.
 
 [Stoker](https://github.com/livehybrid/stoker), the data-load half of the pair,
-takes the same three in its own spelling - `STOKER_MASTER_KEY`,
-`STOKER_CONFIG_IMPORT` and `STOKER_PACK_SOURCE` (plus
-`STOKER_PACK_SOURCE_WRITE`) - so a combined deployment is one chart with two
-config documents and two prefixes, and neither product needs anybody to log in
+takes the same variables in its own spelling - `STOKER_MASTER_KEY`,
+`STOKER_CONFIG_IMPORT`, `STOKER_PACK_SOURCE` and `STOKER_CONFIG_SOURCE` (each
+source with its `_WRITE` switch) - so a combined deployment is one chart with
+two config copies and two prefixes, and neither product needs anybody to log in
 and configure it by hand before the first run.
 
 ### Pointing it at a cluster behind a private CA
@@ -437,6 +438,9 @@ the environment; everything downstream of the claim is the standalone code.
 | `REG_CA_BUNDLE` | unset | A PEM bundle (a file, or a directory of them) that verifies a target behind a **private or internal CA**. Used only where the target's own `verify_tls` is on, so it composes with that switch rather than replacing it. A path that does not exist is a **fatal boot error**, because a deployment that was handed a certificate and quietly verified against the public trust store instead is the exact failure this prevents. Projected to fleet workers automatically as PEM text, so they need no mount of their own |
 | `REG_SCENARIO_SOURCE` | unset | A shared scenario library: `s3://bucket/prefix`, or a mounted directory. Pulled at boot as one `.tar.gz` per scenario, in the format the console's Download and Upload already speak. Import is create-if-absent, so a local edit survives a restart, and one unreadable object is reported rather than aborting the sync |
 | `REG_SCENARIO_SOURCE_WRITE` | off | Also push scenarios created here back to that prefix. A separate switch because the common case is a curated library several instances read, and one of them silently overwriting it would be hard to notice |
+| `REG_CONFIG_SOURCE` | unset | A shared copy of the configuration and the run history: `s3://bucket/prefix`, or a mounted directory. `regulator-config.json` under it holds targets, your scenarios and baselines (the Configuration page's document); `runs/<uid>.json` holds each finished run in the run page's Download format. Pulled at boot, after the scenario source, and with **Pull now**. The configuration is the same upsert as a restore and a run is imported only if no run here has its uid, so a pull never removes or duplicates anything; baselines are applied after the runs they point at. Never fatal: an unreachable bucket is logged and the instance starts unconfigured |
+| `REG_CONFIG_SOURCE_WRITE` | off | Also push: the configuration whenever it changes (credentials as ciphertext, so a restore needs the same `REG_MASTER_KEY`) and each run 30 s after it finishes. Changes are found by comparing the document every 15 s rather than by hooking each route, so nothing added later can forget to back up. A row a pull could not apply, such as a baseline whose run is not archived, is kept in every push rather than deleted from the shared copy. Deleting a run here deletes its archive; on a read-only instance a deleted run returns at the next pull. A separate switch for the same reason as the scenario source's |
+| `REG_CONFIG_SOURCE_SSE` / `REG_CONFIG_SOURCE_SSE_KMS_KEY_ID` | unset | Server-side encryption headers (`aws:kms` or `AES256`, and the key ARN) sent with each upload, for a bucket policy that denies PutObject without them |
 | `REG_SCENARIO_UPLOAD_MAX_ARCHIVE_BYTES` and friends | 16 MiB | Extraction-bomb caps for an uploaded scenario archive (`_MAX_MEMBERS` 2000, `_MAX_MEMBER_BYTES` 8 MiB, `_MAX_TOTAL_BYTES` 32 MiB). Enforced on the bytes produced while streaming, never on the sizes the archive declares |
 | `REG_MAX_VIRTUAL_USERS` | `500` | The in-process ceiling described above. The open model is held to the same ceiling of in-flight searches |
 | `REG_MAX_CONCURRENT_RUNS` | `2` | More at once would mean measuring contention between your own tests |
