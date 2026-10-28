@@ -46,7 +46,7 @@
   <!-- One 30 s grid for both: Stoker reports every 30 s per run (summed to the
        fleet), Regulator every 5 s (the worst interval wins). -->
   <search id="timeline">
-    <query>(index=$sidx$ sourcetype=stoker:metrics run_id=$srun$) OR (index=$ridx$ sourcetype=regulator:sample run_no=$rrun$ NOT slot=*)
+    <query>(index=$sidx$ sourcetype=stoker:metrics run_id=$srun$) OR (index=$ridx$ sourcetype=regulator:sample run_no=$rrun$ (NOT slot=* OR slot="null"))
 | eval ingest_eps=if(sourcetype="stoker:metrics", eps, null()),
        ingest_mbps=if(sourcetype="stoker:metrics", bps/1048576, null()),
        target_eps=if(sourcetype="stoker:metrics", target_eps, null()),

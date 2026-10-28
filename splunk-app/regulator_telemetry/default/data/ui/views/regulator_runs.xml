@@ -1,6 +1,6 @@
 <form version="1.1" theme="dark">
   <label>Regulator runs</label>
-  <description>Everything Regulator ships over HEC, by run. Samples every 5 s from the control plane, one record per search from the workers, the run summary at the end, and the lifecycle in between.</description>
+  <description>Everything Regulator ships over HEC, by run: throughput, latency, queueing, the fleet, the cache and the lifecycle. Samples every 5 s from the control plane, one record per search from the workers, the run summary at the end. Every panel is plain SPL over the regulator sourcetypes; no macros, no data models.</description>
   <fieldset submitButton="false" autoRun="true">
     <input type="text" token="idx" searchWhenChanged="true">
       <label>Index</label>
@@ -39,7 +39,7 @@
       <title>Searches</title>
       <single>
         <search>
-          <query>index=$idx$ sourcetype=regulator:sample run_no=$run$ NOT slot=* | stats latest(executions) as executions by run_no | stats sum(executions) as executions</query>
+          <query>index=$idx$ sourcetype=regulator:sample run_no=$run$ (NOT slot=* OR slot="null") | stats latest(executions) as executions by run_no | stats sum(executions) as executions</query>
           <earliest>$tr.earliest$</earliest>
           <latest>$tr.latest$</latest>
         </search>
@@ -50,7 +50,7 @@
       <title>p95 latency (ms, cumulative, worst run)</title>
       <single>
         <search>
-          <query>index=$idx$ sourcetype=regulator:sample run_no=$run$ NOT slot=* | stats latest(cum.p95_ms) as p95 by run_no | stats max(p95) as p95 | eval p95=round(p95, 0)</query>
+          <query>index=$idx$ sourcetype=regulator:sample run_no=$run$ (NOT slot=* OR slot="null") | stats latest(cum.p95_ms) as p95 by run_no | stats max(p95) as p95 | eval p95=round(p95, 0)</query>
           <earliest>$tr.earliest$</earliest>
           <latest>$tr.latest$</latest>
         </search>
@@ -61,7 +61,7 @@
       <title>Error rate</title>
       <single>
         <search>
-          <query>index=$idx$ sourcetype=regulator:sample run_no=$run$ NOT slot=* | stats latest(executions) as executions, latest(errors) as errors by run_no | stats sum(executions) as executions, sum(errors) as errors | eval rate=if(executions&gt;0, round(100*errors/executions, 2), 0)."%" | fields rate</query>
+          <query>index=$idx$ sourcetype=regulator:sample run_no=$run$ (NOT slot=* OR slot="null") | stats latest(executions) as executions, latest(errors) as errors by run_no | stats sum(executions) as executions, sum(errors) as errors | eval rate=if(executions&gt;0, round(100*errors/executions, 2), 0)."%" | fields rate</query>
           <earliest>$tr.earliest$</earliest>
           <latest>$tr.latest$</latest>
         </search>
@@ -71,7 +71,7 @@
       <title>Peak searches in flight</title>
       <single>
         <search>
-          <query>index=$idx$ sourcetype=regulator:sample run_no=$run$ NOT slot=* | stats max(in_flight) as peak</query>
+          <query>index=$idx$ sourcetype=regulator:sample run_no=$run$ (NOT slot=* OR slot="null") | stats max(in_flight) as peak</query>
           <earliest>$tr.earliest$</earliest>
           <latest>$tr.latest$</latest>
         </search>
@@ -84,7 +84,7 @@
       <title>p95 latency per interval (ms)</title>
       <chart>
         <search>
-          <query>index=$idx$ sourcetype=regulator:sample run_no=$run$ NOT slot=* | timechart max(interval.p95_ms) as p95 by run_label limit=10</query>
+          <query>index=$idx$ sourcetype=regulator:sample run_no=$run$ (NOT slot=* OR slot="null") | timechart max(interval.p95_ms) as p95 by run_label limit=10</query>
           <earliest>$tr.earliest$</earliest>
           <latest>$tr.latest$</latest>
         </search>
@@ -97,7 +97,35 @@
       <title>Throughput and concurrency</title>
       <chart>
         <search>
-          <query>index=$idx$ sourcetype=regulator:sample run_no=$run$ NOT slot=* | timechart sum(interval.throughput_per_s) as "searches/s", sum(in_flight) as "in flight", sum(interval.queued) as "queued in Splunk"</query>
+          <query>index=$idx$ sourcetype=regulator:sample run_no=$run$ (NOT slot=* OR slot="null") | timechart sum(interval.throughput_per_s) as "searches/s", sum(in_flight) as "in flight", sum(interval.queued) as "queued in Splunk"</query>
+          <earliest>$tr.earliest$</earliest>
+          <latest>$tr.latest$</latest>
+        </search>
+        <option name="charting.chart">line</option>
+        <option name="charting.legend.placement">bottom</option>
+      </chart>
+    </panel>
+  </row>
+
+  <row>
+    <panel>
+      <title>Latency, ms: interval p50, p95, p99 and the cumulative p95</title>
+      <chart>
+        <search>
+          <query>index=$idx$ sourcetype=regulator:sample run_no=$run$ (NOT slot=* OR slot="null") | timechart span=10s max(interval.p50_ms) as p50, max(interval.p95_ms) as p95, max(interval.p99_ms) as p99, max(cum.p95_ms) as "p95 so far"</query>
+          <earliest>$tr.earliest$</earliest>
+          <latest>$tr.latest$</latest>
+        </search>
+        <option name="charting.chart">line</option>
+        <option name="charting.legend.placement">bottom</option>
+        <option name="charting.chart.nullValueMode">gaps</option>
+      </chart>
+    </panel>
+    <panel>
+      <title>Errors and queueing, % of each interval</title>
+      <chart>
+        <search>
+          <query>index=$idx$ sourcetype=regulator:sample run_no=$run$ (NOT slot=* OR slot="null") | timechart span=10s max(interval.error_rate_pct) as "error %", max(interval.queued_pct) as "queued %"</query>
           <earliest>$tr.earliest$</earliest>
           <latest>$tr.latest$</latest>
         </search>
@@ -136,10 +164,35 @@
 
   <row>
     <panel>
+      <title>Step latency, p95 ms by step (cold versus warm when the run cycled its cache)</title>
+      <chart>
+        <search base="steps">
+          <query>search ok=true | eval phase=case(isnotnull(since_evict_s) AND isnotnull(cold_window_s) AND since_evict_s&lt;=cold_window_s, "cold", isnotnull(since_evict_s), "warm", true(), "all") | eval series=step_id." ".phase | stats perc95(latency_ms) as p95 by series | sort - p95</query>
+        </search>
+        <option name="charting.chart">bar</option>
+        <option name="charting.legend.placement">none</option>
+      </chart>
+    </panel>
+    <panel>
+      <title>Cache readings: local % and fill %</title>
+      <chart>
+        <search>
+          <query>index=$idx$ sourcetype=regulator:lifecycle (kind=cache_before OR kind=cache_after OR kind=cache_evicted) run_no=$run$ target=* | timechart span=1m latest(local_pct) as "local %", latest(fill_pct) as "fill %" by target</query>
+          <earliest>$tr.earliest$</earliest>
+          <latest>$tr.latest$</latest>
+        </search>
+        <option name="charting.chart">line</option>
+        <option name="charting.legend.placement">bottom</option>
+      </chart>
+    </panel>
+  </row>
+
+  <row>
+    <panel>
       <title>Per worker: p95 latency per interval (fleet runs)</title>
       <chart>
         <search>
-          <query>index=$idx$ sourcetype=regulator:sample run_no=$run$ slot=* | eval worker=run_label." slot ".slot | timechart max(interval.p95_ms) by worker limit=20</query>
+          <query>index=$idx$ sourcetype=regulator:sample run_no=$run$ slot=* slot!="null" | eval worker=run_label." slot ".slot | timechart max(interval.p95_ms) by worker limit=20</query>
           <earliest>$tr.earliest$</earliest>
           <latest>$tr.latest$</latest>
         </search>
@@ -148,10 +201,23 @@
       </chart>
     </panel>
     <panel>
+      <title>Per worker: searches per second by slot</title>
+      <chart>
+        <search>
+          <query>index=$idx$ sourcetype=regulator:sample run_no=$run$ slot=* slot!="null" | eval worker=run_label." slot ".slot | timechart span=10s max(interval.throughput_per_s) by worker limit=20</query>
+          <earliest>$tr.earliest$</earliest>
+          <latest>$tr.latest$</latest>
+        </search>
+        <option name="charting.chart">column</option>
+        <option name="charting.chart.stackMode">stacked</option>
+        <option name="charting.legend.placement">bottom</option>
+      </chart>
+    </panel>
+    <panel>
       <title>Per worker: latest figures</title>
       <table>
         <search>
-          <query>index=$idx$ sourcetype=regulator:sample run_no=$run$ slot=* | stats latest(executions) as searches, latest(errors) as errors, latest(cum.p95_ms) as p95_ms, latest(interval.throughput_per_s) as per_s, latest(in_flight) as in_flight by run_label, slot | eval p95_ms=round(p95_ms, 0)</query>
+          <query>index=$idx$ sourcetype=regulator:sample run_no=$run$ slot=* slot!="null" | stats latest(executions) as searches, latest(errors) as errors, latest(cum.p95_ms) as p95_ms, latest(interval.throughput_per_s) as per_s, latest(in_flight) as in_flight by run_label, slot | eval p95_ms=round(p95_ms, 0)</query>
           <earliest>$tr.earliest$</earliest>
           <latest>$tr.latest$</latest>
         </search>
@@ -165,7 +231,7 @@
       <title>Runs</title>
       <table>
         <search>
-          <query>index=$idx$ sourcetype=regulator:run scope!=worker run_no=$run$ | eval p95_ms=round('stats.latency.p95_ms', 0), error_pct=round('stats.error_rate_pct', 2) | table _time, run_no, run_label, scenario, target, fleet, outcome, valid, stats.executions, p95_ms, error_pct, invalid_reason | rename stats.executions as searches | sort - _time</query>
+          <query>index=$idx$ sourcetype=regulator:run scope!=worker run_no=$run$ | eval p95_ms=round('stats.latency.p95_ms', 0), error_pct=round('stats.error_rate_pct', 2), provenance='cache.delta.provenance' | table _time, run_no, run_label, scenario, target, fleet, outcome, valid, stats.executions, p95_ms, error_pct, stats.queueing.searches_queued, stats.workers, provenance, invalid_reason | rename stats.executions as searches, stats.queueing.searches_queued as queued, stats.workers as workers | sort - _time</query>
           <earliest>$tr.earliest$</earliest>
           <latest>$tr.latest$</latest>
         </search>
@@ -173,6 +239,9 @@
         <drilldown>
           <set token="form.run">$row.run_no$</set>
         </drilldown>
+        <format type="color" field="valid">
+          <colorPalette type="map">{"true":#1a9b5c,"false":#c0392b}</colorPalette>
+        </format>
       </table>
     </panel>
   </row>
@@ -182,18 +251,21 @@
       <title>Lifecycle</title>
       <table>
         <search>
-          <query>index=$idx$ sourcetype=regulator:lifecycle run_no=$run$ | eval detail=coalesce(outcome, reason, worker, 'findings{}') | table _time, run_label, kind, slot, detail | sort - _time | head 200</query>
+          <query>index=$idx$ sourcetype=regulator:lifecycle run_no=$run$ | eval detail=coalesce(outcome, reason, invalid_reason, error, if(isnotnull(confirmed), confirmed." of ".attempted." buckets evicted", null()), if(isnotnull(t0), "T0 ".strftime(t0, "%H:%M:%S"), null()), worker, 'findings{}') | table _time, run_label, kind, slot, detail | sort - _time | head 200</query>
           <earliest>$tr.earliest$</earliest>
           <latest>$tr.latest$</latest>
         </search>
         <option name="drilldown">none</option>
+        <format type="color" field="kind">
+          <colorPalette type="map">{"worker_lost":#c0392b,"cache_evicted":#d68a1e,"run_failed":#c0392b,"run_completed":#1a9b5c}</colorPalette>
+        </format>
       </table>
     </panel>
     <panel>
       <title>Control plane health</title>
       <table>
         <search>
-          <query>index=$idx$ sourcetype=regulator:health | stats latest(_time) as last_seen, latest(version) as version, latest(active_runs) as active_runs, latest(uptime_s) as uptime_s by host | eval last_seen=strftime(last_seen, "%Y-%m-%d %H:%M:%S"), uptime=tostring(round(uptime_s), "duration") | fields - uptime_s</query>
+          <query>index=$idx$ sourcetype=regulator:health | stats latest(_time) as last_seen, latest(version) as version, latest(active_runs) as active_runs, latest(uptime_s) as uptime_s, latest(hec.sent) as hec_sent, latest(hec.dropped) as hec_dropped by host | eval last_seen=strftime(last_seen, "%Y-%m-%d %H:%M:%S"), uptime=tostring(round(uptime_s), "duration") | fields - uptime_s</query>
           <earliest>$tr.earliest$</earliest>
           <latest>$tr.latest$</latest>
         </search>

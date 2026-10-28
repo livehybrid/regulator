@@ -95,3 +95,21 @@ def test_every_dashboard_a_scenario_opens_is_shipped_with_the_tokens_it_pins(sce
 
 def test_at_least_one_scenario_opens_a_shipped_dashboard():
     assert list(_dashboard_steps()), "the dashboard-triage scenario should open the regulator_sut dashboards"
+
+
+TELEMETRY_VIEWS = sorted((APPS / "regulator_telemetry").glob("default/data/ui/views/*.xml"))
+# A fleet run's control-plane samples carry "slot": null, which Splunk extracts
+# as the STRING "null". So a bare `NOT slot=*` silently drops every fleet run
+# from the control-plane panels, and a bare `slot=*` adds a phantom worker
+# called "null" to the per-worker ones (seen on r2-fleet-proof-2, 38 samples).
+BARE_AGGREGATE = re.compile(r'NOT slot=\*(?! OR slot="null"\))')
+BARE_WORKER = re.compile(r'(?<![T(] )(?<!NOT )\bslot=\*(?! slot!="null")(?! OR slot="null"\))')
+
+
+@pytest.mark.parametrize("path", TELEMETRY_VIEWS, ids=lambda p: p.stem)
+def test_slot_filters_account_for_the_null_slot(path):
+    queries = [q.text or "" for q in ET.parse(path).getroot().iter("query")]
+    aggregate = [q for q in queries if BARE_AGGREGATE.search(q)]
+    worker = [q for q in queries if BARE_WORKER.search(q)]
+    assert not aggregate, f"`NOT slot=*` without OR slot=\"null\" drops fleet runs: {aggregate[0][:120]}"
+    assert not worker, f"`slot=*` without slot!=\"null\" adds a phantom worker: {worker[0][:120]}"
