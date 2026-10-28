@@ -293,6 +293,19 @@ const ROUTES = {
     },
     '/fleets': [{ kind: 'k8s', available: true, default: true, detail: 'in-cluster' }],
     '/runs/7': RUN,
+    // A running fleet run that is paused, with a live load change and a note.
+    '/runs/8': {
+        ...RUN,
+        id: 8,
+        label: 'paused run',
+        state: 'running',
+        fleet_state: 'running',
+        paused: true,
+        paused_s: 95,
+        load_override: 40,
+        note: 'held while indexer 3 restarts',
+        summary: null,
+    },
     '/runs/7/samples': SAMPLES,
     '/targets/1/samples': SAMPLES,
     '/targets/1/cache': CACHE,
@@ -408,7 +421,13 @@ window.HTMLElement.prototype.getBoundingClientRect = () => ({
     width: 640,
     height: 220,
 });
-window.fetch = async (url) => {
+// Every write the console makes, so a dialog can be driven to its submit and
+// what it sent asserted on.
+const posted = [];
+window.fetch = async (url, init = {}) => {
+    if (init.method && init.method !== 'GET') {
+        posted.push({ url: String(url), method: init.method, body: init.body ? JSON.parse(init.body) : null });
+    }
     const body = lookup(String(url));
     if (body === null) {
         return {
@@ -547,6 +566,24 @@ const go = async (hash) => {
         () => window.document.querySelectorAll('.highcharts-splunk-annotation').length > 0
     );
 
+    // Run again opens the launch dialog filled in from this run; Edit opens
+    // the label and note.
+    clickByText('Run again', 'open run again');
+    await check('run: run again is prefilled', 'Run again: smoke run');
+    clickByText('Cancel', 'close run again');
+    await settle();
+    clickByText('Edit', 'open edit');
+    await check('run: edit dialog', 'Edit run 7');
+    clickByText('Cancel', 'close edit');
+    await settle();
+
+    await go('#run/8');
+    await check('run: paused banner', 'the run clock is stopped');
+    await check('run: note shown', 'held while indexer 3 restarts');
+    await waitFor('run: resume button', () =>
+        Array.from(window.document.querySelectorAll('button')).some((b) => (b.textContent || '').trim() === 'Resume')
+    );
+
     await go('#target/1');
     await check('target detail', 'SmartStore cache');
 
@@ -579,6 +616,31 @@ const go = async (hash) => {
     clickByText('Launch a run', 'open the launch dialog');
     await settle(400);
     await check('launch dialog', 'Pacing decides what the latency numbers mean');
+
+    // Type a user count and press Launch. Converting a typed number is what
+    // crashed (React error #321): the number input was imported as `Number`,
+    // shadowing the global, so Number(v) called the component as a function.
+    {
+        const label = Array.from(window.document.querySelectorAll('label')).find(
+            (n) => (n.textContent || '').trim() === 'Virtual users'
+        );
+        const group = label && label.closest('[data-test="control-group"]');
+        const input = group && group.querySelector('input');
+        if (!input) {
+            problems.push('launch dialog: no virtual users input');
+        } else {
+            const setter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value').set;
+            setter.call(input, '25');
+            input.dispatchEvent(new window.Event('input', { bubbles: true }));
+            input.dispatchEvent(new window.Event('change', { bubbles: true }));
+            input.dispatchEvent(new window.FocusEvent('blur', { bubbles: true }));
+            await settle(200);
+            clickByText('Launch', 'press Launch');
+            await waitFor('launch dialog: posts the typed user count', () =>
+                posted.some((p) => p.url.endsWith('/runs') && p.body && p.body.virtual_users === 25)
+            );
+        }
+    }
 
     await settle(200);
 

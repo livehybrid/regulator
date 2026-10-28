@@ -384,6 +384,7 @@ def _claim_env(run: Run, target: Target, settings: ServerConfig, share: Dict[str
         env["REG_SEED"] = str(run.seed)
     if run.cold_window_s:
         env["REG_COLD_WINDOW_S"] = str(run.cold_window_s)
+    env["REG_MAX_PAUSE_S"] = str(settings.max_pause_s)
     return env
 
 
@@ -530,6 +531,33 @@ def evaluate_release(session, run: Run, force: bool = False) -> bool:
     return True
 
 
+def paused_seconds(run: Run, now: Optional[float] = None) -> float:
+    """Total time paused, including a pause still in progress."""
+    now = now if now is not None else time.time()
+    current = (now - run.paused_at) if run.paused_at else 0.0
+    return float(run.paused_s or 0.0) + max(0.0, current)
+
+
+def slot_load(session, run: Run, lease: WorkerLease) -> Optional[float]:
+    """This slot's share of a live load change, or None if there is none.
+
+    Split the way the planner split the launched load: users dealt evenly
+    with the remainder to the lowest slots, arrivals divided equally.
+    """
+    if run.load_override is None:
+        return None
+    share = lease.share_json or {}
+    leases = [l for l in _leases(session, run)
+              if (l.share_json or {}).get("group") == share.get("group")]
+    leases.sort(key=lambda l: l.slot)
+    index = next((i for i, l in enumerate(leases) if l.slot == lease.slot), 0)
+    if share.get("model") == "closed":
+        return float(_split_evenly(int(round(run.load_override)), len(leases))[index])
+    if share.get("model") == "open":
+        return round(float(run.load_override) / max(1, len(leases)), 4)
+    return None
+
+
 def _with_epoch(run: Run, reply: Dict[str, Any]) -> Dict[str, Any]:
     """Every reply carries the run's current cache epoch, so a worker that
     missed the beat in which it changed still catches up on the next."""
@@ -597,7 +625,13 @@ def _heartbeat(session, run: Run, slot: int, lease_id: Optional[str], payload: D
         session.add(run)
         telemetry.lifecycle("run_started", run, _target_name(session, run), t0=run.t0, workers=run.workers)
     session.add(lease)
-    return {"command": "continue"}
+    # State, not one-shot commands: every reply says whether the run is paused
+    # and what this slot's load is, so a reply lost in transit only delays it.
+    reply: Dict[str, Any] = {"command": "continue", "paused": run.paused_at is not None}
+    load = slot_load(session, run, lease)
+    if load is not None:
+        reply["load"] = load
+    return reply
 
 
 def final(session, run: Run, slot: int, lease_id: Optional[str], summary: Dict[str, Any], log_tail: List[str]) -> None:
@@ -1021,7 +1055,9 @@ class FleetRun(threading.Thread):
                     secrets={"REG_RUN_JWT": token},
                     labels={"regulator.scenario": self._scenario_name()},
                     stop_grace_s=90,
-                    options={"slot_base": slot_base, "active_deadline_s": int(deadline_basis + 600)},
+                    # Plus the pause budget: a Kubernetes Job's deadline is
+                    # fixed at creation and a pause must not run into it.
+                    options={"slot_base": slot_base, "active_deadline_s": int(deadline_basis + 600 + settings.max_pause_s)},
                 )
                 slot_base += group.workers
                 try:
@@ -1197,7 +1233,10 @@ class FleetRun(threading.Thread):
         provision_deadline = started + settings.fleet.provision_timeout_s
         lease_s = settings.fleet.lease_s
         hard_deadline: Optional[float] = None
-        ceiling = started + settings.fleet.provision_timeout_s + float(duration or settings.max_run_duration_s) + 600.0
+        ceiling = (
+            started + settings.fleet.provision_timeout_s
+            + float(duration or settings.max_run_duration_s) + 600.0 + settings.max_pause_s
+        )
         drain_started: Optional[float] = None
         last_persist = 0.0
         sample_every = max(1.0, float(getattr(settings, "sample_interval_s", 5.0)))
@@ -1267,8 +1306,13 @@ class FleetRun(threading.Thread):
                             lease.state = LEASE_LOST
                             session.add(lease)
 
-                if run.t0 is not None and hard_deadline is None:
-                    hard_deadline = run.t0 + float(duration or settings.max_run_duration_s) + 300.0
+                if run.t0 is not None:
+                    # Moves with every pause: the workers' clocks stop while
+                    # paused, so the run legitimately ends that much later.
+                    hard_deadline = (
+                        run.t0 + float(duration or settings.max_run_duration_s) + 300.0
+                        + paused_seconds(run, now)
+                    )
 
                 # The live aggregate is persisted so a restart, or a page
                 # opened later, still has what the fleet reported so far.

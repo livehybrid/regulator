@@ -17,7 +17,9 @@ bearer token that authorises exactly one run:
 ``heartbeat``
     Every couple of seconds, carrying the live aggregate. The response is the
     command channel: ``release`` with T0, ``stop`` to drain, ``superseded``
-    when the lease was reissued to somebody else. A heartbeat that is
+    when the lease was reissued to somebody else. Every reply also carries
+    ``paused`` and, after a live change, ``load`` (this worker's share), as
+    state rather than commands so a lost reply only delays them. A heartbeat that is
     acknowledged is the lease renewal; a lease that stops being renewed is
     marked lost and its share is not waited for.
 
@@ -287,6 +289,7 @@ async def run_managed(boot: ManagedBoot) -> int:
     phase = {"name": "starting"}
     superseded = {"flag": False}
     stopped: Dict[str, Any] = {"flag": False, "reason": ""}
+    applied_load: Dict[str, Any] = {"value": None}
 
     def request_stop(reason: str) -> None:
         """A stop from any source: the control plane, a signal, the dead-man."""
@@ -330,6 +333,22 @@ async def run_managed(boot: ManagedBoot) -> int:
                         released.set()
                 elif command == "stop":
                     request_stop("stopped by the control plane")
+                # Pause and live load ride every reply rather than being
+                # one-shot commands, so a heartbeat lost in transit only
+                # delays them by one beat.
+                if scheduler is not None and command != "stop":
+                    paused = document.get("paused")
+                    if paused is True and not scheduler.paused:
+                        scheduler.pause()
+                    elif paused is False and scheduler.paused:
+                        scheduler.resume()
+                    load = document.get("load")
+                    if isinstance(load, (int, float)) and load != applied_load["value"]:
+                        try:
+                            scheduler.set_load(float(load))
+                            applied_load["value"] = load
+                        except ValueError as exc:
+                            log.warning("load change refused: %s", exc)
             elif client.deadman_expired():
                 log.error("no control-plane contact for %.0fs: draining", boot.deadman_s)
                 request_stop("control plane unreachable")

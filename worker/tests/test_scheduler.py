@@ -515,3 +515,141 @@ def test_capabilities_are_folded_into_the_summary(env):
     assert target["version"] == "10.4.0"
     # 6 + (1 * 8): the ceiling the concurrency chart draws its line at.
     assert target["max_hist_searches"] == 14
+
+
+# ------------------------------------------------------- pause, resume, load
+
+
+def _controlled(doc, env_factory, engine, control, **env_overrides):
+    """Run a scheduler with ``control(scheduler)`` driving it from the side."""
+    import asyncio
+
+    scenario, config, resolver = build(doc, env_factory, **env_overrides)
+    scheduler = Scheduler(scenario=scenario, config=config, engine=engine, resolver=resolver)
+
+    async def go():
+        task = asyncio.create_task(scheduler.run())
+        await control(scheduler)
+        return await task
+
+    return scheduler, run_async(go())
+
+
+def test_a_paused_run_issues_nothing_and_its_clock_stops(env):
+    import asyncio
+    import time
+
+    doc = copy.deepcopy(tiny_scenario_dict())
+    doc["load"] = {"model": "closed", "virtual_users": 3, "duration": "0.8s"}
+    doc["abort_if"] = {}
+    engine = FakeEngine(latency=0.01)
+    seen = {}
+
+    async def control(scheduler):
+        await asyncio.sleep(0.3)
+        scheduler.pause()
+        await asyncio.sleep(0.05)  # let in-flight searches land
+        seen["at_pause"] = engine.executions
+        await asyncio.sleep(0.6)
+        seen["while_paused"] = engine.executions
+        scheduler.resume()
+
+    began = time.perf_counter()
+    _, summary = _controlled(doc, env, engine, control)
+    wall = time.perf_counter() - began
+
+    assert seen["while_paused"] == seen["at_pause"]
+    assert summary.outcome == "completed"
+    # The run still delivered its 0.8 s of load: the pause did not count.
+    assert wall > 0.8 + 0.6
+    assert engine.executions > seen["while_paused"]
+    pauses = summary.configured_load["pauses"]
+    assert len(pauses) == 1 and pauses[0]["resumed_at"] > pauses[0]["paused_at"]
+    assert summary.configured_load["paused_s"] >= 0.6
+
+
+def test_resuming_does_not_report_the_pause_as_lateness(env):
+    """A paced user's schedule is re-anchored, or the pause becomes latency."""
+    import asyncio
+
+    doc = copy.deepcopy(tiny_scenario_dict())
+    doc["load"] = {"model": "closed", "virtual_users": 2, "duration": "0.6s", "pacing": "0.1s"}
+    doc["abort_if"] = {}
+    engine = FakeEngine(latency=0.01)
+
+    async def control(scheduler):
+        await asyncio.sleep(0.2)
+        scheduler.pause()
+        await asyncio.sleep(0.8)
+        scheduler.resume()
+
+    _, summary = _controlled(doc, env, engine, control)
+    # Every search would be ~800 ms late if the timetable had not moved.
+    assert summary.stats["latency"]["max_ms"] < 400
+
+
+def test_the_load_can_change_while_the_run_is_going(env):
+    import asyncio
+
+    doc = copy.deepcopy(tiny_scenario_dict())
+    doc["load"] = {"model": "closed", "virtual_users": 2, "duration": "1.2s"}
+    doc["abort_if"] = {}
+    engine = FakeEngine(latency=0.05)
+    peaks = {}
+
+    async def control(scheduler):
+        await asyncio.sleep(0.4)
+        peaks["before"] = engine.peak_concurrent
+        scheduler.set_load(6)
+
+    scheduler, summary = _controlled(doc, env, engine, control)
+    assert peaks["before"] <= 2
+    assert engine.peak_concurrent == 6
+    assert summary.configured_load["load_changes"][0]["value"] == 6
+
+
+def test_the_schedule_model_has_no_load_to_change(env):
+    doc = copy.deepcopy(tiny_scenario_dict())
+    doc["load"] = {"model": "closed", "virtual_users": 1, "duration": "1s"}
+    scenario, config, resolver = build(doc, env)
+    scheduler = Scheduler(scenario=scenario, config=config, engine=FakeEngine(), resolver=resolver)
+    import dataclasses
+
+    scheduler.load = dataclasses.replace(scheduler.load, model="schedule")
+    with pytest.raises(ValueError):
+        scheduler.set_load(5)
+
+
+def test_a_pause_past_its_budget_stops_rather_than_resumes(env):
+    import asyncio
+
+    doc = copy.deepcopy(tiny_scenario_dict())
+    doc["load"] = {"model": "closed", "virtual_users": 2, "duration": "5s"}
+    doc["abort_if"] = {}
+    engine = FakeEngine(latency=0.01)
+
+    async def control(scheduler):
+        await asyncio.sleep(0.2)
+        scheduler.pause()
+
+    _, summary = _controlled(doc, env, engine, control, REG_MAX_PAUSE_S="0.5")
+    assert summary.outcome == "stopped"
+    assert "paused for more than" in summary.abort_reason
+
+
+def test_a_stop_while_paused_ends_the_run(env):
+    import asyncio
+
+    doc = copy.deepcopy(tiny_scenario_dict())
+    doc["load"] = {"model": "open", "arrival_rate_per_min": 600, "duration": "5s"}
+    doc["abort_if"] = {}
+    engine = FakeEngine(latency=0.01)
+
+    async def control(scheduler):
+        await asyncio.sleep(0.2)
+        scheduler.pause()
+        await asyncio.sleep(0.2)
+        scheduler.request_stop("stopped from the web interface")
+
+    _, summary = _controlled(doc, env, engine, control)
+    assert summary.outcome == "stopped"

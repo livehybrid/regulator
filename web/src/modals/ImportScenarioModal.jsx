@@ -8,7 +8,9 @@ import React, { useState } from 'react';
 import PropTypes from 'prop-types';
 import Checkbox from '@splunk/react-ui/Checkbox';
 import ControlGroup from '@splunk/react-ui/ControlGroup';
-import Number from '@splunk/react-ui/Number';
+// Not imported as Number: that shadows the global, and Number(v) then calls
+// the component as a function, which React reports as error #321.
+import NumberInput from '@splunk/react-ui/Number';
 import Select from '@splunk/react-ui/Select';
 import Text from '@splunk/react-ui/Text';
 import TextArea from '@splunk/react-ui/TextArea';
@@ -110,13 +112,13 @@ export default function ImportScenarioModal({ prefill, suggestedName, onClose, o
                     </Select>
                 </ControlGroup>
                 <ControlGroup label="Virtual users (closed model)" labelPosition="top">
-                    <Number value={form.virtual_users} min={1} onChange={set('virtual_users')} />
+                    <NumberInput value={form.virtual_users} min={1} onChange={set('virtual_users')} />
                 </ControlGroup>
                 <ControlGroup label="Duration in seconds" labelPosition="top">
-                    <Number value={form.duration_s} min={1} onChange={set('duration_s')} />
+                    <NumberInput value={form.duration_s} min={1} onChange={set('duration_s')} />
                 </ControlGroup>
                 <ControlGroup label="Median think time in seconds" labelPosition="top">
-                    <Number value={form.think_median_s} min={0} onChange={set('think_median_s')} />
+                    <NumberInput value={form.think_median_s} min={0} onChange={set('think_median_s')} />
                 </ControlGroup>
                 <ControlGroup
                     label="Corpus index"

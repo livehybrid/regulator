@@ -321,6 +321,10 @@ class RunStats:
         self.run_id = run_id
         self.slot = slot
         self.started_at = time.time()
+        # Time spent paused, which is not run time: throughput over a run with
+        # a pause in it is the rate while it was running.
+        self.paused_s = 0.0
+        self.paused_since: Optional[float] = None
         self.steps: Dict[str, StepStats] = {}
         self.executions = 0
         self.errors = 0
@@ -454,7 +458,9 @@ class RunStats:
 
     @property
     def elapsed_s(self) -> float:
-        return time.time() - self.started_at
+        now = time.time()
+        paused = self.paused_s + (now - self.paused_since if self.paused_since is not None else 0.0)
+        return now - self.started_at - paused
 
     def histograms(self) -> Dict[str, Any]:
         """Every histogram in the aggregate, keyed for a fleet merge."""

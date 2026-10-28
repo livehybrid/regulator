@@ -124,6 +124,17 @@ class Run(Base):
     driver_refs_json: Mapped[Optional[List[Dict[str, Any]]]] = mapped_column(JSON, nullable=True)
     # The shared start instant, set when every worker is ready.
     t0: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    # An operator's note, editable at any time; the label is too.
+    note: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    # Pause and live load. ``paused_at`` is set while paused; ``paused_s`` is
+    # the total of the pauses that have ended. ``load_override`` is the
+    # current total load after a live change (virtual users or arrivals per
+    # minute, by the run's model); the launched figures stay as launched.
+    paused_at: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    paused_s: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    load_override: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    # Every pause, resume and load change, in order, for the charts.
+    controls_json: Mapped[Optional[List[Dict[str, Any]]]] = mapped_column(JSON, nullable=True)
     # Identity across instances. The id is this database's row number, so a
     # run archived to the config source and pulled into a rebuilt instance
     # gets a different one; the uid is what a baseline in the shared config

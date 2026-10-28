@@ -260,6 +260,9 @@ class ServerConfig:
     # The longest run the control plane will accept, so a mistyped or
     # malicious duration cannot occupy a slot for ever.
     max_run_duration_s: float = 4 * 3600.0
+    # The longest a run may spend paused in total before it is stopped. Not
+    # resumed: somebody paused it, quite possibly to protect the cluster.
+    max_pause_s: float = 1800.0
     # Bearer tokens for scripts and CI. Compared in constant time. A token is
     # as powerful as the password, so treat it as one.
     api_tokens: tuple[str, ...] = field(default=(), repr=False)
@@ -445,6 +448,7 @@ def load_server_config(env: Optional[Mapping[str, str]] = None) -> ServerConfig:
         max_virtual_users=_integer(env, "REG_MAX_VIRTUAL_USERS", 500, minimum=1),
         max_concurrent_runs=_integer(env, "REG_MAX_CONCURRENT_RUNS", 2, minimum=1),
         max_run_duration_s=float(_integer(env, "REG_MAX_RUN_DURATION_S", 4 * 3600, minimum=1)),
+        max_pause_s=float(_integer(env, "REG_MAX_PAUSE_S", 1800, minimum=0)),
         api_tokens=tokens,
         allow_unauthenticated=_boolean(env, "REG_ALLOW_UNAUTHENTICATED", False),
         sample_interval_s=float(_integer(env, "REG_SAMPLE_INTERVAL_S", 5, minimum=1)),

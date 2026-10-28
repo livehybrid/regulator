@@ -240,3 +240,32 @@ def test_runs_from_before_uids_get_one(tmp_path, monkeypatch):
             assert session.get(Run, run_id).uid
     finally:
         _close(client)
+
+
+def test_a_runs_note_and_controls_survive_the_trip(tmp_path, monkeypatch, bucket):
+    first = _instance(tmp_path, monkeypatch, "first").__enter__()
+    try:
+        run_id = _finished_run(first)
+        with db.session_scope() as session:
+            run = session.get(Run, run_id)
+            run.note = "indexer 3 replaced"
+            run.paused_s = 42.0
+            run.controls_json = [
+                {"at": 1_700_000_010.0, "kind": "pause"},
+                {"at": 1_700_000_052.0, "kind": "resume"},
+                {"at": 1_700_000_055.0, "kind": "load", "virtual_users": 8},
+            ]
+        assert first.post("/api/config/source/push").status_code == 200
+    finally:
+        _close(first)
+
+    rebuilt = _instance(tmp_path, monkeypatch, "rebuilt").__enter__()
+    try:
+        pulled = rebuilt.get("/api/runs").json()[0]
+        detail = rebuilt.get(f"/api/runs/{pulled['id']}").json()
+        assert detail["note"] == "indexer 3 replaced"
+        assert detail["paused_s"] == 42.0
+        labels = [m["label"] for m in detail["markers"] if m["kind"] in ("pause", "resume", "load")]
+        assert labels == ["paused", "resumed", "8 users"]
+    finally:
+        _close(rebuilt)

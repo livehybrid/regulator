@@ -40,6 +40,7 @@ RUN_FIELDS = (
     "arrival_rate_per_min", "pacing_s", "evict_cache", "evict_cache_indexes",
     "evict_every_s", "cold_window_s", "seed", "scenario_digest", "fleet",
     "workers", "fleet_state", "created_at", "started_at", "ended_at", "t0", "error",
+    "note", "paused_s", "load_override",
 )
 
 
@@ -55,7 +56,10 @@ def build_document(session: Session, run: Run, target: Optional[Target], points:
     document: Dict[str, Any] = {
         "regulator_run_export_version": EXPORT_VERSION,
         "exported_at": time.time(),
-        "run": _serialise(run, target.name if target is not None else None),
+        # Plus every pause, resume and load change, so a pulled run's charts
+        # still mark them.
+        "run": {**_serialise(run, target.name if target is not None else None),
+                "controls": run.controls_json or []},
         "target": None,
         "scenario": None,
         "samples": samples_for(session, run.id, points=max(10, min(points, 100_000))),
@@ -157,6 +161,7 @@ def import_document(session: Session, document: Dict[str, Any], uid: Optional[st
             setattr(run, name, row[name])
     run.stats_json = row.get("stats")
     run.summary_json = row.get("summary")
+    run.controls_json = row.get("controls") or None
     session.add(run)
     session.flush()
 

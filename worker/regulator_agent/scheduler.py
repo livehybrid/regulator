@@ -273,6 +273,16 @@ class Scheduler:
         self._invalid_reason: Optional[str] = None
         # The unbroken run of refused searches, if one is in progress.
         self._auth_refused_since: Optional[float] = None
+        # Pause and live load. Set from other threads through the public
+        # methods below, which hand the change to this run's own event loop.
+        self._loop: Optional[asyncio.AbstractEventLoop] = None
+        self._resume = asyncio.Event()
+        self._resume.set()
+        self._paused_since: Optional[float] = None
+        self._paused_total_s = 0.0
+        self._pauses: List[Dict[str, Any]] = []
+        self._load_override: Optional[float] = None
+        self._load_changes: List[Dict[str, Any]] = []
         self._auth_refused_count = 0
         self._vu_tasks: Dict[int, asyncio.Task[None]] = {}
         self._retiring: set[int] = set()
@@ -373,6 +383,118 @@ class Scheduler:
             log.info("stop requested: %s", reason)
             self._abort_reason = self._abort_reason or reason
             self._stop.set()
+            # A paused run must wake to stop, not wait for a resume.
+            self._resume.set()
+
+    def _on_loop(self, fn: Any, *args: Any) -> None:
+        """Run ``fn`` on this run's event loop, from whichever thread calls."""
+        loop = self._loop
+        if loop is None or loop.is_closed():
+            fn(*args)
+            return
+        try:
+            running = asyncio.get_running_loop()
+        except RuntimeError:
+            running = None
+        if running is loop:
+            fn(*args)
+        else:
+            loop.call_soon_threadsafe(fn, *args)
+
+    @property
+    def paused(self) -> bool:
+        return self._paused_since is not None
+
+    def pause(self) -> None:
+        """Stop issuing searches; the run clock stops with them.
+
+        Searches already in flight finish and are recorded. Nothing new
+        starts, and the time spent paused does not count towards the
+        duration, so the run still delivers all the load it was asked for.
+        """
+        self._on_loop(self._apply_pause)
+
+    def resume(self) -> None:
+        """Start issuing searches again, re-anchored at now.
+
+        Re-anchoring is what keeps a pause out of the numbers: a paced or
+        open-model schedule would otherwise count every search that was due
+        during the pause as late, and report the pause as latency.
+        """
+        self._on_loop(self._apply_resume)
+
+    def set_load(self, value: float) -> None:
+        """Change the target load while the run is going.
+
+        Virtual users for the closed model, arrivals per minute for the open
+        one. Replaces the ramp from here on; the schedule model has no single
+        load figure and refuses.
+        """
+        if self.load.model not in ("closed", "open"):
+            raise ValueError("the schedule model fires by cron and has no load figure to change")
+        if value < 0:
+            raise ValueError("the load cannot be negative")
+        self._on_loop(self._apply_load, float(value))
+
+    def _apply_pause(self) -> None:
+        if self._paused_since is not None or self._stop.is_set():
+            return
+        self._paused_since = time.perf_counter()
+        self._pauses.append({"paused_at": time.time(), "resumed_at": None})
+        self.stats.paused_since = time.time()
+        self._resume.clear()
+        log.info("paused")
+
+    def _apply_resume(self) -> None:
+        if self._paused_since is None:
+            return
+        self._paused_total_s += time.perf_counter() - self._paused_since
+        self._paused_since = None
+        if self.stats.paused_since is not None:
+            self.stats.paused_s += time.time() - self.stats.paused_since
+            self.stats.paused_since = None
+        if self._pauses:
+            self._pauses[-1]["resumed_at"] = time.time()
+        self._resume.set()
+        log.info("resumed after %.0fs paused in total", self._paused_total_s)
+
+    def _apply_load(self, value: float) -> None:
+        self._load_override = value
+        self._load_changes.append({"at": time.time(), "value": value})
+        log.info("load changed to %s", value)
+
+    def _paused_for(self) -> float:
+        """Seconds paused so far, including a pause still in progress."""
+        current = time.perf_counter() - self._paused_since if self._paused_since is not None else 0.0
+        return self._paused_total_s + current
+
+    async def _wait_unpaused(self) -> float:
+        """Hold while paused. Returns how long it held, 0.0 if it did not.
+
+        Enforces ``max_pause_s`` while it waits: a pause that runs past it
+        stops the run rather than resuming it.
+        """
+        if self._paused_since is None:
+            return 0.0
+        began = time.perf_counter()
+        while self._paused_since is not None and not self._stop.is_set():
+            budget = float(getattr(self.config, "max_pause_s", 0) or 0)
+            if budget and self._paused_for() > budget:
+                self.request_stop(
+                    f"paused for more than {budget:.0f}s in total, so the run was stopped "
+                    "rather than resumed unattended"
+                )
+                break
+            try:
+                await asyncio.wait_for(self._resume.wait(), timeout=TICK_S)
+            except asyncio.TimeoutError:
+                pass
+        return time.perf_counter() - began
+
+    def _target_load(self, elapsed: float) -> float:
+        if self._load_override is not None:
+            return self._load_override
+        return self.ramp.target_at(elapsed)
 
     # ------------------------------------------------------------------
     # The run
@@ -386,6 +508,7 @@ class Scheduler:
         started generating when it happened to boot would measure a ramp
         nobody asked for. A T0 already in the past starts immediately.
         """
+        self._loop = asyncio.get_running_loop()
         if start_at is not None:
             delay = start_at - time.time()
             if delay > 0:
@@ -394,6 +517,11 @@ class Scheduler:
         self._t0_monotonic = time.perf_counter()
         self._t0_wall = time.time()
         self.stats.started_at = self._t0_wall
+        if self._paused_since is not None:
+            # Paused before it started: the pause counts from the start, or
+            # the time spent waiting would come off the run's duration.
+            self._paused_since = self._t0_monotonic
+            self.stats.paused_since = self._t0_wall
 
         log.info(
             "starting %s: model=%s duration=%.0fs target=%s co_corrected=%s",
@@ -443,8 +571,15 @@ class Scheduler:
             elapsed = self._elapsed()
             if elapsed >= self.duration_s:
                 break
+            if self.paused:
+                # The population holds where it is; each virtual user waits at
+                # its next iteration boundary. The tick keeps running so the
+                # loop-lag guard still sees a starved worker.
+                await self._wait_unpaused()
+                next_tick_due = time.perf_counter() + TICK_S
+                continue
 
-            target = int(round(self.ramp.target_at(elapsed)))
+            target = int(round(self._target_load(elapsed)))
             target = max(0, target)
 
             # Grow.
@@ -511,12 +646,17 @@ class Scheduler:
         idle = True
 
         while not self._stop.is_set():
+            if self.paused:
+                await self._wait_unpaused()
+                # Nothing was due while paused: the schedule restarts at now.
+                idle = True
+                continue
             now = time.perf_counter()
-            elapsed = now - self._t0_monotonic
+            elapsed = self._elapsed()
             if elapsed >= self.duration_s:
                 break
 
-            rate_per_min = max(0.0, self.ramp.target_at(elapsed))
+            rate_per_min = max(0.0, self._target_load(elapsed))
             if rate_per_min <= 0:
                 idle = True
                 await asyncio.sleep(TICK_S)
@@ -623,8 +763,13 @@ class Scheduler:
         )
 
         while not self._stop.is_set():
+            if self.paused:
+                # The virtual clock stops too: the next cron minute fires as
+                # far after the resume as it was going to after the pause.
+                due += await self._wait_unpaused()
+                continue
             now = time.perf_counter()
-            if now - self._t0_monotonic >= self.duration_s:
+            if self._elapsed() >= self.duration_s:
                 break
             if now < due:
                 await asyncio.sleep(min(due - now, TICK_S))
@@ -668,7 +813,11 @@ class Scheduler:
 
         try:
             while not self._stop.is_set():
-                if self._elapsed() >= self.duration_s:
+                if await self._wait_unpaused():
+                    # Re-anchored: nothing this user would have started during
+                    # the pause counts as late.
+                    due = time.perf_counter()
+                if self._stop.is_set() or self._elapsed() >= self.duration_s:
                     return
 
                 job = _Iteration(
@@ -733,7 +882,11 @@ class Scheduler:
         if job.delay_s > 0:
             await self._sleep_or_stop(job.delay_s)
         intended = job.intended_start
-        for step in self._steps_for(job):
+        for index, step in enumerate(self._steps_for(job)):
+            if index and await self._wait_unpaused():
+                # Paused between two steps of one iteration: the next question
+                # is asked after the resume, and its clock starts there.
+                intended = time.perf_counter()
             if self._stop.is_set():
                 return
             record = await self._run_step(job, step, intended)
@@ -875,7 +1028,8 @@ class Scheduler:
             pass
 
     def _elapsed(self) -> float:
-        return time.perf_counter() - self._t0_monotonic
+        """Run time so far, not counting time spent paused."""
+        return time.perf_counter() - self._t0_monotonic - self._paused_for()
 
     # ------------------------------------------------------------------
     # Guard rails
@@ -1009,6 +1163,11 @@ class Scheduler:
             configured["scheduled_steps"] = len(self._crons)
             configured["schedule_start"] = self.load.schedule_start
         configured["ramp_stages"] = len(self.load.ramp)
+        if self._pauses:
+            configured["pauses"] = [dict(p) for p in self._pauses]
+            configured["paused_s"] = round(self._paused_for(), 3)
+        if self._load_changes:
+            configured["load_changes"] = list(self._load_changes)
         configured["duration_s"] = self.duration_s
         configured["slot"] = self.config.slot
         configured["total_workers"] = self.config.total_workers

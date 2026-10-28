@@ -627,3 +627,46 @@ def test_a_malformed_final_costs_only_its_own_slot(client, splunkd, fake_driver)
     assert sorted(w["state"] for w in workers) == [LEASE_DONE, LEASE_LOST]
     # And a token presented after the run finished opens nothing.
     assert client.post(f"/api/agent/runs/{run_id}/heartbeat", json={"slot": 0, "lease_id": first["lease_id"], "state": "running"}, headers=headers).status_code == 409
+
+
+def test_pause_and_load_reach_fleet_workers_in_every_reply(client, splunkd, fake_driver):
+    run_id = _launch(client, splunkd, fake_driver, virtual_users=3)
+    headers = _bearer(run_id)
+    deadline = time.time() + 10
+    while time.time() < deadline and not fake_driver.created_groups():
+        time.sleep(0.1)
+    leases = [client.post(f"/api/agent/runs/{run_id}/claim", json={"holder": h}, headers=headers).json() for h in ("w-a", "w-b")]
+    for lease in leases:
+        client.post(f"/api/agent/runs/{run_id}/ready", json={"slot": lease["slot"], "lease_id": lease["lease_id"]}, headers=headers)
+
+    def beat(lease):
+        return client.post(
+            f"/api/agent/runs/{run_id}/heartbeat",
+            json={"slot": lease["slot"], "lease_id": lease["lease_id"], "state": "running"},
+            headers=headers,
+        ).json()
+
+    for lease in leases:
+        beat(lease)
+    assert client.get(f"/api/runs/{run_id}").json()["state"] == "running"
+    assert beat(leases[0])["paused"] is False
+
+    assert client.post(f"/api/runs/{run_id}/pause").status_code == 200
+    assert all(beat(lease)["paused"] is True for lease in leases)
+    # Repeated, not one-shot: a reply lost in transit only delays it.
+    assert beat(leases[0])["paused"] is True
+
+    # 2 workers at 2 users each were planned, so 4 is the most this fleet takes.
+    assert client.patch(f"/api/runs/{run_id}", json={"virtual_users": 5}).status_code == 422
+    assert client.patch(f"/api/runs/{run_id}", json={"virtual_users": 4}).status_code == 200
+    assert sorted(beat(lease)["load"] for lease in leases) == [2.0, 2.0]
+
+    assert client.post(f"/api/runs/{run_id}/resume").status_code == 200
+    assert all(beat(lease)["paused"] is False for lease in leases)
+    assert client.post(f"/api/runs/{run_id}/stop").status_code == 200
+
+
+def test_a_pause_moves_the_fleet_deadline(tmp_path):
+    run = Run(scenario="smoke", paused_s=40.0, paused_at=time.time() - 20.0)
+    assert 59.0 < fleet.paused_seconds(run) < 61.0
+    assert fleet.paused_seconds(Run(scenario="smoke")) == 0.0
