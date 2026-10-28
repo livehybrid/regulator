@@ -71,6 +71,12 @@ services:
       - REG_CA_BUNDLE=${REG_CA_BUNDLE:-}
       - REG_SCENARIO_SOURCE=${REG_SCENARIO_SOURCE:-}
       - REG_SCENARIO_SOURCE_WRITE=${REG_SCENARIO_SOURCE_WRITE:-}
+      # The shared config copy and run history: pulled at boot, and pushed on
+      # every change and finished run when the _WRITE switch is on.
+      - REG_CONFIG_SOURCE=${REG_CONFIG_SOURCE:-}
+      - REG_CONFIG_SOURCE_WRITE=${REG_CONFIG_SOURCE_WRITE:-}
+      - REG_CONFIG_SOURCE_SSE=${REG_CONFIG_SOURCE_SSE:-}
+      - REG_CONFIG_SOURCE_SSE_KMS_KEY_ID=${REG_CONFIG_SOURCE_SSE_KMS_KEY_ID:-}
       # S3 credentials for the scenario source come from the usual boto3
       # chain, so they are passed through rather than configured here.
       - AWS_REGION=${AWS_REGION:-}

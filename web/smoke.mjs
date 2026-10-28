@@ -212,6 +212,23 @@ const ROUTES = {
         location: 's3://regulator-scenarios/shared',
         error: null,
     },
+    '/config/source': {
+        configured: true,
+        writable: true,
+        kind: 's3',
+        location: 's3://regulator-config/lab',
+        object: 'regulator-config.json',
+        error: null,
+        carried: 1,
+        last_pull: {
+            at: '2026-10-28T09:00:00Z',
+            ok: true,
+            found: true,
+            created: { targets: 1, scenarios: 2, baselines: 1, runs: 14 },
+            skipped: 0,
+        },
+        last_push: null,
+    },
     '/targets': [
         {
             id: 1,
@@ -583,6 +600,9 @@ const go = async (hash) => {
     // explaining, so it must survive a refactor of the page.
     await check('configuration: master key note', 'REG_MASTER_KEY');
     await check('configuration: names the shared source', 's3://regulator-scenarios/shared');
+    await check('configuration: shared copy location', 's3://regulator-config/lab/regulator-config.json');
+    await check('configuration: last pull counts runs', '14 run(s) new');
+    await check('configuration: carried rows explained', 'kept in every push');
 
     // Dialogs are where a component library is most easily misused (a Modal
     // without returnFocus, a Select given children it will not accept), so the

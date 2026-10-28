@@ -13,6 +13,7 @@ processes need to agree about the same run.
 from __future__ import annotations
 
 import time
+import uuid
 from typing import Any, Dict, List, Optional
 
 from sqlalchemy import JSON, Boolean, Float, ForeignKey, Index, Integer, String, Text
@@ -134,6 +135,16 @@ class Run(Base):
     load_override: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
     # Every pause, resume and load change, in order, for the charts.
     controls_json: Mapped[Optional[List[Dict[str, Any]]]] = mapped_column(JSON, nullable=True)
+    # Identity across instances. The id is this database's row number, so a
+    # run archived to the config source and pulled into a rebuilt instance
+    # gets a different one; the uid is what a baseline in the shared config
+    # names, and what tells a pull which runs it already has. Nullable only
+    # for rows that predate it, which the config source backfills.
+    uid: Mapped[Optional[str]] = mapped_column(
+        String(32), nullable=True, default=lambda: uuid.uuid4().hex
+    )
+    # When this run was last written to the config source; None until it is.
+    archived_at: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
     # provisioning -> releasing -> running -> draining, for a fleet run.
     fleet_state: Mapped[Optional[str]] = mapped_column(String(16), nullable=True)
     leases: Mapped[list["WorkerLease"]] = relationship(

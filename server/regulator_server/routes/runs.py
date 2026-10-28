@@ -16,15 +16,14 @@ from sqlalchemy.orm import Session
 
 from fastapi import Request
 
-from regulator_agent.scenario import ScenarioError, load_scenario
-
-from ..adapters import load_named_scenario, scenario_path, scenario_summary
+from ..adapters import load_named_scenario
 from ..audit import record as audit_record
 from ..config import get_settings
 from ..db import get_session
 from ..models import Run, Target, is_terminal
 from .. import runcontrol
 from ..fleet import paused_seconds
+from .. import configsource, runarchive
 from ..runner import RunRejected, manager
 from ..schemas import RunCreate, RunOut
 
@@ -62,6 +61,7 @@ def _serialise(run: Run, target_name: Optional[str] = None, full: bool = True) -
     live = manager.live_stats(run.id) if not is_terminal(run.state) else None
     base = {
         "id": run.id,
+        "uid": run.uid,
         "label": run.label,
         "target_id": run.target_id,
         "target_name": target_name,
@@ -69,7 +69,10 @@ def _serialise(run: Run, target_name: Optional[str] = None, full: bool = True) -
         "state": run.state,
         "virtual_users": run.virtual_users,
         "duration_s": run.duration_s,
+        "arrival_rate_per_min": run.arrival_rate_per_min,
+        "pacing_s": run.pacing_s,
         "evict_cache": run.evict_cache,
+        "evict_cache_indexes": run.evict_cache_indexes,
         "evict_every_s": run.evict_every_s,
         "cold_window_s": run.cold_window_s,
         "seed": run.seed,
@@ -80,14 +83,12 @@ def _serialise(run: Run, target_name: Optional[str] = None, full: bool = True) -
         "created_at": run.created_at,
         "started_at": run.started_at,
         "ended_at": run.ended_at,
+        "t0": run.t0,
         "error": run.error,
         "note": run.note,
         "paused": run.paused_at is not None and not is_terminal(run.state),
         "paused_s": round(paused_seconds(run), 1) if (run.paused_at or run.paused_s) else 0.0,
         "load_override": run.load_override,
-        "arrival_rate_per_min": run.arrival_rate_per_min,
-        "pacing_s": run.pacing_s,
-        "evict_cache_indexes": run.evict_cache_indexes,
     }
     if full:
         from ..samples import markers_for
@@ -197,64 +198,7 @@ def export_run(
     if row is None:
         raise HTTPException(status_code=404, detail=f"no run with id {run_id}")
     run, target = row
-
-    from ..samples import markers_for, samples_for
-
-    document: Dict[str, Any] = {
-        "regulator_run_export_version": 1,
-        "exported_at": time.time(),
-        "run": _serialise(run, target.name if target is not None else None),
-        "target": None,
-        "scenario": None,
-        "samples": samples_for(session, run_id, points=max(10, min(points, 100_000))),
-        "markers": markers_for(run),
-        "workers": [
-            {
-                "slot": lease.slot,
-                "engine": lease.engine,
-                "state": lease.state,
-                "holder": lease.holder,
-                "restarts": lease.restarts,
-                "claimed_at": lease.claimed_at,
-                "last_heartbeat_at": lease.last_heartbeat_at,
-            }
-            for lease in sorted(run.leases, key=lambda candidate: candidate.slot)
-        ],
-    }
-    if target is not None:
-        # Named, never credentialed: a result has to say what it measured.
-        document["target"] = {
-            "name": target.name,
-            "mgmt_url": target.mgmt_url,
-            "web_url": target.web_url,
-            "app": target.app,
-            "owner": target.owner,
-            "api_version": target.api_version,
-            "verify_tls": target.verify_tls,
-        }
-    # The scenario inline, because it can be edited after the run that used it
-    # and a result nobody can reproduce is a screenshot with extra steps. The
-    # digest on the run row is what proves this is the version that ran.
-    try:
-        directory, origin = scenario_path(run.scenario)
-        scenario = load_scenario(directory)
-        files: Dict[str, str] = {}
-        for candidate in ("scenario.yaml", scenario.searches.file if scenario.searches else ""):
-            if candidate and (directory / candidate).is_file():
-                files[candidate] = (directory / candidate).read_text(encoding="utf-8")
-        document["scenario"] = {
-            **scenario_summary(scenario, origin),
-            "digest": run.scenario_digest,
-            "files": files,
-        }
-    except (FileNotFoundError, ScenarioError, OSError) as exc:
-        # A run outlives the scenario that made it, and that is not a reason to
-        # refuse the export. Say which version is missing instead.
-        document["scenario"] = {
-            "name": run.scenario,
-            "digest": run.scenario_digest,
-            "unavailable": str(exc),
-        }
+    document = runarchive.build_document(session, run, target, points=points)
 
     audit_record(
         "run_exported",
@@ -481,5 +425,7 @@ def delete_run(run_id: int, session: Session = Depends(get_session)) -> Response
         raise HTTPException(status_code=404, detail=f"no run with id {run_id}")
     if not is_terminal(run.state):
         raise HTTPException(status_code=409, detail="stop the run before deleting it")
+    # Or the next pull from the config source brings it back.
+    configsource.forget_run(run.uid)
     session.delete(run)
     return Response(status_code=204)
