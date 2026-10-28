@@ -20,6 +20,8 @@ from conftest import FakeEngine, run_async, tiny_scenario_dict
 from regulator_agent.config import load_config
 from regulator_agent.params import ParameterResolver
 from regulator_agent.scenario import RampStage, parse_scenario
+from regulator_agent import scheduler as scheduler_module
+from regulator_agent.results import ERROR_AUTH
 from regulator_agent.scheduler import Ramp, Scheduler
 
 
@@ -242,6 +244,48 @@ def test_a_failing_target_trips_the_error_rate_ceiling(env):
     assert "error rate" in (summary.abort_reason or "")
     # The guard must not fire on the very first failure during startup.
     assert engine.executions >= 20
+
+
+def test_a_refused_search_is_a_result_and_the_run_carries_on(env):
+    """A 401 under load, or a 403 on one search, used to end the whole run."""
+    doc = copy.deepcopy(tiny_scenario_dict())
+    doc["load"] = {"model": "closed", "virtual_users": 2, "duration": "1s"}
+    doc["abort_if"] = {}
+    engine = FakeEngine(latency=0.01, fail_every=3, error_class=ERROR_AUTH)
+
+    _, summary = drive(doc, env, engine)
+
+    assert summary.outcome == "completed"
+    assert summary.abort_reason is None
+    assert summary.stats["errors_by_class"].get(ERROR_AUTH, 0) > 1
+
+
+def test_a_credential_refused_for_long_enough_ends_the_run(env, monkeypatch):
+    """Continuing is right for a refusal, not for a credential that is dead."""
+    monkeypatch.setattr(scheduler_module, "AUTH_REFUSED_ABORT_S", 0.3)
+    doc = copy.deepcopy(tiny_scenario_dict())
+    doc["load"] = {"model": "closed", "virtual_users": 4, "duration": "10s"}
+    doc["abort_if"] = {}
+    engine = FakeEngine(latency=0.01, fail_all=True, error_class=ERROR_AUTH)
+
+    _, summary = drive(doc, env, engine)
+
+    assert summary.outcome == "aborted"
+    assert "authentication refusals" in (summary.abort_reason or "")
+    assert summary.ended_at - summary.started_at < 5
+
+
+def test_one_success_resets_the_refusal_streak(env, monkeypatch):
+    monkeypatch.setattr(scheduler_module, "AUTH_REFUSED_ABORT_S", 0.3)
+    doc = copy.deepcopy(tiny_scenario_dict())
+    doc["load"] = {"model": "closed", "virtual_users": 2, "duration": "1.5s"}
+    doc["abort_if"] = {}
+    # Never more than four refusals in a row, so the streak never reaches ten.
+    engine = FakeEngine(latency=0.01, fail_every=5, error_class=ERROR_AUTH)
+
+    _, summary = drive(doc, env, engine)
+
+    assert summary.outcome == "completed"
 
 
 def test_a_slow_target_trips_the_latency_ceiling(env):

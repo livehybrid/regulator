@@ -140,7 +140,10 @@ jobs:
         run: npm run smoke
 
   browser-test:
-    runs-on: ubuntu-latest
+    # Pinned, not ubuntu-latest: that moved to 26.04, where Playwright 1.55
+    # cannot install chromium. 24.04 (noble) is also what the browser image's
+    # base, mcr.microsoft.com/playwright/python:v1.55.0-noble, runs on.
+    runs-on: ubuntu-24.04
     concurrency:
       group: ${{ github.workflow }}-test-${{ github.event.pull_request.number || github.ref }}-browser
       cancel-in-progress: true

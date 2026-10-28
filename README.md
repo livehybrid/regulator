@@ -1004,6 +1004,14 @@ The last one is different in kind: a worker that cannot keep to its own
 schedule is measuring itself, so the run is stopped and marked **invalid**
 rather than reported as a Splunk result.
 
+A refused search (401 or 403) is a failed step with error class `auth`, and the
+run carries on: a search head under load can fail a token lookup, and a 403 can
+be one search the account may not run. Two cases still end the run. A refused
+**login** (wrong username or password) fails it at once, because every retry is
+another failed login towards an account lockout. And a run whose every search
+has been refused for 60 seconds, at least ten in a row, is `aborted`, because
+by then the credential is plainly dead.
+
 The two target-side guards poll the cluster every 30 seconds, which is noise
 next to any real load test, and three rules keep them from being worse than
 their absence:

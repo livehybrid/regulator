@@ -200,10 +200,12 @@ def export_run(
         "workers": [
             {
                 "slot": lease.slot,
-                "engine": getattr(lease, "engine", None),
+                "engine": lease.engine,
                 "state": lease.state,
                 "holder": lease.holder,
-                "last_seen": lease.last_seen,
+                "restarts": lease.restarts,
+                "claimed_at": lease.claimed_at,
+                "last_heartbeat_at": lease.last_heartbeat_at,
             }
             for lease in sorted(run.leases, key=lambda candidate: candidate.slot)
         ],
