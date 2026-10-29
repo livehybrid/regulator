@@ -30,11 +30,13 @@ from ..db import get_session
 from ..models import Run, Target
 from ..runner import manager
 from ..schemas import (
+    TARGET_SECRET_COLUMNS,
     EvictRequest,
     SavedSearchPreview,
     TargetCreate,
     TargetOut,
     TargetTestResult,
+    TargetUpdate,
 )
 
 log = logging.getLogger("regulator.server.targets")
@@ -170,6 +172,90 @@ def create_target(body: TargetCreate, session: Session = Depends(get_session)) -
     except IntegrityError:
         session.rollback()
         raise HTTPException(status_code=409, detail=f"a target named {body.name!r} already exists")
+    return target
+
+
+# Changing any of these changes what a Test proved, so the health goes back to
+# unknown until the next one.
+_CONNECTION_FIELDS = {"mgmt_url", "token", "username", "password", "verify_tls", "api_version"}
+
+
+@router.patch("/{target_id}", response_model=TargetOut)
+def update_target(
+    target_id: int, body: TargetUpdate, request: Request, session: Session = Depends(get_session)
+) -> Target:
+    """Change a target in place: the id, its runs and its baselines stay.
+
+    The common case is an expired token on a target restored from yesterday's
+    config: send the new token and nothing else. Secrets are write-only; one
+    left out or sent empty is kept, and one named in ``clear`` is removed.
+    """
+    target = _get_target(session, target_id)
+    sent = body.model_dump(exclude_unset=True)
+    clear = set(sent.pop("clear", []) or [])
+    changed = []
+
+    for field_name in ("name", "mgmt_url", "web_url", "verify_tls", "app", "owner", "api_version"):
+        if field_name not in sent:
+            continue
+        value = sent[field_name]
+        if field_name == "web_url":
+            value = value or None  # the one optional field: empty clears it
+        elif value is None:
+            continue
+        if getattr(target, field_name) != value:
+            setattr(target, field_name, value)
+            changed.append(field_name)
+
+    if "indexer_urls" in sent and sent["indexer_urls"] is not None:
+        value = ",".join(sent["indexer_urls"]) or None
+        if target.indexer_urls != value:
+            target.indexer_urls = value
+            changed.append("indexer_urls")
+
+    for field_name in ("username", "indexer_username"):
+        value = (sent.get(field_name) or "").strip()
+        if field_name in clear:
+            if getattr(target, field_name):
+                setattr(target, field_name, None)
+                changed.append(field_name)
+        elif value and getattr(target, field_name) != value:
+            setattr(target, field_name, value)
+            changed.append(field_name)
+
+    for field_name, column in TARGET_SECRET_COLUMNS.items():
+        value = sent.get(field_name) or ""
+        if field_name in clear:
+            if getattr(target, column):
+                setattr(target, column, None)
+                changed.append(field_name)
+        elif value:
+            setattr(target, column, encrypt(value))
+            changed.append(field_name)
+
+    if not (target.token_encrypted or (target.username and target.password_encrypted)):
+        session.rollback()
+        raise HTTPException(
+            status_code=422,
+            detail="this would leave the target with no credential: keep or supply a token, "
+            "or both a username and a password",
+        )
+    if _CONNECTION_FIELDS.intersection(changed):
+        target.health = "unknown"
+        target.health_detail = None
+    session.add(target)
+    try:
+        session.flush()
+        # Committed here for the same reason as create: the caller acts on the
+        # response at once (Test, launch), and teardown would race it.
+        session.commit()
+    except IntegrityError:
+        session.rollback()
+        raise HTTPException(status_code=409, detail=f"a target named {body.name!r} already exists")
+    if changed:
+        # Field names only: a credential's value never reaches the audit log.
+        audit_record("target_updated", request=request, target_id=target.id,
+                     detail=f"{target.name}: {', '.join(sorted(set(changed)))}")
     return target
 
 

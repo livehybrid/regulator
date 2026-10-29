@@ -242,6 +242,11 @@ const ROUTES = {
             health: 'ok',
             health_detail: 'reachable',
             created_at: 1757000000,
+            has_token: true,
+            has_username: false,
+            has_password: false,
+            has_indexer_token: false,
+            has_indexer_password: false,
         },
     ],
     '/scenarios': [
@@ -307,6 +312,15 @@ const ROUTES = {
         summary: null,
     },
     '/runs/7/samples': SAMPLES,
+    '/targets/1': { id: 1, name: 'lab', mgmt_url: 'https://splunk.lab:8089', health: 'unknown' },
+    '/targets/1/test': {
+        ok: true,
+        detail: 'Splunk 10.4.4 (search_head, shc_member)',
+        version: '10.4.4',
+        roles: ['search_head', 'shc_member'],
+        cores: 2,
+        max_hist_searches: 8,
+    },
     '/targets/1/samples': SAMPLES,
     '/targets/1/cache': CACHE,
 };
@@ -612,6 +626,55 @@ const go = async (hash) => {
     clickByText('Add target', 'open the add-target form');
     await settle();
     await check('add target form', 'A bearer token is preferred');
+
+    clickByText('Cancel', 'close the add-target form');
+    await settle();
+
+    // Test lays out what it found as labelled facts, not one squashed line.
+    clickByText('Test', 'test a target');
+    await check('test result: version', '10.4.4');
+    await check('test result: ceiling', '8 concurrent historical searches');
+    await check('test result: labelled', 'Search ceiling');
+
+    // Edit a target: replace an expired token without retyping anything else.
+    {
+        const row = Array.from(window.document.querySelectorAll('tr')).find((r) =>
+            (r.textContent || '').includes('https://splunk.lab:8089')
+        );
+        const toggle = row && row.querySelector('[data-test="actions-secondary-toggle"]');
+        if (!toggle) {
+            problems.push('targets: no row actions menu');
+        } else {
+            toggle.dispatchEvent(new window.MouseEvent('click', { bubbles: true, cancelable: true }));
+            await settle();
+            clickByText('Edit…', 'open the edit-target form');
+            await check('edit target form', 'leave a credential blank to keep the stored one');
+            await check('edit target form: stored token', 'Remove the stored token');
+            const label = Array.from(window.document.querySelectorAll('label')).find(
+                (n) => (n.textContent || '').trim() === 'Bearer token'
+            );
+            const group = label && label.closest('[data-test="control-group"]');
+            const input = group && group.querySelector('input');
+            if (!input) {
+                problems.push('edit target form: no token input');
+            } else {
+                const setter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value').set;
+                setter.call(input, 'a-fresh-token');
+                input.dispatchEvent(new window.Event('input', { bubbles: true }));
+                input.dispatchEvent(new window.Event('change', { bubbles: true }));
+                await settle(100);
+                clickByText('Save changes', 'save the target');
+                await waitFor('edit target: sends only the new token', () =>
+                    posted.some(
+                        (p) =>
+                            p.method === 'PATCH' &&
+                            p.url.endsWith('/targets/1') &&
+                            JSON.stringify(p.body) === JSON.stringify({ token: 'a-fresh-token' })
+                    )
+                );
+            }
+        }
+    }
 
     clickByText('Launch a run', 'open the launch dialog');
     await settle(400);
