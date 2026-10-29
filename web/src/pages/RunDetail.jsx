@@ -32,6 +32,7 @@ import PurgeModal from '../modals/PurgeModal';
 import RunCharts from '../components/RunCharts';
 import SutSection from '../components/SutSection';
 import WorkersSection from '../components/WorkersSection';
+import { loadText } from './Runs';
 import {
     Mono,
     Muted,
@@ -64,6 +65,19 @@ const freshSeries = (id) => ({
     startedAt: null,
     loaded: false,
 });
+
+/** "2 workers · pacing 5 s", or nothing to add for a single in-process run. */
+function loadSub(run) {
+    const p = run.planned || {};
+    const bits = [];
+    if (p.workers && p.workers > 1) {
+        bits.push(`${fmtInt(p.workers)} workers`);
+    }
+    if (p.pacing_s) {
+        bits.push(`pacing ${fmtNum(p.pacing_s, 1)} s`);
+    }
+    return bits.length ? bits.join(' · ') : p.load_model === 'open' ? 'open model' : 'closed model';
+}
 
 export default function RunDetail({ runId, navigate, onLaunch }) {
     const [run, setRun] = useState(null);
@@ -479,6 +493,12 @@ export default function RunDetail({ runId, navigate, onLaunch }) {
             {quiet}
 
             <TileGrid>
+                <TimeTile run={run} elapsed={stats.elapsed_s} />
+                <Tile
+                    label="Load"
+                    value={loadText(run)}
+                    sub={loadSub(run)}
+                />
                 <Tile
                     label="Executions"
                     value={fmtInt(stats.executions)}
@@ -761,3 +781,45 @@ RunDetail.propTypes = {
     navigate: PropTypes.func.isRequired,
     onLaunch: PropTypes.func.isRequired,
 };
+
+/**
+ * How long is left while a run runs, how long it ran once it has finished.
+ * The elapsed figure already excludes time spent paused (the clock stops), so
+ * remaining is simply the planned duration less it.
+ */
+export function TimeTile({ run, elapsed }) {
+    const duration = (run.planned || {}).duration_s;
+    const running = run.state === 'running';
+    if (!running) {
+        return (
+            <Tile
+                label="Ran for"
+                value={fmtDur(elapsed)}
+                sub={isBlank(duration) ? 'no set duration' : `of ${fmtDur(duration)} planned`}
+            />
+        );
+    }
+    if (isBlank(duration)) {
+        return <Tile label="Remaining" value="until stopped" sub={`${fmtDur(elapsed)} elapsed`} />;
+    }
+    const remaining = Math.max(0, duration - (elapsed || 0));
+    if (remaining <= 0) {
+        return (
+            <Tile
+                label="Remaining"
+                value="finishing"
+                sub="duration reached; in-flight searches are draining"
+            />
+        );
+    }
+    return (
+        <Tile
+            label="Remaining"
+            value={fmtDur(remaining)}
+            sub={`of ${fmtDur(duration)}${run.paused ? ', clock stopped while paused' : ` · ${fmtDur(elapsed)} elapsed`}`}
+        />
+    );
+}
+
+TimeTile.propTypes = { run: PropTypes.object.isRequired, elapsed: PropTypes.number };
+

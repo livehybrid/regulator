@@ -72,6 +72,7 @@ const RUN = {
     created_at: 1757000000,
     started_at: 1757000000,
     cold_window_s: 300,
+    planned: { load_model: 'closed', virtual_users: 2, duration_s: 600, workers: 2, pacing_s: 5 },
     stats: {
         executions: 1200,
         errors: 3,
@@ -277,14 +278,26 @@ const ROUTES = {
             target_name: 'lab',
             state: 'completed',
             created_at: 1757000000,
+            planned: { load_model: 'closed', virtual_users: 2, duration_s: 600, workers: 1 },
             headline: {
                 executions: 1200,
                 p95_ms: 1450,
+                p99_ms: 2600,
                 error_rate_pct: 0.25,
                 searches_queued: 12,
                 valid: true,
                 cache_provenance: 'cold',
             },
+        },
+        {
+            id: 6,
+            label: 'one user',
+            scenario: 'dashboard-triage',
+            target_name: 'lab',
+            state: 'completed',
+            created_at: 1756990000,
+            planned: { load_model: 'closed', virtual_users: 1, duration_s: 600, workers: 1 },
+            headline: { executions: 600, p95_ms: 980, p99_ms: 1730, valid: true },
         },
     ],
     '/runs/sparklines': { 7: [100, 200, 180, 260] },
@@ -531,9 +544,32 @@ const go = async (hash) => {
 
     await go('#runs');
     await check('runs', 'smoke run');
+    // The setting two runs differ by is a column, not a click away.
+    await check('runs: load column, two users', '2 users');
+    await check('runs: load column, one user', '1 user');
+    clickByText('Columns', 'open the column picker');
+    await settle();
+    {
+        const wrap = Array.from(window.document.querySelectorAll('[data-test="checkbox"]')).find(
+            (n) => (n.textContent || '').trim() === 'p99'
+        );
+        const box = wrap && (wrap.querySelector('[role="checkbox"], input, button') || wrap);
+        if (!box) {
+            problems.push(`runs: column picker has no p99 option (${window.document.querySelectorAll('[data-test="checkbox"]').length} checkboxes)`);
+        } else {
+            box.dispatchEvent(new window.MouseEvent('click', { bubbles: true, cancelable: true }));
+            await settle();
+            await check('runs: p99 column shown once ticked', '1.73 s');
+            await waitFor('runs: the column choice is remembered', () =>
+                (window.localStorage.getItem('regulator.runs.columns') || '').includes('p99')
+            );
+        }
+    }
 
     await go('#run/7');
     await check('run: tiles', 'Peak in flight');
+    await check('run: a finished run says how long it ran', 'of 10m 0s planned');
+    await check('run: load tile', '2 workers · pacing 5.0 s');
     await check('run: queueing banner', 'Queueing observed');
     await check('run: cache provenance banner', 'Cache provenance: cold');
     await check('run: steps', 'triage.overview');
@@ -593,6 +629,8 @@ const go = async (hash) => {
 
     await go('#run/8');
     await check('run: paused banner', 'the run clock is stopped');
+    await check('run: time remaining', '5m 15s');
+    await check('run: remaining clock stopped', 'clock stopped while paused');
     await check('run: note shown', 'held while indexer 3 restarts');
     await waitFor('run: resume button', () =>
         Array.from(window.document.querySelectorAll('button')).some((b) => (b.textContent || '').trim() === 'Resume')

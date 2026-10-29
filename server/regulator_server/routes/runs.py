@@ -43,6 +43,10 @@ def _headline(stats: Optional[Dict[str, Any]], summary: Optional[Dict[str, Any]]
         "throughput_per_s": stats.get("throughput_per_s"),
         "p95_ms": (stats.get("latency") or {}).get("p95_ms"),
         "searches_queued": (stats.get("queueing") or {}).get("searches_queued"),
+        "p50_ms": (stats.get("latency") or {}).get("p50_ms"),
+        "p99_ms": (stats.get("latency") or {}).get("p99_ms"),
+        "elapsed_s": stats.get("elapsed_s"),
+        "peak_virtual_users": summary.get("peak_virtual_users"),
         "valid": summary.get("valid"),
         "invalid_reason": summary.get("invalid_reason"),
         "outcome": summary.get("outcome"),
@@ -51,7 +55,68 @@ def _headline(stats: Optional[Dict[str, Any]], summary: Optional[Dict[str, Any]]
     }
 
 
-def _serialise(run: Run, target_name: Optional[str] = None, full: bool = True) -> Dict[str, Any]:
+def _scenario_load(name: Optional[str], cache: Optional[Dict[str, Any]]) -> Any:
+    """The scenario's own load model, or None if it is gone from the library."""
+    if not name:
+        return None
+    if cache is not None and name in cache:
+        return cache[name]
+    try:
+        load = load_named_scenario(name).load
+    except Exception:  # noqa: BLE001 - a deleted or broken scenario just leaves gaps
+        load = None
+    if cache is not None:
+        cache[name] = load
+    return load
+
+
+def _planned(run: Run, summary: Optional[Dict[str, Any]], cache: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    """What the run was asked to do, with the scenario's defaults filled in.
+
+    A run launched without overrides stores no virtual users or duration of
+    its own, so the list could not say that one run had one user and the next
+    two. Resolved in order: what the launch set; for an in-process run, what
+    its summary recorded it actually configured; then the scenario as it is
+    now (which may have been edited since a run that predates the summary).
+    """
+    configured = {}
+    if (run.fleet or "inprocess") == "inprocess":
+        configured = (summary or {}).get("configured_load") or {}
+    load = None
+
+    def scenario_value(attr: str) -> Any:
+        nonlocal load
+        if load is None:
+            load = _scenario_load(run.scenario, cache) or False
+        return getattr(load, attr, None) if load else None
+
+    def pick(field_name: str, own: Any) -> Any:
+        if own:
+            return own
+        if configured.get(field_name):
+            return configured[field_name]
+        return scenario_value(field_name) or None
+
+    open_model = bool(run.arrival_rate_per_min) or (
+        not run.virtual_users
+        and ((summary or {}).get("load_model") or scenario_value("model")) == "open"
+    )
+    return {
+        "load_model": "open" if open_model else "closed",
+        "virtual_users": None if open_model else pick("virtual_users", run.virtual_users),
+        "arrival_rate_per_min": pick("arrival_rate_per_min", run.arrival_rate_per_min) if open_model else None,
+        "pacing_s": pick("pacing_s", run.pacing_s),
+        "duration_s": pick("duration_s", run.duration_s),
+        "workers": run.workers or 1,
+    }
+
+
+def _serialise(
+    run: Run,
+    target_name: Optional[str] = None,
+    full: bool = True,
+    scenario_cache: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
     """One run as the UI wants it.
 
     While a run is in flight the live aggregate comes from the manager rather
@@ -89,6 +154,7 @@ def _serialise(run: Run, target_name: Optional[str] = None, full: bool = True) -
         "paused": run.paused_at is not None and not is_terminal(run.state),
         "paused_s": round(paused_seconds(run), 1) if (run.paused_at or run.paused_s) else 0.0,
         "load_override": run.load_override,
+        "planned": _planned(run, run.summary_json, scenario_cache),
     }
     if full:
         from ..samples import markers_for
@@ -114,7 +180,8 @@ def get_runs(
         .offset(max(0, offset))
         .limit(max(1, min(limit, 500)))
     ).all()
-    return [_serialise(run, name, full=False) for run, name in rows]
+    scenarios: Dict[str, Any] = {}
+    return [_serialise(run, name, full=False, scenario_cache=scenarios) for run, name in rows]
 
 
 @router.get("/runs/sparklines")
