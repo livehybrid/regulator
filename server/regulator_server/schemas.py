@@ -32,6 +32,47 @@ _LABEL_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
 _SCENARIO_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 
 
+def _clean_indexer_urls(value: Optional[List[str]]) -> Optional[List[str]]:
+    if value is None:
+        return None
+    cleaned = []
+    for url in value:
+        url = (url or "").strip()
+        if not url:
+            continue
+        if not (url.startswith("http://") or url.startswith("https://")):
+            raise ValueError(f"indexer URL {url!r} must start with http:// or https://")
+        if urlsplit(url).username or urlsplit(url).password:
+            raise ValueError("an indexer URL must not embed a credential")
+        cleaned.append(url.rstrip("/"))
+    return cleaned
+
+
+def _clean_url(value: Optional[str]) -> Optional[str]:
+    if value is None:
+        return None
+    if not (value.startswith("http://") or value.startswith("https://")):
+        raise ValueError("must start with http:// or https://")
+    # A credential in the URL would be echoed back: the base URL appears in
+    # transport exception messages, which land in health_detail and in a
+    # run's error, both of which are returned by the API and rendered in
+    # the UI. Credentials belong in the token or password field, which is
+    # write-only by construction.
+    parts = urlsplit(value)
+    if parts.username or parts.password:
+        raise ValueError(
+            "a URL must not embed a username or password: put the credential in the "
+            "token, or the username and password fields, which are never returned"
+        )
+    return value.rstrip("/")
+
+
+def _known_api_version(value: Optional[str]) -> Optional[str]:
+    if value is not None and value not in ("v1", "v2"):
+        raise ValueError("must be v1 or v2")
+    return value
+
+
 class TargetCreate(BaseModel):
     name: str = Field(min_length=1, max_length=128)
     mgmt_url: str
@@ -57,44 +98,17 @@ class TargetCreate(BaseModel):
     @field_validator("indexer_urls")
     @classmethod
     def _indexers_http_only(cls, value: List[str]) -> List[str]:
-        cleaned = []
-        for url in value:
-            url = (url or "").strip()
-            if not url:
-                continue
-            if not (url.startswith("http://") or url.startswith("https://")):
-                raise ValueError(f"indexer URL {url!r} must start with http:// or https://")
-            if urlsplit(url).username or urlsplit(url).password:
-                raise ValueError("an indexer URL must not embed a credential")
-            cleaned.append(url.rstrip("/"))
-        return cleaned
+        return _clean_indexer_urls(value)
 
     @field_validator("mgmt_url", "web_url")
     @classmethod
     def _http_only(cls, value: Optional[str]) -> Optional[str]:
-        if value is None:
-            return None
-        if not (value.startswith("http://") or value.startswith("https://")):
-            raise ValueError("must start with http:// or https://")
-        # A credential in the URL would be echoed back: the base URL appears in
-        # transport exception messages, which land in health_detail and in a
-        # run's error, both of which are returned by the API and rendered in
-        # the UI. Credentials belong in the token or password field, which is
-        # write-only by construction.
-        parts = urlsplit(value)
-        if parts.username or parts.password:
-            raise ValueError(
-                "a URL must not embed a username or password: put the credential in the "
-                "token, or the username and password fields, which are never returned"
-            )
-        return value.rstrip("/")
+        return _clean_url(value)
 
     @field_validator("api_version")
     @classmethod
     def _known_version(cls, value: str) -> str:
-        if value not in ("v1", "v2"):
-            raise ValueError("must be v1 or v2")
-        return value
+        return _known_api_version(value)
 
     def check_credentials(self) -> None:
         if not self.token and not (self.username and self.password):
@@ -118,7 +132,80 @@ class TargetOut(BaseModel):
     indexer_urls: Optional[str] = None
     indexer_username: Optional[str] = None
     # Deliberately absent: token, username, password, and their indexer
-    # counterparts. There is no field to accidentally populate.
+    # counterparts. There is no field to accidentally populate. What the edit
+    # form needs is only whether one is stored, so it can say "stored, leave
+    # blank to keep".
+    has_token: bool = False
+    has_username: bool = False
+    has_password: bool = False
+    has_indexer_token: bool = False
+    has_indexer_password: bool = False
+
+
+# A target's write-only secrets, and the column each is stored encrypted in.
+TARGET_SECRET_COLUMNS = {
+    "token": "token_encrypted",
+    "password": "password_encrypted",
+    "indexer_token": "indexer_token_encrypted",
+    "indexer_password": "indexer_password_encrypted",
+}
+
+
+class TargetUpdate(BaseModel):
+    """A change to an existing target. Only the fields sent are changed.
+
+    Secrets are write-only, as on create: a secret left out (or sent empty)
+    keeps the stored one, a new value replaces it, and a secret named in
+    ``clear`` is removed. So an expired token is replaced without retyping
+    anything else, and the id, the runs against it and its baselines stay.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    name: Optional[str] = Field(default=None, min_length=1, max_length=128)
+    mgmt_url: Optional[str] = None
+    web_url: Optional[str] = None
+    token: Optional[str] = None
+    username: Optional[str] = None
+    password: Optional[str] = None
+    verify_tls: Optional[bool] = None
+    app: Optional[str] = Field(default=None, min_length=1, max_length=128)
+    owner: Optional[str] = Field(default=None, min_length=1, max_length=128)
+    api_version: Optional[str] = None
+    indexer_urls: Optional[List[str]] = None
+    indexer_token: Optional[str] = None
+    indexer_username: Optional[str] = None
+    indexer_password: Optional[str] = None
+    clear: List[str] = Field(default_factory=list)
+
+    @field_validator("indexer_urls")
+    @classmethod
+    def _indexers_http_only(cls, value: Optional[List[str]]) -> Optional[List[str]]:
+        return _clean_indexer_urls(value)
+
+    @field_validator("mgmt_url")
+    @classmethod
+    def _mgmt_url(cls, value: Optional[str]) -> Optional[str]:
+        return _clean_url(value)
+
+    @field_validator("web_url")
+    @classmethod
+    def _web_url(cls, value: Optional[str]) -> Optional[str]:
+        # Empty clears the optional web URL.
+        return _clean_url(value) if value else value
+
+    @field_validator("api_version")
+    @classmethod
+    def _known_version(cls, value: Optional[str]) -> Optional[str]:
+        return _known_api_version(value)
+
+    @field_validator("clear")
+    @classmethod
+    def _clearable(cls, value: List[str]) -> List[str]:
+        unknown = sorted(set(value) - set(TARGET_SECRET_COLUMNS) - {"username", "indexer_username"})
+        if unknown:
+            raise ValueError(f"cannot clear {', '.join(unknown)}: only credentials can be cleared")
+        return value
 
 
 class TargetTestResult(BaseModel):

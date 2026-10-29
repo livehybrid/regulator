@@ -13,6 +13,8 @@ import P from '@splunk/react-ui/Paragraph';
 import Table from '@splunk/react-ui/Table';
 import Text from '@splunk/react-ui/Text';
 import WaitSpinner from '@splunk/react-ui/WaitSpinner';
+import styled from 'styled-components';
+import { variables } from '@splunk/themes';
 
 import BusyButton from '../components/BusyButton';
 import CacheModal from '../modals/CacheModal';
@@ -56,10 +58,89 @@ const EMPTY_TARGET = {
     verify_tls: true,
 };
 
+// The write-only credentials. An edit sends one only when it was typed, so a
+// blank field keeps what is stored.
+const SECRETS = ['token', 'password', 'indexer_token', 'indexer_password'];
+// Sent on an edit only when it differs from what the target has now.
+const PLAIN = ['name', 'mgmt_url', 'web_url', 'app', 'owner', 'api_version', 'verify_tls'];
+
+/** The form's starting values: blank for a new target, the target's own for an edit. */
+function formFrom(target) {
+    if (!target) {
+        return EMPTY_TARGET;
+    }
+    return {
+        ...EMPTY_TARGET,
+        name: target.name || '',
+        mgmt_url: target.mgmt_url || '',
+        web_url: target.web_url || '',
+        app: target.app || '',
+        owner: target.owner || '',
+        api_version: target.api_version || '',
+        indexer_urls: (target.indexer_urls || '').split(',').filter(Boolean).join(', '),
+        indexer_username: target.indexer_username || '',
+        verify_tls: target.verify_tls !== false,
+    };
+}
+
+function splitUrls(text) {
+    return (text || '')
+        .split(',')
+        .map((x) => x.trim())
+        .filter(Boolean);
+}
+
+/** A table cell with more than one line: Splunk's cells lay children out in a row. */
+const Stack = styled.div`
+    display: flex;
+    flex-direction: column;
+    align-items: flex-start;
+    gap: 2px;
+    min-width: 0;
+`;
+
+const ResultHead = styled.div`
+    display: flex;
+    align-items: center;
+    gap: ${variables.spacingSmall};
+    flex-wrap: wrap;
+
+    & > :first-child {
+        flex-shrink: 0;
+    }
+`;
+
+/** A form field with a control under it: ControlGroup lays its children in a row. */
+const Field = styled.div`
+    display: flex;
+    flex-direction: column;
+    gap: ${variables.spacingXSmall};
+    width: 100%;
+`;
+
+/** What a Test found, as label and value pairs rather than one run-on line. */
+const Facts = styled.dl`
+    display: grid;
+    grid-template-columns: max-content minmax(0, 1fr);
+    gap: ${variables.spacingXSmall} ${variables.spacingLarge};
+    margin: ${variables.spacingSmall} 0 0;
+
+    dt {
+        color: ${variables.contentColorMuted};
+    }
+    dd {
+        margin: 0;
+        display: flex;
+        flex-wrap: wrap;
+        gap: ${variables.spacingXSmall};
+    }
+`;
+
 export default function Targets({ navigate, onLaunch }) {
     const { data, error, loading, reload } = useLoader(() => api('/targets'), []);
     const targets = data || [];
     const [adding, setAdding] = useState(false);
+    const [editing, setEditing] = useState(null);
     const [tests, setTests] = useState({});
     const [expanded, setExpanded] = useState(null);
     const [dialog, setDialog] = useState(null);
@@ -93,7 +174,10 @@ export default function Targets({ navigate, onLaunch }) {
                 <Toolbar>
                     <Button
                         label={adding ? 'Cancel' : 'Add target'}
-                        onClick={() => setAdding((v) => !v)}
+                        onClick={() => {
+                            setEditing(null);
+                            setAdding((v) => !v);
+                        }}
                     />
                     <Button
                         appearance="primary"
@@ -104,11 +188,24 @@ export default function Targets({ navigate, onLaunch }) {
             </PageHead>
 
             {adding && (
-                <AddTargetForm
+                <TargetForm
                     onCancel={() => setAdding(false)}
-                    onCreated={() => {
+                    onSaved={() => {
                         setAdding(false);
                         notify('Target created', 'success');
+                        reload();
+                    }}
+                />
+            )}
+            {editing && (
+                <TargetForm
+                    key={editing.id}
+                    target={editing}
+                    onCancel={() => setEditing(null)}
+                    onSaved={(saved) => {
+                        setEditing(null);
+                        setTests((t) => ({ ...t, [saved.id]: undefined }));
+                        notify(`Target ${saved.name} updated. Test it to check the change.`, 'success');
                         reload();
                     }}
                 />
@@ -165,6 +262,16 @@ export default function Targets({ navigate, onLaunch }) {
                                     }
                                     actionsSecondary={
                                         <Menu>
+                                            <Menu.Item
+                                                onClick={(e, row) => {
+                                                    setAdding(false);
+                                                    setEditing(row);
+                                                    window.scrollTo({ top: 0, behavior: 'smooth' });
+                                                }}
+                                            >
+                                                Edit…
+                                            </Menu.Item>
+                                            <Menu.Divider />
                                             <Menu.Item
                                                 onClick={(e, row) =>
                                                     openWith('report', row, () =>
@@ -234,26 +341,23 @@ export default function Targets({ navigate, onLaunch }) {
                                 >
                                     <Table.Cell>{t.name || '(unnamed)'}</Table.Cell>
                                     <Table.Cell>
-                                        <Mono $break>{t.mgmt_url || ''}</Mono>
-                                        {t.web_url && (
-                                            <div>
-                                                <Muted $small>{t.web_url}</Muted>
-                                            </div>
-                                        )}
+                                        <Stack>
+                                            <Mono $break>{t.mgmt_url || ''}</Mono>
+                                            {t.web_url && <Muted $small>web {t.web_url}</Muted>}
+                                        </Stack>
                                     </Table.Cell>
                                     <Table.Cell>
-                                        <Mono>
-                                            {t.app || '–'}
-                                            {t.owner ? ` / ${t.owner}` : ''}
-                                        </Mono>
-                                        {t.indexer_urls && (
-                                            <div>
+                                        <Stack>
+                                            <Mono>
+                                                {t.app || '–'}
+                                                {t.owner ? ` / ${t.owner}` : ''}
+                                            </Mono>
+                                            {t.indexer_urls && (
                                                 <Muted $small>
-                                                    {String(t.indexer_urls).split(',').length}{' '}
-                                                    indexer(s)
+                                                    {splitUrls(t.indexer_urls).length} indexer(s)
                                                 </Muted>
-                                            </div>
-                                        )}
+                                            )}
+                                        </Stack>
                                     </Table.Cell>
                                     <Table.Cell>
                                         <Chip appearance={t.verify_tls === false ? 'warning' : 'success'}>
@@ -359,81 +463,134 @@ function TestResult({ result }) {
     }
     if (!result.ok) {
         return (
-            <>
-                <Chip appearance="error">failed</Chip>{' '}
-                <Mono>{result.detail || 'no detail given'}</Mono>
-            </>
+            <div>
+                <ResultHead>
+                    <Chip appearance="error">failed</Chip>
+                    <Mono $break>{result.detail || 'no detail given'}</Mono>
+                </ResultHead>
+            </div>
         );
     }
-    const bits = [];
-    if (result.version) {
-        bits.push(`version ${result.version}`);
-    }
-    if (result.roles && result.roles.length) {
-        bits.push(`roles ${result.roles.join(', ')}`);
-    }
-    if (!isBlank(result.cores)) {
-        bits.push(`${result.cores} cores`);
-    }
-    if (!isBlank(result.max_hist_searches)) {
-        bits.push(`ceiling ${fmtInt(result.max_hist_searches)} concurrent historical searches`);
-    }
     return (
-        <>
-            <Chip appearance="success">reachable</Chip> <Mono>{bits.join(' · ')}</Mono>{' '}
-            {result.detail && <Muted>{result.detail}</Muted>}
-        </>
+        <div>
+            <ResultHead>
+                <Chip appearance="success">reachable</Chip>
+                <Muted>Regulator reached splunkd and read what it can run.</Muted>
+            </ResultHead>
+            <Facts>
+                <dt>Version</dt>
+                <dd>
+                    <Mono>{result.version || '–'}</Mono>
+                </dd>
+                <dt>Roles</dt>
+                <dd>
+                    {result.roles && result.roles.length ? (
+                        result.roles.map((role) => (
+                            <Chip key={role} appearance="outline">
+                                {role}
+                            </Chip>
+                        ))
+                    ) : (
+                        <Muted>none reported</Muted>
+                    )}
+                </dd>
+                <dt>Cores</dt>
+                <dd>{isBlank(result.cores) ? '–' : fmtInt(result.cores)}</dd>
+                <dt>Search ceiling</dt>
+                <dd>
+                    {isBlank(result.max_hist_searches)
+                        ? '–'
+                        : `${fmtInt(result.max_hist_searches)} concurrent historical searches`}
+                </dd>
+            </Facts>
+        </div>
     );
 }
 
 TestResult.propTypes = { result: PropTypes.object };
 
-/** The add form: a Splunk instance and, optionally, the indexers behind it. */
-function AddTargetForm({ onCancel, onCreated }) {
-    const [form, setForm] = useState(EMPTY_TARGET);
+/**
+ * The add and edit form: a Splunk instance and, optionally, the indexers behind it.
+ *
+ * Editing keeps the target's id, so its runs, re-runs and baselines stay with
+ * it. Credentials are never sent back by the API, so on an edit each secret
+ * field starts blank: left blank it keeps what is stored, typed it replaces
+ * it, and "Remove" drops it (say, moving from a password to a token).
+ */
+function TargetForm({ target, onCancel, onSaved }) {
+    const editing = Boolean(target);
+    const [form, setForm] = useState(() => formFrom(target));
+    const [clear, setClear] = useState({});
     const set = (k) => (e, data) => setForm((f) => ({ ...f, [k]: data.value }));
+    const toggleClear = (k) => setClear((c) => ({ ...c, [k]: !c[k] }));
 
-    const create = async () => {
-        const body = {
-            name: form.name,
-            mgmt_url: form.mgmt_url,
-            verify_tls: form.verify_tls,
-        };
-        [
-            'web_url',
-            'token',
-            'username',
-            'password',
-            'app',
-            'owner',
-            'api_version',
-            'indexer_token',
-            'indexer_username',
-            'indexer_password',
-        ].forEach((k) => {
+    const stored = (k) => editing && target[`has_${k}`];
+    const secretProps = (k) => ({
+        placeholder: stored(k) ? 'Stored. Leave blank to keep it.' : '',
+        disabled: Boolean(clear[k]),
+    });
+
+    const createBody = () => {
+        const body = { name: form.name, mgmt_url: form.mgmt_url, verify_tls: form.verify_tls };
+        ['web_url', 'username', 'app', 'owner', 'api_version', 'indexer_username', ...SECRETS].forEach((k) => {
             const v = (form[k] || '').trim();
             if (v) {
                 body[k] = v;
             }
         });
-        const idx = form.indexer_urls
-            .split(',')
-            .map((x) => x.trim())
-            .filter(Boolean);
+        const idx = splitUrls(form.indexer_urls);
         if (idx.length) {
             body.indexer_urls = idx;
         }
-        await api('/targets', { method: 'POST', body });
-        setForm(EMPTY_TARGET);
-        onCreated();
+        return body;
     };
 
+    const editBody = () => {
+        const before = formFrom(target);
+        const body = {};
+        PLAIN.forEach((k) => {
+            const v = typeof form[k] === 'string' ? form[k].trim() : form[k];
+            if (v !== before[k] && (v !== '' || k === 'web_url')) {
+                body[k] = v;
+            }
+        });
+        if (splitUrls(form.indexer_urls).join(',') !== splitUrls(before.indexer_urls).join(',')) {
+            body.indexer_urls = splitUrls(form.indexer_urls);
+        }
+        ['username', 'indexer_username', ...SECRETS].forEach((k) => {
+            const v = (form[k] || '').trim();
+            if (v && !clear[k]) {
+                body[k] = v;
+            }
+        });
+        const cleared = Object.keys(clear).filter((k) => clear[k]);
+        if (cleared.length) {
+            body.clear = cleared;
+        }
+        return body;
+    };
+
+    const save = async () => {
+        const saved = editing
+            ? await api(`/targets/${encodeURIComponent(target.id)}`, { method: 'PATCH', body: editBody() })
+            : await api('/targets', { method: 'POST', body: createBody() });
+        setForm(EMPTY_TARGET);
+        onSaved(saved);
+    };
+
+    const removeBox = (k, label) =>
+        stored(k) && (
+            <Checkbox checked={Boolean(clear[k])} onChange={() => toggleClear(k)}>
+                {label}
+            </Checkbox>
+        );
+
     return (
-        <Panel title="Add a target">
+        <Panel title={editing ? `Edit target ${target.name}` : 'Add a target'}>
             <Note>
-                A bearer token is preferred over a username and password: it can be scoped, revoked
-                and never puts an account password in the store. Fill in either the token or both
-                credential fields.
+                {editing
+                    ? 'Only what you change is saved. Credentials are never shown: leave a credential blank to keep the stored one, or type a new one to replace it, for example a token that has expired. The target keeps its id, so its runs and baselines stay with it.'
+                    : 'A bearer token is preferred over a username and password: it can be scoped, revoked and never puts an account password in the store. Fill in either the token or both credential fields.'}
             </Note>
             <Grid2>
                 <ControlGroup label="Name" labelPosition="top">
@@ -458,18 +615,49 @@ function AddTargetForm({ onCancel, onCreated }) {
                     />
                 </ControlGroup>
                 <ControlGroup label="Bearer token" labelPosition="top" help="Preferred.">
-                    <Text type="password" value={form.token} autoComplete="off" onChange={set('token')} />
+                    <Field>
+                        <Text
+                            type="password"
+                            value={form.token}
+                            autoComplete="off"
+                            onChange={set('token')}
+                            {...secretProps('token')}
+                        />
+                        {removeBox('token', 'Remove the stored token')}
+                    </Field>
                 </ControlGroup>
                 <ControlGroup label="Username" labelPosition="top" help="Only without a token.">
-                    <Text value={form.username} autoComplete="off" onChange={set('username')} />
+                    <Text
+                        value={form.username}
+                        autoComplete="off"
+                        onChange={set('username')}
+                        {...secretProps('username')}
+                    />
                 </ControlGroup>
                 <ControlGroup label="Password" labelPosition="top" help="Only without a token.">
-                    <Text
-                        type="password"
-                        value={form.password}
-                        autoComplete="new-password"
-                        onChange={set('password')}
-                    />
+                    <Field>
+                        <Text
+                            type="password"
+                            value={form.password}
+                            autoComplete="new-password"
+                            onChange={set('password')}
+                            {...secretProps('password')}
+                        />
+                        {stored('password') && (
+                            <Checkbox
+                                checked={Boolean(clear.password)}
+                                onChange={() =>
+                                    setClear((c) => ({
+                                        ...c,
+                                        password: !c.password,
+                                        username: !c.password,
+                                    }))
+                                }
+                            >
+                                Remove the stored username and password
+                            </Checkbox>
+                        )}
+                    </Field>
                 </ControlGroup>
                 <ControlGroup label="App context" labelPosition="top">
                     <Text value={form.app} placeholder="search" onChange={set('app')} />
@@ -501,12 +689,16 @@ function AddTargetForm({ onCancel, onCreated }) {
                     />
                 </ControlGroup>
                 <ControlGroup label="Indexer bearer token" labelPosition="top">
-                    <Text
-                        type="password"
-                        value={form.indexer_token}
-                        autoComplete="off"
-                        onChange={set('indexer_token')}
-                    />
+                    <Field>
+                        <Text
+                            type="password"
+                            value={form.indexer_token}
+                            autoComplete="off"
+                            onChange={set('indexer_token')}
+                            {...secretProps('indexer_token')}
+                        />
+                        {removeBox('indexer_token', 'Remove the stored indexer token')}
+                    </Field>
                 </ControlGroup>
                 <ControlGroup label="Indexer username" labelPosition="top">
                     <Text
@@ -516,12 +708,16 @@ function AddTargetForm({ onCancel, onCreated }) {
                     />
                 </ControlGroup>
                 <ControlGroup label="Indexer password" labelPosition="top">
-                    <Text
-                        type="password"
-                        value={form.indexer_password}
-                        autoComplete="new-password"
-                        onChange={set('indexer_password')}
-                    />
+                    <Field>
+                        <Text
+                            type="password"
+                            value={form.indexer_password}
+                            autoComplete="new-password"
+                            onChange={set('indexer_password')}
+                            {...secretProps('indexer_password')}
+                        />
+                        {removeBox('indexer_password', 'Remove the stored indexer password')}
+                    </Field>
                 </ControlGroup>
             </Grid2>
 
@@ -533,14 +729,19 @@ function AddTargetForm({ onCancel, onCreated }) {
             </Checkbox>
 
             <Toolbar>
-                <BusyButton appearance="primary" label="Create target" onClick={create} />
+                <BusyButton
+                    appearance="primary"
+                    label={editing ? 'Save changes' : 'Create target'}
+                    onClick={save}
+                />
                 <Button appearance="secondary" label="Cancel" onClick={onCancel} />
             </Toolbar>
         </Panel>
     );
 }
 
-AddTargetForm.propTypes = {
+TargetForm.propTypes = {
+    target: PropTypes.object,
     onCancel: PropTypes.func.isRequired,
-    onCreated: PropTypes.func.isRequired,
+    onSaved: PropTypes.func.isRequired,
 };

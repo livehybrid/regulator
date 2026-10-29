@@ -62,6 +62,28 @@ class Target(Base):
     indexer_username: Mapped[Optional[str]] = mapped_column(String(128), nullable=True)
     indexer_password_encrypted: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
 
+    # Whether each credential is stored, never what it is: the edit form shows
+    # "stored, leave blank to keep" from these.
+    @property
+    def has_token(self) -> bool:
+        return bool(self.token_encrypted)
+
+    @property
+    def has_username(self) -> bool:
+        return bool(self.username)
+
+    @property
+    def has_password(self) -> bool:
+        return bool(self.password_encrypted)
+
+    @property
+    def has_indexer_token(self) -> bool:
+        return bool(self.indexer_token_encrypted)
+
+    @property
+    def has_indexer_password(self) -> bool:
+        return bool(self.indexer_password_encrypted)
+
 
 class Run(Base):
     """One execution of a scenario against a target.
