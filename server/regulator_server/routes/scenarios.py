@@ -16,21 +16,34 @@ end up with the same library.
 from __future__ import annotations
 
 import logging
+import re
 import shutil
+import uuid
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 import yaml
-from fastapi import APIRouter, File, Form, HTTPException, Request, UploadFile
+from fastapi import APIRouter, Depends, File, Form, HTTPException, Request, UploadFile
 from fastapi.responses import PlainTextResponse, Response
 
 from regulator_agent import savedsearches as ss
+from regulator_agent.report import scenario_fit
 from regulator_agent.scenario import ScenarioError, lint, load_scenario
+from sqlalchemy import select
+from sqlalchemy.orm import Session
 
 from .. import scenariosource
-from ..adapters import list_scenarios, scenario_path, scenario_summary, user_scenarios_dir
+from ..adapters import (
+    list_scenarios,
+    scenario_path,
+    scenario_summary,
+    set_overlay_tags,
+    user_scenarios_dir,
+)
 from ..audit import record as audit_record
 from ..config import get_settings
+from ..db import get_session
+from ..models import Target
 from ..scenarioarchive import (
     ArchiveLimits,
     ScenarioArchiveError,
@@ -38,7 +51,14 @@ from ..scenarioarchive import (
     export_scenario_bytes,
     extract_scenario,
 )
-from ..schemas import SavedSearchPreview, ScenarioCreate, ScenarioOut
+from ..schemas import (
+    SavedSearchPreview,
+    ScenarioCreate,
+    ScenarioDuplicate,
+    ScenarioOut,
+    ScenarioTags,
+    ScenarioUpdate,
+)
 
 log = logging.getLogger("regulator.server.scenarios")
 
@@ -60,6 +80,36 @@ def get_scenario_source() -> Dict[str, Any]:
     and credential free (see :func:`..scenariosource.describe`).
     """
     return scenariosource.describe()
+
+
+@source_router.get("/scenario-fit")
+def get_scenario_fit(session: Session = Depends(get_session)) -> Dict[str, Any]:
+    """Which scenarios each target holds data for, from its last stored Report.
+
+    Worked out again from the stored sourcetype census against the library as
+    it is now, rather than read back from the report, so a scenario imported
+    or edited since the Report was taken still gets a fit. A target with no
+    report yet is listed as untested: nothing is known about it.
+    """
+    library = [scenario_summary(sc, origin) for sc, origin in list_scenarios()]
+    targets = []
+    for target in session.scalars(select(Target).order_by(Target.id)):
+        report = target.last_report_json or None
+        if not report or not report.get("reachable", True) or report.get("sourcetypes") is None:
+            targets.append(
+                {"id": target.id, "name": target.name, "reported_at": None, "fit": None}
+            )
+            continue
+        fits = scenario_fit(report, library)
+        targets.append(
+            {
+                "id": target.id,
+                "name": target.name,
+                "reported_at": report.get("generated_at"),
+                "fit": {f["name"]: {"fit": f["fit"], "missing": f["missing"]} for f in fits},
+            }
+        )
+    return {"targets": targets}
 
 
 @router.get("", response_model=List[ScenarioOut])
@@ -103,8 +153,33 @@ def get_scenario(name: str) -> Dict[str, Any]:
         "steps": steps,
         "saved_selected": list(scenario.saved_selected),
         "saved_skipped": dict(scenario.saved_skipped),
+        "searches_file": scenario.searches.file if scenario.searches else None,
+        "saved_searches_rows": _search_rows(directory, scenario),
         "files": files,
     }
+
+
+def _search_rows(directory: Path, scenario: Any) -> List[Dict[str, Any]]:
+    """The scenario's savedsearches.conf as editable rows, in file order."""
+    if scenario.searches is None:
+        return []
+    conf = directory / scenario.searches.file
+    if not conf.is_file():
+        return []
+    rows = []
+    for search in ss.parse_savedsearches(conf.read_text(encoding="utf-8")):
+        rows.append(
+            {
+                "name": search.name,
+                "search": search.raw_search or search.search,
+                "earliest": search.earliest,
+                "latest": search.latest,
+                "cron": search.cron or "",
+                "scheduled": search.scheduled,
+                "disabled": search.disabled,
+            }
+        )
+    return rows
 
 
 @router.post("/preview", response_model=List[SavedSearchPreview])
@@ -280,6 +355,270 @@ def create_scenario(body: ScenarioCreate, request: Request) -> Dict[str, Any]:
     summary["saved_selected"] = selected
     summary["saved_skipped"] = dict(scenario.saved_skipped)
     return summary
+
+
+# --------------------------------------------------------------------------- #
+# Editing: in place for the operator's own, by copy for the built-in ones
+# --------------------------------------------------------------------------- #
+
+def _user_scenario(name: str) -> Path:
+    """The directory of one of the operator's own scenarios, or the reason not."""
+    try:
+        directory, origin = scenario_path(name)
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
+    if origin != "user":
+        raise HTTPException(
+            status_code=403,
+            detail="built-in scenarios ship with the image and are read only: duplicate it to edit",
+        )
+    return directory
+
+
+def _set_top_level(text: str, key: str, value: Any) -> Optional[str]:
+    """Replace one top-level ``key`` in YAML text, keeping everything else.
+
+    The scenario files carry long explanatory comments, and a full dump would
+    throw every one of them away to change a tag. A key written on one line,
+    or as a block list under it, is swapped in place; anything else (a nested
+    mapping, a folded string) returns None and the caller rewrites the
+    document instead.
+    """
+    lines = text.split("\n")
+    hits = [i for i, line in enumerate(lines) if re.match(rf"^{re.escape(key)}:(\s|$)", line)]
+    if len(hits) != 1:
+        return None
+    first = hits[0]
+    inline = lines[first][len(key) + 1:].strip()
+    last = first
+    if not inline or inline.startswith("#"):
+        # A block list: the "- item" lines (at column 0, as PyYAML writes
+        # them, or indented) that follow, and nothing else.
+        j = first + 1
+        while j < len(lines) and re.match(r"^\s*- ", lines[j]):
+            last = j
+            j += 1
+        if last == first:
+            return None
+    elif inline[0] in "|>":
+        return None
+    rendered = yaml.safe_dump({key: value}, default_flow_style=True, width=10_000, allow_unicode=True)
+    rendered = rendered.strip()
+    if rendered.startswith("{") and rendered.endswith("}"):
+        rendered = rendered[1:-1].strip()
+    if "\n" in rendered:
+        return None
+    return "\n".join(lines[:first] + [rendered] + lines[last + 1:])
+
+
+def _apply_yaml_fields(text: str, fields: Dict[str, Any], corpus: Dict[str, Any]) -> str:
+    """scenario.yaml with the form's fields changed, comments kept where possible."""
+    out = text
+    pending: Dict[str, Any] = {}
+    for key, value in fields.items():
+        replaced = _set_top_level(out, key, value)
+        if replaced is None:
+            pending[key] = value
+        else:
+            out = replaced
+    if not pending and not corpus:
+        return out
+    document = yaml.safe_load(out) or {}
+    if not isinstance(document, dict):
+        raise HTTPException(status_code=422, detail="scenario.yaml is not a mapping")
+    document.update(pending)
+    if corpus:
+        merged = dict(document.get("corpus") or {})
+        merged.update(corpus)
+        document["corpus"] = merged
+    return yaml.safe_dump(document, sort_keys=False, allow_unicode=True)
+
+
+def _render_rows(existing_text: str, rows: List[Dict[str, Any]]) -> str:
+    """A savedsearches.conf from edited rows, keeping each stanza's other keys."""
+    existing = ss.parse_conf(existing_text) if existing_text else {}
+    stanzas: Dict[str, Dict[str, str]] = {}
+    for row in rows:
+        name = row["name"]
+        if name in stanzas:
+            raise HTTPException(status_code=422, detail=f"two searches are named {name!r}")
+        base = dict(existing.get(row.get("original_name") or name, {}))
+        base[ss.KEY_SEARCH] = row["search"]
+        for key, value in (
+            (ss.KEY_EARLIEST, row.get("earliest") or ""),
+            (ss.KEY_LATEST, row.get("latest") or ""),
+            (ss.KEY_CRON, row.get("cron") or ""),
+        ):
+            if value:
+                base[key] = value
+            else:
+                base.pop(key, None)
+        base[ss.KEY_ENABLE_SCHED] = "1" if row.get("scheduled") else "0"
+        if row.get("disabled"):
+            base[ss.KEY_DISABLED] = "1"
+        else:
+            base.pop(ss.KEY_DISABLED, None)
+        # The search goes first, as a person would write the stanza.
+        stanzas[name] = {ss.KEY_SEARCH: base.pop(ss.KEY_SEARCH), **base}
+    return ss.render_conf(stanzas, header="Edited in Regulator.")
+
+
+def _check_and_swap(directory: Path, files: Dict[str, str]) -> Any:
+    """Write ``files`` over a copy of the scenario, load and lint it, then swap.
+
+    Nothing touches the live directory until the edited copy loads and lints,
+    so a bad edit is a 422 and the scenario that was there still runs.
+    """
+    staging = directory.parent / f".edit-{directory.name}-{uuid.uuid4().hex[:8]}"
+    shutil.copytree(directory, staging)
+    try:
+        for rel, content in files.items():
+            target = (staging / rel).resolve()
+            if staging.resolve() not in target.parents:
+                raise HTTPException(status_code=422, detail=f"{rel!r} is outside the scenario")
+            target.write_text(content, encoding="utf-8")
+        try:
+            scenario = load_scenario(staging)
+        except Exception as exc:  # noqa: BLE001 - any parse failure is the operator's to fix
+            raise HTTPException(status_code=422, detail=f"the edited scenario does not load: {exc}")
+        if scenario.name != directory.name:
+            raise HTTPException(
+                status_code=422,
+                detail=f"the scenario's name must stay {directory.name!r}: duplicate it to rename",
+            )
+        problems = [line for line in lint(scenario) if not line.startswith("advice: ")]
+        if problems and any("does not lint" in p or "needs" in p for p in problems):
+            raise HTTPException(
+                status_code=422, detail="the edited scenario does not lint: " + "; ".join(problems[:5])
+            )
+        if scenario.searches is not None and not scenario.saved_selected:
+            raise HTTPException(
+                status_code=422,
+                detail=(
+                    "no search would be selected after this edit: "
+                    + "; ".join(f"{k}: {v}" for k, v in list(scenario.saved_skipped.items())[:5])
+                ),
+            )
+    except BaseException:
+        shutil.rmtree(staging, ignore_errors=True)
+        raise
+    retired = directory.parent / f".old-{directory.name}-{uuid.uuid4().hex[:8]}"
+    directory.rename(retired)
+    staging.rename(directory)
+    shutil.rmtree(retired, ignore_errors=True)
+    return load_scenario(directory)
+
+
+@router.put("/{name}")
+def update_scenario(name: str, body: ScenarioUpdate, request: Request) -> Dict[str, Any]:
+    """Edit one of the operator's own scenarios.
+
+    Either the raw files (``files``) or the form fields; raw wins when both
+    are sent, because it is the more specific statement of intent.
+    """
+    directory = _user_scenario(name)
+    scenario = load_scenario(directory)
+    files: Dict[str, str] = {}
+    if body.files:
+        allowed = {"scenario.yaml"} | ({scenario.searches.file} if scenario.searches else set())
+        unknown = set(body.files) - allowed
+        if unknown:
+            raise HTTPException(
+                status_code=422, detail=f"only {', '.join(sorted(allowed))} can be edited here"
+            )
+        files = dict(body.files)
+    else:
+        yaml_text = (directory / "scenario.yaml").read_text(encoding="utf-8")
+        fields: Dict[str, Any] = {}
+        corpus: Dict[str, Any] = {}
+        if body.description is not None:
+            fields["description"] = body.description
+        if body.tags is not None:
+            fields["tags"] = list(body.tags)
+        if body.index is not None:
+            corpus["index"] = body.index
+        if body.searches is not None:
+            if scenario.searches is None:
+                raise HTTPException(
+                    status_code=422,
+                    detail="this scenario defines its steps in scenario.yaml: edit the raw file",
+                )
+            conf_path = directory / scenario.searches.file
+            current = conf_path.read_text(encoding="utf-8") if conf_path.is_file() else ""
+            conf_text = _render_rows(current, [r.model_dump() for r in body.searches])
+            files[scenario.searches.file] = conf_text
+            if body.sourcetypes is None:
+                corpus["sourcetypes"] = _sourcetypes_in(ss.parse_savedsearches(conf_text))
+        if body.sourcetypes is not None:
+            corpus["sourcetypes"] = [st for st in body.sourcetypes if st]
+        if fields or corpus:
+            files["scenario.yaml"] = _apply_yaml_fields(yaml_text, fields, corpus)
+    if not files:
+        raise HTTPException(status_code=422, detail="nothing to change")
+    updated = _check_and_swap(directory, files)
+    audit_record("scenario_edited", request=request, detail=f"{name}: {', '.join(sorted(files))}")
+    scenariosource.publish_scenario(name, directory)
+    return scenario_summary(updated, "user")
+
+
+@router.put("/{name}/tags")
+def set_scenario_tags(name: str, body: ScenarioTags, request: Request) -> Dict[str, Any]:
+    """Retag a scenario: in its scenario.yaml if it is the operator's, else in the overlay."""
+    try:
+        directory, origin = scenario_path(name)
+        scenario = load_scenario(directory)
+    except (FileNotFoundError, ScenarioError) as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
+    tags = body.tags
+    if origin == "builtin":
+        # Setting a built-in's tags back to what it ships with clears the
+        # override, so a later image that retags it is not shadowed.
+        set_overlay_tags(name, None if tags == list(scenario.tags) else tags)
+        updated = scenario
+    else:
+        text = (directory / "scenario.yaml").read_text(encoding="utf-8")
+        updated = _check_and_swap(directory, {"scenario.yaml": _apply_yaml_fields(text, {"tags": tags}, {})})
+        scenariosource.publish_scenario(name, directory)
+    audit_record("scenario_tagged", request=request, detail=f"{name}: {', '.join(tags) or '(none)'}")
+    return scenario_summary(updated, origin)
+
+
+@router.post("/{name}/duplicate", status_code=201)
+def duplicate_scenario(name: str, body: ScenarioDuplicate, request: Request) -> Dict[str, Any]:
+    """Copy any scenario into the operator's library under a new name, to edit it."""
+    try:
+        source, origin = scenario_path(name)
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
+    try:
+        scenario_path(body.name)
+    except FileNotFoundError:
+        pass
+    else:
+        raise HTTPException(status_code=409, detail=f"a scenario named {body.name!r} already exists")
+    root = user_scenarios_dir()
+    root.mkdir(parents=True, exist_ok=True)
+    target = root / body.name
+    if target.exists():
+        raise HTTPException(status_code=409, detail=f"a scenario named {body.name!r} already exists")
+    shutil.copytree(source, target)
+    try:
+        text = (target / "scenario.yaml").read_text(encoding="utf-8")
+        fields: Dict[str, Any] = {"name": body.name}
+        if origin == "builtin":
+            summary_tags = scenario_summary(load_scenario(source), origin)["tags"]
+            fields["tags"] = list(summary_tags)
+        (target / "scenario.yaml").write_text(_apply_yaml_fields(text, fields, {}), encoding="utf-8")
+        scenario = load_scenario(target)
+    except HTTPException:
+        shutil.rmtree(target, ignore_errors=True)
+        raise
+    except Exception as exc:  # noqa: BLE001 - never leave a half-written copy behind
+        shutil.rmtree(target, ignore_errors=True)
+        raise HTTPException(status_code=422, detail=f"the copy does not load: {exc}")
+    audit_record("scenario_duplicated", request=request, detail=f"{name} -> {body.name}")
+    scenariosource.publish_scenario(body.name, target)
+    return scenario_summary(scenario, "user")
 
 
 @router.delete("/{name}", status_code=204)

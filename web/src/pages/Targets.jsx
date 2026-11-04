@@ -228,7 +228,14 @@ export default function Targets({ navigate, onLaunch }) {
                 </Panel>
             ) : (
                 <Panel flush>
-                    <Table rowExpansion="controlled" horizontalOverflow="scroll">
+                    {/* Without a width Splunk UI draws no header cell over the
+                        Test and menu columns, so the header stops short of
+                        the rows. */}
+                    <Table
+                        rowExpansion="controlled"
+                        horizontalOverflow="scroll"
+                        actionsColumnWidth={128}
+                    >
                         <Table.Head>
                             <Table.HeadCell>Name</Table.HeadCell>
                             <Table.HeadCell>Management URL</Table.HeadCell>

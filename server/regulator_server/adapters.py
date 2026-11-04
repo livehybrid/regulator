@@ -9,6 +9,10 @@ behaviour.
 
 from __future__ import annotations
 
+import json
+import logging
+import os
+import tempfile
 from pathlib import Path
 from typing import Dict, List, Optional
 
@@ -39,6 +43,62 @@ def user_scenarios_dir() -> Path:
     return Path(get_settings().user_scenarios_dir)
 
 
+# Tags for built-in scenarios, set from the console. The built-in library is
+# read only and replaced with every image, so its tags cannot be written into
+# its scenario.yaml; they live beside the operator's own scenarios instead,
+# on the volume that survives an upgrade. The leading dot keeps the file out
+# of the scenario listing, which only considers directories anyway.
+TAG_OVERLAY_FILE = ".scenario-tags.json"
+
+log = logging.getLogger("regulator.server.adapters")
+
+
+def _tag_overlay_path() -> Path:
+    return user_scenarios_dir() / TAG_OVERLAY_FILE
+
+
+def tag_overlay() -> Dict[str, List[str]]:
+    """Every built-in scenario's console-set tags, by scenario name.
+
+    A missing or unreadable file is an empty overlay: tags are a convenience
+    and must never stop the library from listing.
+    """
+    path = _tag_overlay_path()
+    if not path.is_file():
+        return {}
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        log.warning("ignoring unreadable tag overlay %s: %s", path, exc)
+        return {}
+    if not isinstance(raw, dict):
+        return {}
+    return {
+        str(name): [str(t) for t in tags]
+        for name, tags in raw.items()
+        if isinstance(tags, list)
+    }
+
+
+def set_overlay_tags(name: str, tags: Optional[List[str]]) -> None:
+    """Set (or, with None, clear) one built-in scenario's tags, atomically."""
+    overlay = tag_overlay()
+    if tags is None:
+        overlay.pop(name, None)
+    else:
+        overlay[name] = list(tags)
+    path = _tag_overlay_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=str(path.parent), prefix=".tags-", suffix=".json")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            json.dump(overlay, handle, indent=2, sort_keys=True)
+        os.replace(tmp, path)
+    except BaseException:
+        Path(tmp).unlink(missing_ok=True)
+        raise
+
+
 def _libraries() -> List[tuple[Path, str]]:
     return [(scenarios_dir(), "builtin"), (user_scenarios_dir(), "user")]
 
@@ -62,6 +122,10 @@ def list_scenarios() -> List[tuple[Scenario, str]]:
         if not root.is_dir():
             continue
         for child in sorted(root.iterdir()):
+            # Dot-directories are an edit in progress (or one a crash left
+            # behind), never a scenario of their own.
+            if child.name.startswith("."):
+                continue
             if not (child / "scenario.yaml").is_file() or child.name in seen:
                 continue
             try:
@@ -114,12 +178,15 @@ def scenario_summary(scenario: Scenario, origin: str = "builtin") -> Dict[str, o
             "from the browser worker image until the fleet lands"
         )
     saved = [step for step in scenario.steps if step.saved]
+    tags = list(scenario.tags)
+    if origin == "builtin":
+        tags = tag_overlay().get(scenario.name, tags)
     return {
         "name": scenario.name,
         "description": scenario.description,
         "engine": scenario.engine,
         "origin": origin,
-        "tags": list(scenario.tags),
+        "tags": tags,
         "personas": len(scenario.personas),
         "steps": len(scenario.steps),
         "saved_searches": len(saved),
