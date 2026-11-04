@@ -18,6 +18,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from regulator_agent import savedsearches as ss
+from regulator_agent.ceilings import search_ceilings
 from regulator_agent.engines.api import ApiEngine
 from regulator_agent.report import target_report
 from regulator_agent.smartstore import cache_state, evict_all
@@ -282,10 +283,16 @@ async def test_target(target_id: int, session: Session = Depends(get_session)) -
         engine = ApiEngine(
             worker_config(target, scenario_path="smoke"), client=client
         )
-        return await engine.probe()
+        found = await engine.probe()
+        try:
+            limits = await search_ceilings(client, target.mgmt_url, found)
+        except Exception:  # noqa: BLE001 - the breakdown is a nicety, the Test is not
+            log.warning("search ceiling breakdown failed for target %s", target.id, exc_info=True)
+            limits = None
+        return found, limits
 
     try:
-        caps = await _with_client(target, probe, ACTION_TIMEOUT_S)
+        caps, ceilings = await _with_client(target, probe, ACTION_TIMEOUT_S)
     except HTTPException:
         raise
     except Exception as exc:  # noqa: BLE001 - a failed probe is a result, not a crash
@@ -304,6 +311,7 @@ async def test_target(target_id: int, session: Session = Depends(get_session)) -
         roles=list(caps.server_roles),
         cores=caps.cpu_count,
         max_hist_searches=caps.max_hist_searches,
+        ceilings=ceilings,
     )
 
 
