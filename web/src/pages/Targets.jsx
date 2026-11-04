@@ -498,14 +498,90 @@ function TestResult({ result }) {
                 <dd>{isBlank(result.cores) ? '–' : fmtInt(result.cores)}</dd>
                 <dt>Search ceiling</dt>
                 <dd>
-                    {isBlank(result.max_hist_searches)
-                        ? '–'
-                        : `${fmtInt(result.max_hist_searches)} concurrent historical searches`}
+                    {result.ceilings ? (
+                        <Ceilings c={result.ceilings} />
+                    ) : isBlank(result.max_hist_searches) ? (
+                        '–'
+                    ) : (
+                        `${fmtInt(result.max_hist_searches)} concurrent historical searches on this search head`
+                    )}
                 </dd>
             </Facts>
         </div>
     );
 }
+
+/**
+ * Which concurrent-search limit a run here hits first, and the others beside it.
+ *
+ * "Concurrent" is the point: these are how many searches Splunk runs at once
+ * before it starts queueing, not a throughput figure.
+ */
+function Ceilings({ c }) {
+    const sh = c.search_head || {};
+    const { cluster, account, indexers: idx, effective: eff } = c;
+    const lines = [];
+    if (!isBlank(sh.ad_hoc)) {
+        const share = isBlank(sh.scheduler_share)
+            ? ''
+            : `, of which ${fmtInt(sh.scheduler_share)} for scheduled searches`;
+        lines.push(
+            `This search head: ${fmtInt(sh.ad_hoc)} (${fmtInt(sh.base_max_searches)} + ${fmtInt(
+                sh.max_searches_per_cpu
+            )} × ${fmtInt(sh.cores)} cores)${share}.`
+        );
+    }
+    if (cluster) {
+        lines.push(
+            cluster.routing === 'load_balancer'
+                ? `Search head cluster: ${fmtInt(cluster.members)} members, about ${fmtInt(
+                      cluster.ad_hoc_total
+                  )} in total. This target looks like a load balancer, so a run can spread across them.`
+                : `Search head cluster: ${fmtInt(cluster.members)} members, but this target names one of them, so a run uses that member only.`
+        );
+    }
+    if (account) {
+        const who = account.user || 'unknown';
+        lines.push(
+            isBlank(account.srch_jobs_quota)
+                ? `Your account (${who}): no per-user search quota.`
+                : `Your account (${who}, roles ${(account.roles || []).join(', ')}): ${fmtInt(
+                      account.srch_jobs_quota
+                  )} concurrent searches per user${cluster ? ' on each member' : ''}.`
+        );
+    }
+    if (idx) {
+        const cores = isBlank(idx.cores_total) ? '' : `, ${fmtInt(idx.cores_total)} cores in total`;
+        lines.push(
+            `Indexers: ${fmtInt(idx.peers)} peers${cores}. They put no cap on concurrent searches by default, so their CPU is the limit.`
+        );
+    }
+    return (
+        <div>
+            {eff ? (
+                <div>
+                    <strong>{fmtInt(eff.value)} concurrent historical searches</strong>: the{' '}
+                    {eff.limit} is the one a run here hits first{eff.note ? ` (${eff.note})` : ''}.
+                </div>
+            ) : (
+                <Muted>Unknown: none of the limits could be read with this account.</Muted>
+            )}
+            {lines.concat(c.notes || []).map((line) => (
+                <Muted key={line} $small>
+                    <div>{line}</div>
+                </Muted>
+            ))}
+            <Muted $small>
+                <div>
+                    These are how many searches run at once before Splunk queues the rest, not a
+                    throughput limit.
+                </div>
+            </Muted>
+        </div>
+    );
+}
+
+Ceilings.propTypes = { c: PropTypes.object.isRequired };
 
 TestResult.propTypes = { result: PropTypes.object };
 

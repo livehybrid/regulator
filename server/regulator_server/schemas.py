@@ -215,6 +215,10 @@ class TargetTestResult(BaseModel):
     roles: List[str] = Field(default_factory=list)
     cores: Optional[int] = None
     max_hist_searches: Optional[int] = None
+    # Which concurrent-search limit a run against this target hits first:
+    # this search head, the cluster behind a load balancer, the account's
+    # role quota, and the indexers. See regulator_agent/ceilings.py.
+    ceilings: Optional[Dict[str, Any]] = None
 
 
 class EvictRequest(BaseModel):

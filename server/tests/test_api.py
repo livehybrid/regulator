@@ -154,6 +154,11 @@ def test_testing_a_target_records_its_health(client, splunkd):
     assert body["version"] == "10.4.0"
     # 6 + (1 * 8): the ceiling the run detail draws its line at.
     assert body["max_hist_searches"] == 14
+    # The breakdown of which limit binds first. The fake is a single instance.
+    ceilings = body["ceilings"]
+    assert ceilings["search_head"]["ad_hoc"] == 14
+    assert ceilings["cluster"] is None
+    assert ceilings["effective"]["value"] <= 14
 
     assert client.get("/api/targets").json()[0]["health"] == "ok"
 
