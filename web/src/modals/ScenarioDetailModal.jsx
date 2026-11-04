@@ -29,10 +29,7 @@ export default function ScenarioDetailModal({ scenario, loading, onClose, onDele
                     <BusyButton
                         appearance="destructive"
                         label="Delete scenario"
-                        onClick={async () => {
-                            await onDelete();
-                            onClose();
-                        }}
+                        onClick={() => onDelete()}
                     />
                 )
             }

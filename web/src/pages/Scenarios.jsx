@@ -30,6 +30,7 @@ import { variables } from '@splunk/themes';
 import BusyButton from '../components/BusyButton';
 import DuplicateScenarioModal from '../modals/DuplicateScenarioModal';
 import ImportScenarioModal from '../modals/ImportScenarioModal';
+import DeleteScenarioModal from '../modals/DeleteScenarioModal';
 import ScenarioDetailModal from '../modals/ScenarioDetailModal';
 import ScenarioEditModal from '../modals/ScenarioEditModal';
 import ScenarioTagsModal from '../modals/ScenarioTagsModal';
@@ -518,6 +519,13 @@ export default function Scenarios({ onLaunch }) {
                                             >
                                                 Download
                                             </Menu.Item>
+                                            {s.origin === 'user' && (
+                                                <Menu.Item
+                                                    onClick={() => setDialog({ kind: 'delete', name: s.name })}
+                                                >
+                                                    Delete&hellip;
+                                                </Menu.Item>
+                                            )}
                                             {canPush && (
                                                 <Menu.Item onClick={() => onPush(s.name)}>
                                                     Push
@@ -537,11 +545,29 @@ export default function Scenarios({ onLaunch }) {
                     scenario={dialog.payload}
                     loading={dialog.loading}
                     onClose={() => setDialog(null)}
-                    onDelete={async () => {
-                        await api(`/scenarios/${encodeURIComponent(dialog.name)}`, {
-                            method: 'DELETE',
-                        });
-                        notify('Scenario deleted', 'success');
+                    onDelete={() => setDialog({ kind: 'delete', name: dialog.name })}
+                />
+            )}
+            {dialog && dialog.kind === 'delete' && (
+                <DeleteScenarioModal
+                    name={dialog.name}
+                    source={source}
+                    onClose={() => setDialog(null)}
+                    onConfirm={async (remote) => {
+                        const result = await api(
+                            `/scenarios/${encodeURIComponent(dialog.name)}${remote ? '?remote=true' : ''}`,
+                            { method: 'DELETE' }
+                        );
+                        if (result && result.remote_key) {
+                            notify(
+                                result.remote_existed
+                                    ? `Scenario deleted, and ${result.remote_key} removed from the scenario source`
+                                    : `Scenario deleted (${result.remote_key} was not in the scenario source)`,
+                                'success'
+                            );
+                        } else {
+                            notify('Scenario deleted', 'success');
+                        }
                         afterChange();
                     }}
                 />

@@ -21,10 +21,12 @@ import WaitSpinner from '@splunk/react-ui/WaitSpinner';
 import styled from 'styled-components';
 import { variables } from '@splunk/themes';
 
+import DeleteRunsModal, { DELETABLE_STATES } from '../modals/DeleteRunsModal';
 import useLoader from '../useLoader';
 import { Sparkline } from '../components/LineChart';
 import { Mono, Muted, PageHead, Panel, RelTime, StatePill, Toolbar } from '../components/primitives';
 import { api, isAuthError } from '../api';
+import { useNotify } from '../Notifications';
 import { DASH, fmtDur, fmtInt, fmtMs, fmtNum, fmtPct, isBlank } from '../format';
 
 const COLUMNS_KEY = 'regulator.runs.columns';
@@ -142,8 +144,24 @@ ColumnPicker.propTypes = {
 };
 
 export default function Runs({ navigate, onLaunch }) {
-    const { data, error, loading } = useLoader(() => api('/runs'), []);
+    const { data, error, loading, reload } = useLoader(() => api('/runs'), []);
     const runs = data || [];
+    const notify = useNotify();
+    // Selection for bulk delete. Only finished runs can be deleted, so only
+    // they get a checkbox, and the selection is pruned to what is still listed.
+    const [selected, setSelected] = useState(() => new Set());
+    const [deleting, setDeleting] = useState(false);
+    const selectable = runs.filter((r) => DELETABLE_STATES.has(r.state)).map((r) => r.id);
+    const selectedIds = selectable.filter((id) => selected.has(id));
+    const allSelected = selectable.length > 0 && selectedIds.length === selectable.length;
+    const toggle = (id) =>
+        setSelected((prev) => {
+            const next = new Set(prev);
+            if (!next.delete(id)) {
+                next.add(id);
+            }
+            return next;
+        });
     const [sparks, setSparks] = useState({});
     const [shown, setShown] = useState(readColumns);
     useEffect(() => {
@@ -190,6 +208,21 @@ export default function Runs({ navigate, onLaunch }) {
             <PageHead>
                 <Heading level={1}>Runs</Heading>
                 <Toolbar>
+                    {selectedIds.length > 0 && (
+                        <>
+                            <Muted>{selectedIds.length} selected</Muted>
+                            <Button
+                                appearance="subtle"
+                                label="Clear selection"
+                                onClick={() => setSelected(new Set())}
+                            />
+                            <Button
+                                appearance="destructive"
+                                label="Delete selected"
+                                onClick={() => setDeleting(true)}
+                            />
+                        </>
+                    )}
                     <ColumnPicker shown={shown} onChange={setShown} />
                     <Button
                         appearance="primary"
@@ -215,6 +248,16 @@ export default function Runs({ navigate, onLaunch }) {
                 <Panel flush>
                     <Table horizontalOverflow="scroll">
                         <Table.Head>
+                            <Table.HeadCell>
+                                <Checkbox
+                                    checked={allSelected}
+                                    disabled={!selectable.length}
+                                    onChange={() =>
+                                        setSelected(allSelected ? new Set() : new Set(selectable))
+                                    }
+                                    aria-label="Select all finished runs"
+                                />
+                            </Table.HeadCell>
                             {columns.map((c) => (
                                 <Table.HeadCell key={c.key} align={c.align}>
                                     {c.label}
@@ -231,6 +274,19 @@ export default function Runs({ navigate, onLaunch }) {
                                         data={r}
                                         onClick={() => navigate(`run/${encodeURIComponent(r.id)}`)}
                                     >
+                                        {/* Its own click: the row's opens the run. */}
+                                        <Table.Cell>
+                                            {DELETABLE_STATES.has(r.state) && (
+                                                // eslint-disable-next-line jsx-a11y/click-events-have-key-events, jsx-a11y/no-static-element-interactions
+                                                <span onClick={(e) => e.stopPropagation()}>
+                                                    <Checkbox
+                                                        checked={selected.has(r.id)}
+                                                        onChange={() => toggle(r.id)}
+                                                        aria-label={`Select run ${r.id}`}
+                                                    />
+                                                </span>
+                                            )}
+                                        </Table.Cell>
                                         {columns.map((c) => (
                                             <Table.Cell key={c.key} align={c.align}>
                                                 {c.cell(r, h, sparks)}
@@ -253,6 +309,22 @@ export default function Runs({ navigate, onLaunch }) {
                         </Table.Body>
                     </Table>
                 </Panel>
+            )}
+
+            {deleting && (
+                <DeleteRunsModal
+                    ids={selectedIds}
+                    notify={notify}
+                    onClose={() => setDeleting(false)}
+                    onDeleted={(gone) => {
+                        setSelected((prev) => {
+                            const next = new Set(prev);
+                            gone.forEach((id) => next.delete(id));
+                            return next;
+                        });
+                        reload();
+                    }}
+                />
             )}
         </div>
     );
