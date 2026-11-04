@@ -569,3 +569,56 @@ def test_concurrency_queueing_is_visible_when_the_target_has_a_ceiling(env):
         assert any((r.queued_ms or 0) > 0 for r in records)
     finally:
         server.close()
+
+
+# ------------------------------------------------- searches running at the end
+
+
+def _slow_run(env, **overrides):
+    """One VU, one search that outlives the run and its 1 s drain budget."""
+    server = FakeSplunk(port=0, base_latency_ms=2500.0, jitter_ms=1.0, dispatch_latency_ms=1.0, seed=5)
+    try:
+        doc = tiny_scenario_dict()
+        doc["personas"][0]["steps"] = [doc["personas"][0]["steps"][0]]
+        doc["load"] = {"model": "closed", "virtual_users": 1, "duration": "0.3s"}
+        scenario_obj = parse_scenario(doc)
+        config = make_config(server, env, REG_DRAIN_BUDGET_S="1", **overrides)
+        engine = ApiEngine(config)
+
+        async def go():
+            await engine.start()
+            try:
+                scheduler = Scheduler(
+                    scenario=scenario_obj, config=config, engine=engine,
+                    resolver=ParameterResolver(scenario_obj),
+                )
+                return await scheduler.run()
+            finally:
+                await engine.close()
+
+        return run_async(go()), server.stats
+    finally:
+        server.close()
+
+
+def test_a_search_running_at_the_end_is_followed_to_completion(env):
+    summary, stats = _slow_run(env, REG_HARVEST_S="10")
+    s = summary.stats
+    assert s["errors"] == 0
+    assert s["abandoned"] == 1
+    assert s["unfinished"]["finished_after_end"] == 1
+    assert s["unfinished"]["still_running"] == 0
+    assert s["unfinished"]["run_duration"]["max_ms"] >= 2000
+    # The job was left running, then deleted once it had been read.
+    assert stats.jobs_deleted >= 1
+    # The harvest is not run time: duration stops at the end of the drain.
+    assert summary.duration_s < 2.5
+
+
+def test_with_no_harvest_the_job_is_deleted_at_the_end_of_the_drain(env):
+    summary, stats = _slow_run(env, REG_HARVEST_S="0")
+    s = summary.stats
+    assert s["errors"] == 0
+    assert s["abandoned"] == 1
+    assert s["unfinished"]["finished_after_end"] == 0
+    assert stats.jobs_deleted >= 1

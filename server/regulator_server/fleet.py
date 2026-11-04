@@ -81,6 +81,24 @@ SUPERVISE_TICK_S = 1.0
 # After a stop, how long the workers get to hear the command over their
 # heartbeats and report before the driver's SIGTERM is used as the fallback.
 DRAIN_GRACE_S = 60.0
+
+
+def _end_allowance_s(settings: Any) -> float:
+    """How long after its duration a worker may legitimately still be busy.
+
+    The drain budget, then the harvest of searches the drain abandoned. The
+    supervisor's deadlines grow by this so a worker still harvesting is not
+    declared lost, which would throw away the slot's whole report.
+    """
+    return float(getattr(settings, "drain_budget_s", 60.0) or 0.0) + float(getattr(settings, "harvest_s", 0.0) or 0.0)
+
+
+def _stop_grace_s(settings: Any) -> int:
+    """SIGTERM grace for a stopped worker: its drain budget plus time to report.
+
+    A stop is not a normal completion, so a stopped worker does not harvest.
+    """
+    return int(max(90.0, float(getattr(settings, "drain_budget_s", 60.0) or 0.0) + 30.0))
 STATE_PROVISIONING = "provisioning"
 STATE_RELEASING = "releasing"
 STATE_RUNNING = "running"
@@ -385,6 +403,8 @@ def _claim_env(run: Run, target: Target, settings: ServerConfig, share: Dict[str
     if run.cold_window_s:
         env["REG_COLD_WINDOW_S"] = str(run.cold_window_s)
     env["REG_MAX_PAUSE_S"] = str(settings.max_pause_s)
+    env["REG_DRAIN_BUDGET_S"] = str(settings.drain_budget_s)
+    env["REG_HARVEST_S"] = str(settings.harvest_s)
     return env
 
 
@@ -722,10 +742,10 @@ def merge_summaries(run_label: str, scenario: str, summaries: Sequence[Dict[str,
             entry = merged_steps.setdefault(
                 sid,
                 {"step_id": sid, "class": step.get("class", "unclassified"), "executions": 0, "successes": 0,
-                 "partial": 0, "errors": 0, "errors_by_class": {}, "scan_count_total": 0,
+                 "partial": 0, "unfinished": 0, "errors": 0, "errors_by_class": {}, "scan_count_total": 0,
                  "result_count_total": 0, "_run_duration_total_s": 0.0},
             )
-            for key in ("executions", "successes", "partial", "errors", "scan_count_total", "result_count_total"):
+            for key in ("executions", "successes", "partial", "unfinished", "errors", "scan_count_total", "result_count_total"):
                 entry[key] += int(step.get(key) or 0)
             for key, value in (step.get("errors_by_class") or {}).items():
                 entry["errors_by_class"][key] = entry["errors_by_class"].get(key, 0) + int(value or 0)
@@ -789,6 +809,12 @@ def merge_summaries(run_label: str, scenario: str, summaries: Sequence[Dict[str,
         "epochs": epochs_out,
         "partial": total("partial"),
         "abandoned": total("abandoned"),
+        "unfinished": {
+            "count": total("abandoned"),
+            "finished_after_end": int(sum(int((st.get("unfinished") or {}).get("finished_after_end") or 0) for st in stats_list)),
+            "still_running": int(sum(int((st.get("unfinished") or {}).get("still_running") or 0) for st in stats_list)),
+            "run_duration": _hist([h.get("after_end_run_duration") for h in hists]).summary(),
+        },
         "in_flight": 0,
         # A sum of per-worker peaks: an upper bound on the fleet's true peak,
         # since the workers' peaks need not have coincided.
@@ -1054,10 +1080,10 @@ class FleetRun(threading.Thread):
                     },
                     secrets={"REG_RUN_JWT": token},
                     labels={"regulator.scenario": self._scenario_name()},
-                    stop_grace_s=90,
+                    stop_grace_s=_stop_grace_s(settings),
                     # Plus the pause budget: a Kubernetes Job's deadline is
                     # fixed at creation and a pause must not run into it.
-                    options={"slot_base": slot_base, "active_deadline_s": int(deadline_basis + 600 + settings.max_pause_s)},
+                    options={"slot_base": slot_base, "active_deadline_s": int(deadline_basis + 600 + settings.max_pause_s + _end_allowance_s(settings))},
                 )
                 slot_base += group.workers
                 try:
@@ -1236,6 +1262,7 @@ class FleetRun(threading.Thread):
         ceiling = (
             started + settings.fleet.provision_timeout_s
             + float(duration or settings.max_run_duration_s) + 600.0 + settings.max_pause_s
+            + _end_allowance_s(settings)
         )
         drain_started: Optional[float] = None
         last_persist = 0.0
@@ -1311,6 +1338,7 @@ class FleetRun(threading.Thread):
                     # paused, so the run legitimately ends that much later.
                     hard_deadline = (
                         run.t0 + float(duration or settings.max_run_duration_s) + 300.0
+                        + _end_allowance_s(settings)
                         + paused_seconds(run, now)
                     )
 
@@ -1347,11 +1375,13 @@ class FleetRun(threading.Thread):
                 # The driver's own stop (SIGTERM) is the fallback for a worker
                 # that never heard the command over its heartbeat. Workers
                 # that did hear it are reporting and exiting on their own.
-                if draining and not self._stopped_driver and drain_started and now - drain_started > DRAIN_GRACE_S:
+                if draining and not self._stopped_driver and drain_started and now - drain_started > max(
+                    DRAIN_GRACE_S, float(getattr(settings, "drain_budget_s", 0.0) or 0.0)
+                ):
                     self._stopped_driver = True
                     for ref in self.refs:
                         try:
-                            self.driver.stop(ref, grace_s=90)
+                            self.driver.stop(ref, grace_s=_stop_grace_s(settings))
                         except DriverError as exc:
                             log.warning("stopping %s failed: %s", ref.id, exc)
 
