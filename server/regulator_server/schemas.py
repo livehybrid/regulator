@@ -252,6 +252,91 @@ class ScenarioOut(BaseModel):
     lint: List[str] = Field(default_factory=list)
 
 
+_SCENARIO_NAME_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,63}$")
+_TAG_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9 _.:/-]{0,39}$")
+
+
+def _clean_tags(values: List[str]) -> List[str]:
+    """Tags trimmed, de-duplicated in order, and each one a short plain label."""
+    out: List[str] = []
+    for raw in values:
+        tag = str(raw).strip()
+        if not tag or tag in out:
+            continue
+        if not _TAG_RE.match(tag):
+            raise ValueError(
+                f"tag {tag!r}: up to 40 letters, digits, spaces and _ . : / -, starting "
+                "with a letter or digit"
+            )
+        out.append(tag)
+    if len(out) > 30:
+        raise ValueError("a scenario takes at most 30 tags")
+    return out
+
+
+class ScenarioTags(BaseModel):
+    tags: List[str] = Field(default_factory=list)
+
+    @field_validator("tags")
+    @classmethod
+    def _tags(cls, value: List[str]) -> List[str]:
+        return _clean_tags(value)
+
+
+class ScenarioDuplicate(BaseModel):
+    name: str
+
+    @field_validator("name")
+    @classmethod
+    def _safe_name(cls, value: str) -> str:
+        if not _SCENARIO_NAME_RE.match(value):
+            raise ValueError(
+                "a scenario name is lowercase letters, digits, dashes and underscores, up "
+                "to 64 characters"
+            )
+        return value
+
+
+class SavedSearchRow(BaseModel):
+    """One saved search as the scenario editor shows it."""
+
+    name: str = Field(min_length=1, max_length=200)
+    # The stanza this row was loaded as, so a rename keeps its other keys.
+    original_name: Optional[str] = None
+    search: str = Field(min_length=1, max_length=200_000)
+    earliest: str = ""
+    latest: str = ""
+    cron: str = ""
+    scheduled: bool = False
+    disabled: bool = False
+
+    @field_validator("name")
+    @classmethod
+    def _stanza_name(cls, value: str) -> str:
+        value = value.strip()
+        if not value or any(c in value for c in "[]\n\r"):
+            raise ValueError("a saved search name cannot be empty or contain [ ] or a newline")
+        return value
+
+
+class ScenarioUpdate(BaseModel):
+    """An edit to one of the operator's own scenarios. Only the fields sent change."""
+
+    description: Optional[str] = Field(default=None, max_length=2000)
+    tags: Optional[List[str]] = None
+    index: Optional[str] = Field(default=None, max_length=200)
+    sourcetypes: Optional[List[str]] = None
+    searches: Optional[List[SavedSearchRow]] = Field(default=None, max_length=5000)
+    # Raw text by file name (scenario.yaml, the savedsearches.conf), which
+    # replaces everything above when present.
+    files: Optional[Dict[str, str]] = None
+
+    @field_validator("tags")
+    @classmethod
+    def _tags(cls, value: Optional[List[str]]) -> Optional[List[str]]:
+        return None if value is None else _clean_tags(value)
+
+
 class ScenarioCreate(BaseModel):
     """A scenario built from a savedsearches.conf.
 

@@ -11,7 +11,7 @@ import asyncio
 import logging
 from typing import Any, Dict, List, Optional
 
-from fastapi import APIRouter, Depends, HTTPException, Request
+from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from fastapi.responses import PlainTextResponse
 from sqlalchemy import select, func
 from sqlalchemy.exc import IntegrityError
@@ -462,6 +462,34 @@ def _preview(search: ss.SavedSearch, skipped: Dict[str, str]) -> SavedSearchPrev
     )
 
 
+@router.get("/{target_id}/apps")
+async def list_target_apps(target_id: int, session: Session = Depends(get_session)) -> List[Dict[str, Any]]:
+    """The apps on the target, for choosing which app's saved searches to load.
+
+    An account that cannot list apps gets an empty list rather than an error,
+    and the console then lets the operator type an app name instead.
+    """
+    target = _get_target(session, target_id)
+    entries = await _with_client(
+        target, lambda client: client.entries("/services/apps/local", "apps"), ACTION_TIMEOUT_S
+    )
+    apps = []
+    for entry in entries:
+        name = str(entry.get("name") or "").strip()
+        if not name or str(entry.get("disabled")).lower() in ("1", "true"):
+            continue
+        apps.append({"name": name, "label": str(entry.get("label") or name)})
+    apps.sort(key=lambda a: a["label"].lower())
+    return apps
+
+
+def _only_named(searches: List[ss.SavedSearch], names: Optional[List[str]]) -> List[ss.SavedSearch]:
+    if not names:
+        return searches
+    wanted = set(names)
+    return [s for s in searches if s.name in wanted]
+
+
 @router.get("/{target_id}/savedsearches", response_model=List[SavedSearchPreview])
 async def list_target_saved_searches(
     target_id: int,
@@ -488,16 +516,18 @@ async def export_target_saved_searches(
     target_id: int,
     session: Session = Depends(get_session),
     app: Optional[str] = None,
+    name: Optional[List[str]] = Query(default=None),
 ) -> str:
     """The same searches as a savedsearches.conf a Splunk admin would recognise."""
     target = _get_target(session, target_id)
     entries = await _with_client(
         target, lambda client: client.saved_searches(app=app), ACTION_TIMEOUT_S
     )
-    searches = ss.from_rest_entries(entries)
+    searches = _only_named(ss.from_rest_entries(entries), name)
     header = (
         f"Exported by Regulator from {target.mgmt_url}"
         + (f", app {app}" if app else "")
+        + (f", {len(searches)} selected search(es)" if name else "")
         + "\nAlert actions and display settings are omitted on purpose: a load test replays "
         "the search, never its consequences."
     )
