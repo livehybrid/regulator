@@ -42,7 +42,7 @@ export default function Baselines({ navigate }) {
                 </Panel>
             ) : (
                 <Panel flush>
-                    <Table>
+                    <Table actionsColumnWidth={64}>
                         <Table.Head>
                             <Table.HeadCell>Label</Table.HeadCell>
                             <Table.HeadCell>Run</Table.HeadCell>

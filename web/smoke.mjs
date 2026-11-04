@@ -269,7 +269,40 @@ const ROUTES = {
             lint: ['no corpus check declared'],
             runnable_here: true,
         },
+        {
+            name: 'pack-flatline',
+            description: 'A pack whose data this lab does not hold.',
+            origin: 'user',
+            engine: 'api',
+            load_model: 'closed',
+            personas: 1,
+            steps: 3,
+            saved_searches: 3,
+            virtual_users: 5,
+            duration_s: 600,
+            index: 'main',
+            sourcetypes: ['stoker:flatline'],
+            requires_packs: ['flatline'],
+            tags: ['imported', 'savedsearches', 'closed', 'stoker-corpus', 'metrics'],
+            lint: [],
+            runnable_here: true,
+        },
     ],
+    // One reported target: the first scenario fits it, the second does not,
+    // so the default filter has something to hide and say it hid.
+    '/scenario-fit': {
+        targets: [
+            {
+                id: 1,
+                name: 'lab',
+                reported_at: 1757000000,
+                fit: {
+                    'dashboard-triage': { fit: 'full', missing: [] },
+                    'pack-flatline': { fit: 'none', missing: ['stoker:flatline'] },
+                },
+            },
+        ],
+    },
     '/runs': [
         {
             id: 7,
@@ -538,8 +571,18 @@ const go = async (hash) => {
     await go('#scenarios');
     await check('scenarios', 'dashboard-triage');
     await check('scenarios: lint on the card', 'no corpus check declared');
-    await check('scenarios: the archive buttons', 'Download');
     await check('scenarios: the source banner', 's3://regulator-scenarios/shared');
+    await check('scenarios: the default filter hides what fits no target', '1 hidden because no target');
+    await check('scenarios: the card says which target it fits', 'Fits');
+    if ((window.document.body.textContent || '').includes('A pack whose data this lab')) {
+        problems.push('scenarios: a scenario that fits no target was shown under the default filter');
+    }
+    clickByText('Clear filters', 'scenarios: clear filters');
+    await check('scenarios: clearing the filter shows everything', 'A pack whose data this lab');
+    await check('scenarios: a long tag list is folded', '+2');
+    await check('scenarios: edit on the card', 'Edit');
+    clickByText('More', 'scenarios: the card menu');
+    await check('scenarios: the archive buttons', 'Download');
     await check('scenarios: push appears when the source is writable', 'Push');
 
     await go('#runs');
