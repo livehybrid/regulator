@@ -54,11 +54,12 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 import time
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 
-from .params import sanitise_marker_part
+from .params import sanitise_marker_part, sid_prefix_for
 from .splunk import SplunkClient, SplunkError
 from .timepolicy import TimeWindow
 
@@ -89,9 +90,20 @@ class Probe:
     name: str
     spl: str
     description: str
+    # For a probe that aggregates with no ``by`` clause: the column holding
+    # its event count. ``stats`` with no ``by`` always returns one row, even
+    # over no events, which used to show as "1 row(s)" of zeros. A probe
+    # whose count is zero reports no rows instead.
+    count_field: str = ""
     rows: List[Dict[str, Any]] = field(default_factory=list)
     available: bool = False
     reason: str = ""
+
+    @property
+    def index(self) -> str:
+        """The internal index this probe reads, for the access check."""
+        match = re.search(r"index=(_[A-Za-z0-9_]+)", self.spl)
+        return match.group(1) if match else ""
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -102,14 +114,21 @@ class Probe:
         }
 
 
-def build_probes(marker_prefix: str) -> List[Probe]:
-    """The five questions.
+def build_probes(marker_prefix: str, sid_prefix: str = "") -> List[Probe]:
+    """The questions.
 
-    ``marker_prefix`` is the run's cache-busting marker stem, which every
-    dispatched search carries as a Splunk comment. Matching on it isolates this
-    run's searches from everything else the cluster was doing, which matters on
-    a shared cluster where the answer would otherwise be everybody's traffic.
+    ``sid_prefix`` is the stem of the search ids Regulator gave the run's jobs,
+    and ``marker_prefix`` the run's cache-busting marker stem, which every
+    dispatched search also carries as a Splunk comment. Matching on either
+    isolates this run's searches from everything else the cluster was doing,
+    which matters on a shared cluster where the answer would otherwise be
+    everybody's traffic. The search id is the primary match because it does
+    not depend on the comment surviving into the audited search string.
     """
+    if sid_prefix:
+        ours = f'(search_id="*{sid_prefix}*" OR "{marker_prefix}")'
+    else:
+        ours = f'"{marker_prefix}"'
     return [
         Probe(
             name="our_searches",
@@ -128,8 +147,9 @@ def build_probes(marker_prefix: str) -> List[Probe]:
             # Zero extra load, and it turns cache provenance into a cost per
             # search. Shape after silkyrich/cluster_health_tools; every field
             # confirmed on a live 10.4 instance.
+            count_field="searches",
             spl=(
-                f'search index=_audit action=search info=completed "{marker_prefix}" '
+                f"search index=_audit action=search info=completed {ours} "
                 "| stats count as searches, "
                 "avg(total_run_time) as avg_run_time_s, "
                 "perc95(total_run_time) as p95_run_time_s, "
@@ -163,9 +183,10 @@ def build_probes(marker_prefix: str) -> List[Probe]:
             # enqueue_seaches_count is Splunk's own spelling. Shape after
             # silkyrich/cluster_health_tools; confirmed on 10.4, which also
             # reports denied_queued_jobs_user_role and _systemwide.
+            count_field="events",
             spl=(
                 "search index=_internal sourcetype=splunkd group=search_concurrency name=search_queue_metrics "
-                "| stats sum(enqueue_seaches_count) as enqueued, max(current_queue_size) as max_queue_size, "
+                "| stats count as events, sum(enqueue_seaches_count) as enqueued, max(current_queue_size) as max_queue_size, "
                 "max(largest_queue_size) as largest_queue_size, max(max_time_spent_in_queue) as max_queued_s, "
                 "avg(avg_time_spent_in_queue) as avg_queued_s, "
                 "sum(denied_queued_jobs_user_role) as denied_by_role, sum(denied_queued_jobs_systemwide) as denied_systemwide"
@@ -203,10 +224,13 @@ def build_probes(marker_prefix: str) -> List[Probe]:
                 "dispatched counts from the searchscheduler group. The earlier and kinder "
                 "signal than a skip"
             ),
+            # By host: on a search head cluster only the captain schedules, and
+            # a member that reports nothing is visible rather than averaged in.
             spl=(
                 "search index=_internal sourcetype=splunkd group=searchscheduler "
-                "| stats max(max_lag) as max_lag_s, max(total_lag) as max_total_lag_s, sum(delayed) as delayed, "
-                "sum(skipped) as skipped, sum(dispatched) as dispatched, max(max_running) as max_running"
+                "| stats count as events, max(max_lag) as max_lag_s, max(total_lag) as max_total_lag_s, "
+                "sum(delayed) as delayed, sum(skipped) as skipped, sum(dispatched) as dispatched, "
+                "max(max_running) as max_running by host"
             ),
         ),
         Probe(
@@ -240,6 +264,7 @@ def build_probes(marker_prefix: str) -> List[Probe]:
                 "each page URL carries. Browser searches are the page's own and carry "
                 "no marker, so this is the browser channel's audit trail"
             ),
+            count_field="page_loads",
             spl=(
                 f'search index=_internal sourcetype=splunk_web_access "_reg={marker_prefix}" '
                 "| stats count as page_loads, avg(spent) as avg_spent_ms, "
@@ -269,14 +294,20 @@ def build_probes(marker_prefix: str) -> List[Probe]:
             # phase_0 is the map phase on the peers and phase_1 the reduce on
             # the search head. A standalone instance reports only phase_1
             # (checked live), so both are read and the summary says which.
+            # Bare field names, not single-quoted: stats takes single quotes as
+            # part of the name, so 'a.b' names a field that does not exist and
+            # every aggregate came back empty (confirmed on a live instance).
+            # Single quotes mean "field" only in eval and where. A name stats
+            # cannot take bare, like search_commands{}, is double-quoted.
+            count_field="searches",
             spl=(
                 "search index=_introspection sourcetype=search_telemetry "
                 "| stats count as searches, "
-                "avg('phases.phase_0.elapsed_time_aggregations.avg') as avg_indexer_ms, "
-                "perc95('phases.phase_0.elapsed_time_aggregations.max') as p95_indexer_ms, "
-                "avg('phases.phase_1.elapsed_time_aggregations.avg') as avg_reduce_ms, "
-                "perc95('phases.phase_1.elapsed_time_aggregations.max') as p95_reduce_ms, "
-                "avg('search_commands{}.maxPeerDuration') as avg_max_peer_s"
+                'avg(phases.phase_0.elapsed_time_aggregations.avg) as avg_indexer_ms, '
+                'perc95(phases.phase_0.elapsed_time_aggregations.max) as p95_indexer_ms, '
+                'avg(phases.phase_1.elapsed_time_aggregations.avg) as avg_reduce_ms, '
+                'perc95(phases.phase_1.elapsed_time_aggregations.max) as p95_reduce_ms, '
+                'avg("search_commands{}.maxPeerDuration") as avg_max_peer_s'
             ),
         ),
         Probe(
@@ -311,12 +342,13 @@ def build_probes(marker_prefix: str) -> List[Probe]:
                 "laid against the machine's own load"
             ),
             # By host, so a search head and its indexers are never averaged
-            # into one number that describes neither.
+            # into one number that describes neither. Bare field names: see
+            # search_telemetry.
             spl=(
                 "search index=_introspection sourcetype=splunk_resource_usage component=Hostwide "
-                "| stats avg('data.cpu_system_pct') as avg_system_cpu_pct, "
-                "avg('data.cpu_user_pct') as avg_user_cpu_pct, "
-                "max('data.cpu_user_pct') as max_user_cpu_pct by host"
+                '| stats avg(data.cpu_system_pct) as avg_system_cpu_pct, '
+                'avg(data.cpu_user_pct) as avg_user_cpu_pct, '
+                'max(data.cpu_user_pct) as max_user_cpu_pct by host'
             ),
         ),
     ]
@@ -329,6 +361,7 @@ async def correlate(
     marker_prefix: str,
     timeout_s: float = QUERY_TIMEOUT_S,
     settle_s: float = SETTLE_S,
+    sid_prefix: str = "",
 ) -> Dict[str, Any]:
     """Ask the cluster what it thought was happening. Never raises."""
     if settle_s > 0:
@@ -347,8 +380,14 @@ async def correlate(
     # "correlation works".
     latest = max(ended_at, time.time()) + AUDIT_TAIL_S
     window = TimeWindow(earliest=started_at, latest=latest)
-    probes = build_probes(marker_prefix)
+    probes = build_probes(marker_prefix, sid_prefix)
     notes: List[str] = []
+
+    # Which internal indexes this account can see at all. A search over an
+    # index the account cannot read returns nothing and no error, so without
+    # this "no access" and "nothing happened" look identical. None means the
+    # check itself failed and every probe runs as before.
+    readable = await _readable_indexes(client, timeout_s)
 
     async def run_probe(probe: Probe) -> None:
         try:
@@ -365,12 +404,19 @@ async def correlate(
             probe.reason = str(exc)[:300]
             return
         probe.available = True
-        probe.rows = rows
+        probe.rows = _drop_empty_aggregate(probe, rows)
 
     # Sequential rather than concurrent. These run against the cluster that has
     # just been load tested, and firing six searches at once at something still
     # recovering is a poor way to end a benchmark.
     for probe in probes:
+        if readable is not None and probe.index and probe.index not in readable:
+            probe.reason = (
+                f"not run: this account cannot read {probe.index}, or it holds no events "
+                "(| eventcount found none)"
+            )
+            notes.append(f"{probe.name}: {probe.reason}")
+            continue
         await run_probe(probe)
         if not probe.available and probe.reason:
             notes.append(f"{probe.name}: {probe.reason}")
@@ -383,12 +429,14 @@ async def correlate(
             "settled_s": settle_s,
         },
         "marker_prefix": marker_prefix,
+        "sid_prefix": sid_prefix,
+        "readable_indexes": sorted(readable) if readable is not None else None,
         "probes": {probe.name: probe.to_dict() for probe in probes},
         "notes": notes,
         # These searches ran on the cluster under test. Small, after the fact,
         # and recorded rather than pretended away.
         "self_load": {
-            "queries": len(probes),
+            "queries": sum(1 for probe in probes if not probe.reason.startswith("not run:")) + 1,
             "note": (
                 "these correlation searches ran on the target after the load stopped, so "
                 "they add a small, known amount of work to the system being measured"
@@ -397,6 +445,47 @@ async def correlate(
     }
     result["findings"] = _findings(result)
     return result
+
+
+ACCESS_CHECK_SPL = (
+    "| eventcount summarize=false index=_audit index=_internal index=_introspection "
+    "| stats sum(count) as events by index"
+)
+
+
+async def _readable_indexes(client: SplunkClient, timeout_s: float) -> Optional[set]:
+    """The internal indexes this account can read that hold events, or None."""
+    try:
+        rows, _ = await asyncio.wait_for(
+            client.oneshot(ACCESS_CHECK_SPL, TimeWindow(earliest=0, latest=time.time()), count=10),
+            timeout=timeout_s,
+        )
+    except Exception as exc:  # noqa: BLE001 - the check is a nicety, never a failure
+        log.info("index access check failed, running every probe: %s", exc)
+        return None
+    if not any(isinstance(row, dict) and row.get("index") for row in rows):
+        # Nothing usable came back: a target that does not answer eventcount
+        # as expected is not evidence that every index is unreadable.
+        return None
+    readable = set()
+    for row in rows:
+        try:
+            if float(row.get("events") or 0) > 0 and row.get("index"):
+                readable.add(str(row["index"]))
+        except (TypeError, ValueError):
+            continue
+    return readable
+
+
+def _drop_empty_aggregate(probe: Probe, rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """No rows, rather than one row of zeros, for an aggregate over nothing."""
+    if not probe.count_field or not rows:
+        return rows
+    try:
+        total = sum(float(row.get(probe.count_field) or 0) for row in rows)
+    except (TypeError, ValueError):
+        return rows
+    return rows if total > 0 else []
 
 
 def _findings(correlation: Dict[str, Any]) -> List[str]:
@@ -410,8 +499,9 @@ def _findings(correlation: Dict[str, Any]) -> List[str]:
         return rows[0] if rows and probe.get("available") else {}
 
     ours = first_row("our_searches")
-    if ours.get("searches") is not None:
-        counted = int(float(ours["searches"] or 0))
+    ours_probe = probes.get("our_searches") or {}
+    if ours.get("searches") is not None or ours_probe.get("available"):
+        counted = int(float(ours.get("searches") or 0))
         p95 = _number(ours.get("p95_run_time_s"))
         tail = f", p95 run time {p95}s" if p95 != "unknown" else ""
         if counted:

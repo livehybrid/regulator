@@ -241,6 +241,21 @@ def cache_bust_marker(run_id: str, vu_id: int, iteration: int, step_id: str) -> 
     )
 
 
+_SID_SAFE = re.compile(r"[^A-Za-z0-9_]")
+
+
+def sid_prefix_for(run_id: str) -> str:
+    """The search-id stem every job Regulator dispatches in a run starts with.
+
+    Jobs are dispatched with their own ``id`` so the target's ``_audit``
+    records of a run can be found by ``search_id``. That does not depend on the
+    cache-bust comment surviving into the audited search string. Letters,
+    digits and underscores only: a search id becomes a dispatch directory name
+    on the search head, and it lands in a quoted SPL operand when correlating.
+    """
+    return f"reg_{_SID_SAFE.sub('_', str(run_id))[:48]}_"
+
+
 def apply_cache_bust(spl: str, marker: str) -> str:
     """Append the marker as a Splunk comment."""
     return f"{spl.rstrip()}{CACHE_BUST_TEMPLATE.format(marker=marker)}"

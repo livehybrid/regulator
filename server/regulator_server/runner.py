@@ -29,7 +29,7 @@ from typing import Any, Dict, List, Optional
 
 from regulator_agent.engines import BrowserUnavailable, get_engine
 from regulator_agent.hec import HecEmitter
-from regulator_agent.params import ParameterResolver, sanitise_marker_part
+from regulator_agent.params import ParameterResolver, sanitise_marker_part, sid_prefix_for
 from regulator_agent.results import RunStats
 from regulator_agent.scenario import is_advice, lint, scenario_digest
 from regulator_agent.scheduler import Scheduler
@@ -489,6 +489,7 @@ class RunManager:
                     summary.started_at,
                     summary.ended_at,
                     marker_prefix_for(config.run_id),
+                    sid_prefix=sid_prefix_for(config.run_id),
                 )
                 if isinstance(summary.sut, dict):
                     self._lifecycle(run_id, "correlation", findings=summary.sut.get("findings"), probes=sorted((summary.sut.get("probes") or {}).keys()))

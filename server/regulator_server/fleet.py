@@ -45,6 +45,7 @@ from regulator_agent.results import merge_intervals
 from regulator_agent.scenario import Scenario, load_scenario
 from regulator_agent.smartstore import cache_state, delta as cache_delta, evict_all
 from regulator_agent.splunk import SplunkClient
+from regulator_agent.params import sid_prefix_for
 from regulator_agent.sut import correlate, marker_prefix_for
 
 from .adapters import hec_config, indexer_settings, scenario_path, target_config
@@ -1123,7 +1124,10 @@ class FleetRun(threading.Thread):
                 merged["cache"] = {"available": False, "reason": before.reason}
             if merged.get("started_at") and merged.get("ended_at") and summaries:
                 try:
-                    merged["sut"] = await correlate(client, merged["started_at"], merged["ended_at"], marker_prefix_for(label))
+                    merged["sut"] = await correlate(
+                        client, merged["started_at"], merged["ended_at"], marker_prefix_for(label),
+                        sid_prefix=sid_prefix_for(label),
+                    )
                 except Exception as exc:  # noqa: BLE001 - correlation never fails a run
                     log.warning("correlation failed for run %s: %s", self.run_id, exc)
             from .runner import manager as _manager

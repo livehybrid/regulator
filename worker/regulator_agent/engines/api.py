@@ -30,11 +30,14 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import itertools
+import logging
+import secrets
 import time
 from typing import Any, Dict, List, Optional, Tuple
 
 from ..config import Config
-from ..params import DrawContext, ParameterResolver
+from ..params import DrawContext, ParameterResolver, sid_prefix_for
 from ..results import (
     ERROR_AUTH,
     ERROR_CANCELLED,
@@ -57,6 +60,8 @@ from ..splunk import (
 )
 from ..timepolicy import TimeWindow
 from .base import StepContext, TargetCapabilities
+
+log = logging.getLogger("regulator.engine.api")
 
 ADVICE = "advice: "
 
@@ -139,6 +144,46 @@ class ApiEngine:
             max_connections=config.max_in_flight,
         )
         self._closed = False
+        # Every job gets a search id Regulator chose, so the post-run
+        # correlation can find this run in _audit by search_id. The random
+        # part keeps two workers, or a re-run under the same label, apart.
+        self._sid_stem = f"{sid_prefix_for(config.run_id)}{int(config.slot)}_{secrets.token_hex(3)}_"
+        self._sid_seq = itertools.count(1)
+        # None until splunkd has accepted one custom id. A target that refuses
+        # them gets random ids for the rest of the run instead of failing.
+        self._custom_sid: Optional[bool] = None
+
+    def _next_sid(self) -> Optional[str]:
+        if self._custom_sid is False:
+            return None
+        return f"{self._sid_stem}{next(self._sid_seq)}"
+
+    async def _create_job(self, spl: str, window: TimeWindow, **kwargs: Any) -> Tuple[str, float, int]:
+        """Dispatch with a Regulator search id, falling back to splunkd's own.
+
+        Until a custom id has been accepted once, an HTTP 400 is retried a
+        single time without one. If that succeeds the target is taken not to
+        accept custom ids and none are sent again; if it fails too, the error
+        was the search's own and is raised as usual.
+        """
+        sid = self._next_sid()
+        if sid is None:
+            return await self._client.create_job(spl, window, **kwargs)
+        try:
+            result = await self._client.create_job(spl, window, sid=sid, **kwargs)
+        except SplunkHttpError as exc:
+            if self._custom_sid or exc.status != 400:
+                raise
+            result = await self._client.create_job(spl, window, **kwargs)
+            self._custom_sid = False
+            log.warning(
+                "the target refused a custom search id (%s); dispatching with "
+                "splunkd's own ids, so _audit correlation falls back to the run marker",
+                str(exc)[:200],
+            )
+            return result
+        self._custom_sid = True
+        return result
 
     @property
     def client(self) -> SplunkClient:
@@ -595,7 +640,7 @@ class ApiEngine:
                 owner=self._config.target.owner,
             )
         else:
-            sid, dispatch_ms, status = await self._client.create_job(
+            sid, dispatch_ms, status = await self._create_job(
                 ctx.spl,
                 ctx.window,
                 exec_mode=ctx.step.exec_mode,
