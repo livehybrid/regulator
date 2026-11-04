@@ -607,6 +607,16 @@ class FakeSplunk:
             return 200, _conf_limits()
         if path.startswith("/services/data/indexes") and method == "GET":
             return self._index(path)
+        if path == "/services/apps/local" and method == "GET":
+            # Every app that owns one of the fake's saved searches, plus the
+            # launcher, which a real instance always has and which owns none.
+            names = sorted({str(s.get("app") or "search") for s in self.config.saved_searches} | {"launcher"})
+            return 200, {
+                "entry": [
+                    {"name": name, "content": {"label": name.title(), "disabled": "0"}}
+                    for name in names
+                ]
+            }
         if path == "/services/configs/conf-server/cachemanager" and method == "GET":
             return self._cacheman_config()
         if path == "/services/admin/cacheman" and method == "GET":

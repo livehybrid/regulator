@@ -620,12 +620,18 @@ async def _report_summary(
             stats["partial"],
         )
     if stats.get("abandoned"):
+        unfinished = stats.get("unfinished") or {}
+        after = (unfinished.get("run_duration") or {})
         log.warning(
-            "%d search(es) were still in flight when the run ended and were abandoned "
-            "after the %.0fs drain budget. They are recorded as cancelled failures with "
-            "the time they had accrued, so the tail is a floor rather than a measurement",
+            "%d search(es) were still running when the run ended and the %.0fs drain "
+            "budget ran out. They are counted as unfinished, not as errors. %d finished "
+            "after the run (server-side run time p95 %s ms) and %d were still running "
+            "when the follow-up gave up",
             stats["abandoned"],
             config.drain_budget_s,
+            int(unfinished.get("finished_after_end") or 0),
+            after.get("p95_ms", "n/a"),
+            int(unfinished.get("still_running") or 0),
         )
 
     if not summary.co_corrected:

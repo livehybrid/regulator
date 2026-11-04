@@ -11,12 +11,28 @@ import Tooltip from '@splunk/react-ui/Tooltip';
 import { Mono, Muted } from './primitives';
 import { DASH, fmtNum, isBlank } from '../format';
 
-export default function SavedSearchTable({ rows }) {
+export const rowKey = (r) => `${r.app || ''}:${r.name}`;
+
+/**
+ * With ``selected`` (a Set of rowKey values) and ``onToggle`` the table grows a
+ * checkbox per row and a select-all in the header; without them it is the
+ * read-only listing it always was.
+ */
+export default function SavedSearchTable({ rows, selected, onToggle, onToggleAll }) {
     if (!rows || !rows.length) {
         return <Muted>No saved searches were returned.</Muted>;
     }
+    const selectable = !!(selected && onToggle);
+    let allState = 'none';
+    if (selectable) {
+        const count = rows.filter((r) => selected.has(rowKey(r))).length;
+        allState = count === 0 ? 'none' : count === rows.length ? 'all' : 'some';
+    }
     return (
-        <Table horizontalOverflow="scroll">
+        <Table
+            horizontalOverflow="scroll"
+            {...(selectable ? { rowSelection: allState, onRequestToggleAllRows: onToggleAll } : {})}
+        >
             <Table.Head>
                 <Table.HeadCell>Name</Table.HeadCell>
                 <Table.HeadCell>App</Table.HeadCell>
@@ -28,7 +44,15 @@ export default function SavedSearchTable({ rows }) {
             </Table.Head>
             <Table.Body>
                 {rows.map((r) => (
-                    <Table.Row key={`${r.app || ''}:${r.name}`}>
+                    <Table.Row
+                        key={rowKey(r)}
+                        {...(selectable
+                            ? {
+                                  selected: selected.has(rowKey(r)),
+                                  onRequestToggle: () => onToggle(rowKey(r)),
+                              }
+                            : {})}
+                    >
                         <Table.Cell>
                             <Tooltip content={r.search} defaultPlacement="right">
                                 <Mono>{r.name}</Mono>
@@ -68,4 +92,9 @@ export default function SavedSearchTable({ rows }) {
     );
 }
 
-SavedSearchTable.propTypes = { rows: PropTypes.array };
+SavedSearchTable.propTypes = {
+    rows: PropTypes.array,
+    selected: PropTypes.instanceOf(Set),
+    onToggle: PropTypes.func,
+    onToggleAll: PropTypes.func,
+};

@@ -144,6 +144,10 @@ class ApiEngine:
             max_connections=config.max_in_flight,
         )
         self._closed = False
+        # Jobs the drain abandoned whose searches were left running on the
+        # target, so the harvest can report how long they really took:
+        # (record, perf_counter at dispatch).
+        self._parked: List[Tuple[StepRecord, float]] = []
         # Every job gets a search id Regulator chose, so the post-run
         # correlation can find this run in _audit by search_id. The random
         # part keeps two workers, or a re-run under the same label, apart.
@@ -542,7 +546,11 @@ class ApiEngine:
             record.error_detail = "the run ended while this search was still in flight"
             record.service_time_ms = (time.perf_counter() - started) * 1000.0
             ctx.outcome.append(record)
-            await self._tidy(record)
+            if record.sid and self._config.harvest_s > 0 and ctx.step.exec_mode not in ("oneshot", "export"):
+                # Left running for the harvest, which deletes it either way.
+                self._parked.append((record, started))
+            else:
+                await self._tidy(record)
             raise
         except SplunkLoginRejected as exc:
             record.ok = False
@@ -587,6 +595,65 @@ class ApiEngine:
         record.service_time_ms = (time.perf_counter() - started) * 1000.0
         await self._tidy(record)
         return record
+
+    async def harvest(
+        self, budget_s: float, abort: Optional[asyncio.Event] = None
+    ) -> List[Tuple[StepRecord, Optional[float], bool]]:
+        """Follow abandoned searches to completion after the run.
+
+        Returns ``(record, run_duration_s, finished)`` for each parked job.
+        Each job is followed for at most ``budget_s`` overall and never past
+        ``read_timeout_s`` from its own dispatch, the same limit a search gets
+        during the run. Every parked job is deleted at the end, finished or
+        not, so nothing is left running on the target.
+        """
+        parked, self._parked = self._parked, []
+        if not parked:
+            return []
+        log.info(
+            "following %d search(es) still running at the end of the run for up to %.0fs",
+            len(parked), budget_s,
+        )
+        overall = time.perf_counter() + max(0.0, budget_s)
+        pending = {record.sid: (record, started) for record, started in parked if record.sid}
+        results: Dict[str, Tuple[StepRecord, Optional[float], bool]] = {}
+        interval_s = max(0.5, self._config.poll_max_ms / 1000.0)
+        try:
+            while pending:
+                now = time.perf_counter()
+                for sid, (record, started) in list(pending.items()):
+                    if now >= min(overall, started + self._config.read_timeout_s):
+                        results[sid] = (record, None, False)
+                        del pending[sid]
+                        continue
+                    try:
+                        status = await self._client.job_status(sid)
+                    except Exception as exc:  # noqa: BLE001 - one lost job is not a failed harvest
+                        log.debug("harvest: job %s unreadable: %s", sid, exc)
+                        results[sid] = (record, None, False)
+                        del pending[sid]
+                        continue
+                    if status.is_done or status.is_failed:
+                        finished = status.is_done and not status.is_failed
+                        results[sid] = (record, status.run_duration_s if finished else None, finished)
+                        del pending[sid]
+                if not pending:
+                    break
+                if abort is not None and abort.is_set():
+                    for sid, (record, _) in pending.items():
+                        results[sid] = (record, None, False)
+                    break
+                await asyncio.sleep(interval_s)
+        finally:
+            for record, _ in parked:
+                await self._tidy(record)
+        return [results[record.sid] for record, _ in parked if record.sid in results]
+
+    async def discard_parked(self) -> None:
+        """Delete parked jobs without following them (the run was stopped)."""
+        parked, self._parked = self._parked, []
+        for record, _ in parked:
+            await self._tidy(record)
 
     async def _tidy(self, record: StepRecord) -> None:
         """Delete the job artefact, whatever happened to the poll.

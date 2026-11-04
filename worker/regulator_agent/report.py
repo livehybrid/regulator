@@ -55,7 +55,11 @@ def _int(value: Any) -> Optional[int]:
 # How far back the sourcetype census looks. Long enough to see anything with a
 # regular heartbeat, short enough that tstats stays quick on a large estate.
 SOURCETYPE_WINDOW_S = 7 * 86400
-SOURCETYPE_LIMIT = 40
+# Rows kept from the census. It decides which scenarios a target "fits", so
+# a short list wrongly marks a low-volume pack's sourcetype as absent on any
+# estate with more pairs than this. tstats over the metadata stays cheap at a
+# thousand rows; the console shows only the largest of them.
+SOURCETYPE_LIMIT = 1000
 
 
 async def _sourcetypes(client: SplunkClient, notes: List[str]) -> List[Dict[str, Any]]:
@@ -279,12 +283,12 @@ async def target_report(
             "covering the corpus"
         )
 
-    report["scenario_fit"] = _scenario_fit(report, scenarios or [])
+    report["scenario_fit"] = scenario_fit(report, scenarios or [])
     report["recommended_scenario"] = _recommend(report)
     return report
 
 
-def _scenario_fit(report: Dict[str, Any], scenarios: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+def scenario_fit(report: Dict[str, Any], scenarios: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     """Which scenarios this cluster holds data for, from the sourcetype census.
 
     A scenario that names sourcetypes the census does not show searches

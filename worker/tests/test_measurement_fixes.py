@@ -276,8 +276,14 @@ def test_work_in_flight_at_the_end_is_recorded_as_abandoned_not_dropped(env):
     scheduler = Scheduler(scenario=scenario, config=config, engine=engine, resolver=resolver)
     summary = run_async(scheduler.run())
     assert summary.stats["abandoned"] == 2
-    assert summary.stats["errors"] == 2
-    assert summary.stats["errors_by_class"] == {ERROR_CANCELLED: 2}
+    # Unfinished, not failed: a search the run stopped waiting for is kept out
+    # of the error rate, and reported on its own.
+    assert summary.stats["errors"] == 0
+    assert summary.stats["executions"] == 0
+    assert summary.stats["errors_by_class"] == {}
+    assert summary.stats["unfinished"]["count"] == 2
+    steps = {s["step_id"]: s for s in summary.stats["steps"]}
+    assert sum(s["unfinished"] for s in steps.values()) == 2
 
 
 def test_ramp_down_retires_users_after_their_iteration_not_during(env):
@@ -365,3 +371,36 @@ def test_fleet_slots_draw_different_arrival_streams(env):
         offsets.append([round(value - starts[0], 4) for value in starts])
     assert len(offsets[0]) > 3 and len(offsets[1]) > 3
     assert offsets[0] != offsets[1]
+
+
+class _HarvestingEngine(FakeEngine):
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self.harvested = None
+        self.discarded = False
+
+    async def harvest(self, budget_s, abort=None):
+        self.harvested = budget_s
+        return [(None, 3.5, True), (None, None, False)]
+
+    async def discard_parked(self):
+        self.discarded = True
+
+
+def test_a_normal_end_harvests_and_a_stopped_run_does_not(env):
+    doc = copy.deepcopy(tiny_scenario_dict())
+    doc["load"] = {"model": "closed", "virtual_users": 1, "duration": "0.1s"}
+    scenario, config, resolver = build(doc, env, REG_HARVEST_S="30")
+
+    engine = _HarvestingEngine(latency=0.001)
+    summary = run_async(Scheduler(scenario=scenario, config=config, engine=engine, resolver=resolver).run())
+    assert engine.harvested == 30.0 and not engine.discarded
+    assert summary.stats["unfinished"]["finished_after_end"] == 1
+    assert summary.stats["unfinished"]["still_running"] == 1
+    assert summary.stats["unfinished"]["run_duration"]["max_ms"] >= 3400
+
+    engine = _HarvestingEngine(latency=0.001)
+    scheduler = Scheduler(scenario=scenario, config=config, engine=engine, resolver=resolver)
+    scheduler.request_stop("operator pressed stop")
+    run_async(scheduler.run())
+    assert engine.harvested is None and engine.discarded

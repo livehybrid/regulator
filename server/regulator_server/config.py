@@ -263,6 +263,11 @@ class ServerConfig:
     # The longest a run may spend paused in total before it is stopped. Not
     # resumed: somebody paused it, quite possibly to protect the cluster.
     max_pause_s: float = 1800.0
+    # Handed to fleet workers, and used to size the supervisor's deadlines so
+    # a worker still draining or harvesting is not declared lost. See the
+    # worker's Config.drain_budget_s and Config.harvest_s.
+    drain_budget_s: float = 60.0
+    harvest_s: float = 240.0
     # Bearer tokens for scripts and CI. Compared in constant time. A token is
     # as powerful as the password, so treat it as one.
     api_tokens: tuple[str, ...] = field(default=(), repr=False)
@@ -449,6 +454,8 @@ def load_server_config(env: Optional[Mapping[str, str]] = None) -> ServerConfig:
         max_concurrent_runs=_integer(env, "REG_MAX_CONCURRENT_RUNS", 2, minimum=1),
         max_run_duration_s=float(_integer(env, "REG_MAX_RUN_DURATION_S", 4 * 3600, minimum=1)),
         max_pause_s=float(_integer(env, "REG_MAX_PAUSE_S", 1800, minimum=0)),
+        drain_budget_s=float(_integer(env, "REG_DRAIN_BUDGET_S", 60, minimum=1)),
+        harvest_s=float(_integer(env, "REG_HARVEST_S", 240, minimum=0)),
         api_tokens=tokens,
         allow_unauthenticated=_boolean(env, "REG_ALLOW_UNAUTHENTICATED", False),
         sample_interval_s=float(_integer(env, "REG_SAMPLE_INTERVAL_S", 5, minimum=1)),

@@ -314,9 +314,14 @@ class Config:
     # rather than at boot.
     lint_strict: bool = True
     # How long in-flight searches may finish after the run ends before they
-    # are abandoned. Abandoned work is recorded as a cancelled failure with
-    # the time it had accrued, never silently dropped.
+    # are abandoned. Abandoned work is counted as unfinished (not as an
+    # error), never silently dropped.
     drain_budget_s: float = 60.0
+    # After a run that completed normally, how long to keep polling searches
+    # the drain abandoned, so their real run time is reported rather than a
+    # floor. Their jobs are left running on the target for that long (never
+    # past read_timeout_s). 0 cancels them at the end of the drain, as before.
+    harvest_s: float = 240.0
     # The longest a run may stay paused, in total, before it is stopped. A
     # forgotten pause must not hold a run slot forever, nor resume load
     # unattended on a cluster somebody paused it to protect.
@@ -498,6 +503,7 @@ def load_config(env: Optional[Mapping[str, str]] = None) -> Config:
         builtin_scenarios_dir=_get(env, "REG_BUILTIN_SCENARIOS_DIR"),
         lint_strict=_boolean(env, "REG_LINT_STRICT", True),
         drain_budget_s=_number(env, "REG_DRAIN_BUDGET_S", 60.0, minimum=1.0),
+        harvest_s=_number(env, "REG_HARVEST_S", 240.0, minimum=0.0),
         max_pause_s=_number(env, "REG_MAX_PAUSE_S", 1800.0, minimum=0.0),
         sut_settle_s=_number(env, "REG_SUT_SETTLE_S", 8.0, minimum=0.0),
         indexer_urls=tuple(
