@@ -571,6 +571,56 @@ def test_concurrency_queueing_is_visible_when_the_target_has_a_ceiling(env):
         server.close()
 
 
+def test_jobs_are_dispatched_with_a_regulator_search_id(splunkd, env):
+    """The post-run _audit correlation finds the run by this id."""
+    from regulator_agent.params import sid_prefix_for
+
+    async def scenario():
+        config = make_config(splunkd, env)
+        engine = ApiEngine(config)
+        await engine.start()
+        try:
+            first = await engine.execute(context_for(search_step(result_count=1)))
+            second = await engine.execute(context_for(search_step(result_count=1)))
+        finally:
+            await engine.close()
+        return config, first, second
+
+    config, first, second = run_async(scenario())
+    stem = sid_prefix_for(config.run_id)
+    assert first.ok and second.ok
+    assert first.sid.startswith(stem) and second.sid.startswith(stem)
+    assert first.sid != second.sid
+
+
+def test_a_target_that_refuses_custom_search_ids_falls_back_once(splunkd, env):
+    from regulator_agent.splunk import SplunkHttpError
+
+    calls = []
+
+    async def scenario():
+        engine = ApiEngine(make_config(splunkd, env))
+        await engine.start()
+        real = engine.client.create_job
+
+        async def refusing(spl, window, sid=None, **kwargs):
+            calls.append(sid)
+            if sid:
+                raise SplunkHttpError(400, "bad id", context="dispatch")
+            return await real(spl, window, **kwargs)
+
+        engine.client.create_job = refusing
+        try:
+            first = await engine.execute(context_for(search_step(result_count=1)))
+            second = await engine.execute(context_for(search_step(result_count=1)))
+        finally:
+            await engine.close()
+        return first, second
+
+    first, second = run_async(scenario())
+    assert first.ok and second.ok
+    # One refused custom id, its retry, then splunkd's own ids from then on.
+    assert calls[0] and calls[1:] == [None, None]
 # ------------------------------------------------- searches running at the end
 
 

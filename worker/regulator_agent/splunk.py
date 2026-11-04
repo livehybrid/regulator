@@ -645,6 +645,7 @@ class SplunkClient:
         exec_mode: str = "normal",
         adhoc_search_level: Optional[str] = None,
         auto_cancel_s: Optional[int] = None,
+        sid: Optional[str] = None,
     ) -> Tuple[str, float, int]:
         """Dispatch a search, returning ``(sid, dispatch_ms, http_status)``.
 
@@ -653,8 +654,15 @@ class SplunkClient:
         under pressure the time to *accept* a search climbs long before the time
         to run one does, so a rising dispatch time with flat run durations is
         the earliest visible sign of admission-control pressure.
+
+        ``sid`` asks splunkd to use that search id instead of a random one
+        (the ``id`` argument of ``search/jobs``). Regulator uses it so the
+        target's ``_audit`` records of a run can be matched by ``search_id``
+        rather than by a comment in the search string.
         """
         form: Dict[str, Any] = {"search": spl, "exec_mode": exec_mode}
+        if sid:
+            form["id"] = sid
         form.update(window.as_args())
         if adhoc_search_level:
             form["adhoc_search_level"] = adhoc_search_level

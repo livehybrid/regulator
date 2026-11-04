@@ -42,7 +42,7 @@ from .compare import GateError, compare_runs
 from .config import Config, ConfigError, load_config, load_managed_boot
 from .engines import BrowserUnavailable, get_engine
 from .hec import HecEmitter
-from .params import ParameterResolver
+from .params import ParameterResolver, sid_prefix_for
 from .report import render, target_report
 from .smartstore import CacheState, cache_state, delta as cache_delta, evict_all
 from .sut import correlate, marker_prefix_for
@@ -486,6 +486,7 @@ async def _run(config: Config, args: argparse.Namespace) -> int:
                 summary.ended_at,
                 marker_prefix_for(config.run_id),
                 settle_s=config.sut_settle_s,
+                sid_prefix=sid_prefix_for(config.run_id),
             )
             for finding in summary.sut.get("findings", []):
                 log.info("target: %s", finding)

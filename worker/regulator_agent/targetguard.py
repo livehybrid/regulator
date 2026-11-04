@@ -66,7 +66,7 @@ LOOKBACK_S = 180.0
 
 _CPU_SPL = (
     "search index=_introspection sourcetype=splunk_resource_usage component=Hostwide "
-    "| stats max('data.cpu_user_pct') as cpu by host "
+    "| stats max(data.cpu_user_pct) as cpu by host "
     "| sort 0 - cpu | head 1"
 )
 

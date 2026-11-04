@@ -90,7 +90,8 @@ def test_correlation_returns_a_result_for_every_probe(splunkd, env):
 def test_the_self_load_is_recorded_rather_than_pretended_away(splunkd, env):
     """These searches run on the cluster under test. Small, but not zero."""
     result = correlate_against(splunkd, env)
-    assert result["self_load"]["queries"] == len(build_probes("x"))
+    # Every probe plus the index access check that runs before them.
+    assert result["self_load"]["queries"] == len(build_probes("x")) + 1
     assert "add a small" in result["self_load"]["note"]
 
 
@@ -269,3 +270,89 @@ def test_findings_tell_a_role_quota_from_the_instance_ceiling():
         "queueing_reasons": {"available": True, "rows": [{"reason": "The maximum number of concurrent historical searches for this role has been reached.", "count": "3"}]},
     }})
     assert any("per-role quota" in f for f in quota), quota
+
+
+# ------------------------------------------------- probe accuracy (SPL shape)
+
+
+def test_no_probe_single_quotes_a_field_inside_stats():
+    """stats takes 'a.b' as a field literally named with quotes.
+
+    Every aggregate over such a name came back empty, so resource_usage listed
+    hosts with no CPU figures. Single quotes mean "field" only in eval/where.
+    """
+    import re
+
+    from regulator_agent.targetguard import _CPU_SPL
+
+    pattern = re.compile(r"\b(?:avg|max|min|sum|perc\d+|count)\(\s*'")
+    for probe in build_probes("reg:x:", "reg_x_"):
+        assert not pattern.search(probe.spl), probe.name
+    assert not pattern.search(_CPU_SPL)
+
+
+def test_our_searches_match_by_search_id_as_well_as_the_marker():
+    probes = {p.name: p for p in build_probes("reg:run-7:", "reg_run_7_")}
+    spl = probes["our_searches"].spl
+    assert 'search_id="*reg_run_7_*"' in spl
+    assert '"reg:run-7:"' in spl
+
+
+def test_the_sid_prefix_is_safe_in_a_search_id_and_an_spl_operand():
+    from regulator_agent.params import sid_prefix_for
+
+    assert sid_prefix_for("r12-nightly run") == "reg_r12_nightly_run_"
+    assert sid_prefix_for('x" | delete') == "reg_x____delete_"
+
+
+def test_an_aggregate_over_no_events_reports_no_rows():
+    """stats with no by clause returns one row of zeros over nothing."""
+    from regulator_agent.sut import _drop_empty_aggregate
+
+    probes = {p.name: p for p in build_probes("reg:x:")}
+    ours = probes["our_searches"]
+    assert _drop_empty_aggregate(ours, [{"searches": "0", "cache_lookups": "0"}]) == []
+    rows = [{"searches": "3"}]
+    assert _drop_empty_aggregate(ours, rows) == rows
+    # A grouped probe is left alone: no events means no rows already.
+    resources = probes["resource_usage"]
+    assert _drop_empty_aggregate(resources, [{"host": "sh1"}]) == [{"host": "sh1"}]
+
+
+class _StubClient:
+    """Answers the access check, then every probe with one zero row."""
+
+    def __init__(self, eventcount):
+        self.eventcount = eventcount
+        self.searches = []
+
+    async def oneshot(self, spl, window, count=50):
+        self.searches.append(spl)
+        if spl.startswith("| eventcount"):
+            if isinstance(self.eventcount, Exception):
+                raise self.eventcount
+            return self.eventcount, None
+        return [{"searches": "0", "events": "0"}], None
+
+
+def test_a_probe_on_an_unreadable_index_is_skipped_and_says_why():
+    client = _StubClient([{"index": "_internal", "events": "1000"}])
+    result = run_async(correlate(client, 1.0, 2.0, "reg:x:", settle_s=0, sid_prefix="reg_x_"))
+    ours = result["probes"]["our_searches"]
+    assert not ours["available"]
+    assert "cannot read _audit" in ours["reason"]
+    assert not any("index=_audit" in s for s in client.searches if not s.startswith("| eventcount"))
+    assert result["probes"]["queueing"]["available"]
+    assert result["readable_indexes"] == ["_internal"]
+
+
+def test_a_failed_access_check_runs_every_probe():
+    from regulator_agent.splunk import SplunkError
+
+    client = _StubClient(SplunkError("eventcount is not allowed"))
+    result = run_async(correlate(client, 1.0, 2.0, "reg:x:", settle_s=0))
+    assert result["readable_indexes"] is None
+    assert all(p["available"] for p in result["probes"].values())
+    # And an aggregate over nothing is "no matching events", not zeros.
+    assert result["probes"]["our_searches"]["rows"] == []
+    assert any("none of this run's searches yet" in f for f in result["findings"])

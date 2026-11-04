@@ -378,7 +378,7 @@ class FakeSplunk:
         api_version: str,
         internal: bool = False,
     ) -> _Job:
-        sid = str(uuid.uuid4())
+        sid = _first(form, "id", "") or str(uuid.uuid4())
         with self._lock:
             now = time.monotonic()
             self._pump_locked(now)
