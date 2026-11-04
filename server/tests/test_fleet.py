@@ -670,3 +670,23 @@ def test_a_pause_moves_the_fleet_deadline(tmp_path):
     run = Run(scenario="smoke", paused_s=40.0, paused_at=time.time() - 20.0)
     assert 59.0 < fleet.paused_seconds(run) < 61.0
     assert fleet.paused_seconds(Run(scenario="smoke")) == 0.0
+
+
+def test_merging_adds_up_searches_unfinished_at_the_end():
+    a = _summary(0, [100.0], 1)
+    b = _summary(1, [100.0], 1)
+    after = LatencyHistogram()
+    after.record_ms(90_000.0)
+    for doc, finished, running in ((a, 1, 0), (b, 0, 2)):
+        doc["stats"]["abandoned"] = finished + running
+        doc["stats"]["unfinished"] = {"count": finished + running, "finished_after_end": finished, "still_running": running}
+        doc["stats"]["steps"][0]["unfinished"] = finished + running
+        doc["stats"]["histograms"]["after_end_run_duration"] = (after if finished else LatencyHistogram()).to_dict()
+    stats = fleet.merge_summaries("r1", "s", [a, b], lost_slots=[])["stats"]
+    assert stats["abandoned"] == 3
+    assert stats["unfinished"]["count"] == 3
+    assert stats["unfinished"]["finished_after_end"] == 1
+    assert stats["unfinished"]["still_running"] == 2
+    assert stats["unfinished"]["run_duration"]["max_ms"] == pytest.approx(90_000.0, rel=0.05)
+    assert stats["steps"][0]["unfinished"] == 3
+    assert stats["errors"] == 0

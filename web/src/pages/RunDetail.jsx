@@ -351,11 +351,19 @@ export default function RunDetail({ runId, navigate, onLaunch }) {
         );
     }
     if (stats.abandoned) {
+        const unfinished = stats.unfinished || {};
+        const after = unfinished.run_duration || {};
         quiet.push(
             <Note key="abandoned">
-                {fmtInt(stats.abandoned)} search(es) were still in flight when the run ended and are
-                recorded as cancelled failures with the time they had accrued, so the tail is a
-                floor rather than a measurement.
+                {fmtInt(stats.abandoned)} search(es) were still running when the run ended. They
+                are counted as unfinished, not as errors, and are left out of the error rate and
+                the latency percentiles.
+                {unfinished.finished_after_end
+                    ? ` ${fmtInt(unfinished.finished_after_end)} finished after the run (server-side run time p50 ${fmtMs(after.p50_ms)}, p95 ${fmtMs(after.p95_ms)}, max ${fmtMs(after.max_ms)}).`
+                    : ''}
+                {unfinished.still_running
+                    ? ` ${fmtInt(unfinished.still_running)} were still running when Regulator stopped following them and were cancelled.`
+                    : ''}
             </Note>
         );
     }
@@ -533,9 +541,13 @@ export default function RunDetail({ runId, navigate, onLaunch }) {
                 ) : null}
                 {stats.abandoned ? (
                     <Tile
-                        label="Abandoned"
+                        label="Unfinished"
                         value={fmtInt(stats.abandoned)}
-                        sub="still running at the end"
+                        sub={
+                            stats.unfinished && stats.unfinished.finished_after_end
+                                ? `${fmtInt(stats.unfinished.finished_after_end)} finished after the run`
+                                : 'still running at the end'
+                        }
                         tone="warning"
                     />
                 ) : null}
