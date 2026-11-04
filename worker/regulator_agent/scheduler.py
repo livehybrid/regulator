@@ -270,6 +270,8 @@ class Scheduler:
         self._stop = asyncio.Event()
         self._fatal: Optional[BaseException] = None
         self._abort_reason: Optional[str] = None
+        self._harvest_abort = asyncio.Event()
+        self._ended_wall: Optional[float] = None
         self._invalid_reason: Optional[str] = None
         # The unbroken run of refused searches, if one is in progress.
         self._auth_refused_since: Optional[float] = None
@@ -379,6 +381,8 @@ class Scheduler:
 
     def request_stop(self, reason: str = "requested") -> None:
         """Ask the run to wind down. Safe from a signal handler."""
+        # A stop during the post-run harvest ends the harvest.
+        self._harvest_abort.set()
         if not self._stop.is_set():
             log.info("stop requested: %s", reason)
             self._abort_reason = self._abort_reason or reason
@@ -557,8 +561,34 @@ class Scheduler:
         finally:
             await self._target_guard.stop()
             await self._drain()
+            await self._harvest()
 
         return self._summarise()
+
+    async def _harvest(self) -> None:
+        """Report searches the drain abandoned, if the run ended normally.
+
+        Only after a normal completion: a stopped or aborted run was ended on
+        purpose, often to protect the target, so its abandoned jobs are
+        deleted at once rather than followed.
+        """
+        harvest = getattr(self.engine, "harvest", None)
+        discard = getattr(self.engine, "discard_parked", None)
+        budget = float(getattr(self.config, "harvest_s", 0.0) or 0.0)
+        ended_normally = self._abort_reason is None and self._fatal is None and self._invalid_reason is None
+        try:
+            if harvest is None:
+                return
+            if not ended_normally or budget <= 0:
+                if discard is not None:
+                    await discard()
+                return
+            self.stats.freeze()
+            self._ended_wall = time.time()
+            for _record, run_duration_s, finished in await harvest(budget, self._harvest_abort):
+                self.stats.record_after_end(run_duration_s, finished)
+        except Exception as exc:  # noqa: BLE001 - the harvest never fails a run
+            log.warning("following up unfinished searches failed: %s", exc)
 
     async def _run_closed(self) -> None:
         """Maintain a population of virtual users that follows the ramp."""
@@ -1114,7 +1144,8 @@ class Scheduler:
             await asyncio.gather(*still_pending, return_exceptions=True)
 
     def _summarise(self) -> RunSummary:
-        ended = time.time()
+        # The end of the measured run, which is before any harvest.
+        ended = self._ended_wall or time.time()
 
         if self._arrivals_shed and not self._invalid_reason:
             self._invalid_reason = (

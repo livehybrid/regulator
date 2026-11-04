@@ -206,6 +206,9 @@ class StepStats:
     run_duration_total_s: float = 0.0
     errors_by_class: Dict[str, int] = field(default_factory=dict)
     partial: int = 0
+    # Still in flight when the run ended. Not an execution and not an error:
+    # see RunStats.record.
+    unfinished: int = 0
     # When the run cycles its cache, the same step's latency inside the cold
     # window after an eviction and outside it, kept apart: that split is the
     # question a cold-versus-warm run is asked.
@@ -213,6 +216,9 @@ class StepStats:
     latency_warm: LatencyHistogram = field(default_factory=LatencyHistogram)
 
     def add(self, record: StepRecord, phase: Optional[str] = None) -> None:
+        if record.error_class == ERROR_CANCELLED:
+            self.unfinished += 1
+            return
         self.executions += 1
         if record.partial:
             self.partial += 1
@@ -282,6 +288,7 @@ class StepStats:
             "executions": self.executions,
             "successes": self.successes,
             "partial": self.partial,
+            "unfinished": self.unfinished,
             "errors": self.errors,
             "error_rate_pct": round(100.0 * self.errors / self.executions, 3) if self.executions else 0.0,
             "errors_by_class": dict(self.errors_by_class),
@@ -362,9 +369,20 @@ class RunStats:
         self.job_executions = 0
         self.partial = 0
         # Work that was still in flight when the run ended and had to be
-        # abandoned. Recorded as failures with the time they had accrued, and
-        # counted here so the summary can say the tail is a floor.
+        # abandoned by the drain. Not counted as executions or errors: a long
+        # search that happened to start near the end did not fail, the run
+        # just stopped waiting for it. Counted here, and reported per step as
+        # "unfinished".
         self.abandoned = 0
+        # Of those, the ones whose jobs were then polled to completion after
+        # the run (the harvest): their server-side run time, and how many were
+        # still running when the harvest gave up.
+        self.finished_after_end = 0
+        self.still_running_at_end = 0
+        self.after_end_run_duration = LatencyHistogram()
+        # When the measured part of the run ended. Set before a harvest so the
+        # time spent waiting for stragglers does not dilute throughput.
+        self.frozen_at: Optional[float] = None
         # The rolling interval behind the time series: everything since the
         # last sample was taken. Cumulative percentiles hide a degradation
         # twenty minutes into a run; these do not.
@@ -406,15 +424,21 @@ class RunStats:
                 phase = "cold" if record.since_evict_s <= self.cold_window_s else "warm"
             if record.ok:
                 self.epoch_latency.setdefault(self.epoch, LatencyHistogram()).record_ms(record.latency_ms)
-            self.epoch_executions[self.epoch] = self.epoch_executions.get(self.epoch, 0) + 1
+            if record.error_class != ERROR_CANCELLED:
+                self.epoch_executions[self.epoch] = self.epoch_executions.get(self.epoch, 0) + 1
         stats.add(record, phase)
         self.interval.add(record)
 
+        if record.error_class == ERROR_CANCELLED:
+            # Unfinished, not failed. Kept out of executions, errors, the
+            # interval series and both latency histograms, so the error rate
+            # and the compare gates no longer depend on when a long search
+            # happened to start.
+            self.abandoned += 1
+            return
         self.executions += 1
         if record.partial:
             self.partial += 1
-        if record.error_class == ERROR_CANCELLED:
-            self.abandoned += 1
         if record.ok and record.sid and record.step_type == "search":
             self.job_executions += 1
         if record.ok:
@@ -445,6 +469,20 @@ class RunStats:
         self.interval.loop_lag.record_ms(lag_ms)
         self.max_loop_lag_ms = max(self.max_loop_lag_ms, lag_ms)
 
+    def record_after_end(self, run_duration_s: Optional[float], finished: bool) -> None:
+        """One abandoned search the harvest followed up after the run."""
+        if finished:
+            self.finished_after_end += 1
+            if run_duration_s is not None:
+                self.after_end_run_duration.record_ms(float(run_duration_s) * 1000.0)
+        else:
+            self.still_running_at_end += 1
+
+    def freeze(self) -> None:
+        """Stop the run clock: what follows is housekeeping, not load."""
+        if self.frozen_at is None:
+            self.frozen_at = time.time()
+
     def enter(self) -> None:
         self.in_flight += 1
         self.peak_in_flight = max(self.peak_in_flight, self.in_flight)
@@ -458,7 +496,7 @@ class RunStats:
 
     @property
     def elapsed_s(self) -> float:
-        now = time.time()
+        now = self.frozen_at if self.frozen_at is not None else time.time()
         paused = self.paused_s + (now - self.paused_since if self.paused_since is not None else 0.0)
         return now - self.started_at - paused
 
@@ -470,6 +508,7 @@ class RunStats:
             "queued": self.queued.to_dict(),
             "loop_lag": self.loop_lag.to_dict(),
             "drift": self.drift.to_dict(),
+            "after_end_run_duration": self.after_end_run_duration.to_dict(),
             "steps": {step_id: stats.histograms() for step_id, stats in self.steps.items()},
             "epochs": {str(epoch): hist.to_dict() for epoch, hist in self.epoch_latency.items()},
         }
@@ -504,6 +543,12 @@ class RunStats:
             "errors_by_class": dict(self.errors_by_class),
             "partial": self.partial,
             "abandoned": self.abandoned,
+            "unfinished": {
+                "count": self.abandoned,
+                "finished_after_end": self.finished_after_end,
+                "still_running": self.still_running_at_end,
+                "run_duration": self.after_end_run_duration.summary(),
+            },
             "in_flight": self.in_flight,
             "peak_in_flight": self.peak_in_flight,
             "throughput_per_s": (
@@ -566,6 +611,8 @@ class IntervalStats:
         self.loop_lag = LatencyHistogram()
 
     def add(self, record: StepRecord) -> None:
+        if record.error_class == ERROR_CANCELLED:
+            return
         self.executions += 1
         if record.ok:
             self.latency.record_ms(record.latency_ms)
