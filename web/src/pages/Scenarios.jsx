@@ -22,6 +22,7 @@ import P from '@splunk/react-ui/Paragraph';
 import WaitSpinner from '@splunk/react-ui/WaitSpinner';
 
 import ImportScenarioModal from '../modals/ImportScenarioModal';
+import DeleteScenarioModal from '../modals/DeleteScenarioModal';
 import ScenarioDetailModal from '../modals/ScenarioDetailModal';
 import useLoader from '../useLoader';
 import { Mono, Muted, Note, PageHead, Panel, Toolbar } from '../components/primitives';
@@ -231,6 +232,12 @@ export default function Scenarios({ onLaunch }) {
                                             `/scenarios/${encodeURIComponent(s.name)}/export`
                                         )}
                                     />
+                                    {s.origin === 'user' && (
+                                        <Button
+                                            label="Delete"
+                                            onClick={() => setDialog({ kind: 'delete', name: s.name })}
+                                        />
+                                    )}
                                     {canPush && (
                                         <Button
                                             label={busy === s.name ? 'Pushing\u2026' : 'Push'}
@@ -250,11 +257,29 @@ export default function Scenarios({ onLaunch }) {
                     scenario={dialog.payload}
                     loading={dialog.loading}
                     onClose={() => setDialog(null)}
-                    onDelete={async () => {
-                        await api(`/scenarios/${encodeURIComponent(dialog.name)}`, {
-                            method: 'DELETE',
-                        });
-                        notify('Scenario deleted', 'success');
+                    onDelete={() => setDialog({ kind: 'delete', name: dialog.name })}
+                />
+            )}
+            {dialog && dialog.kind === 'delete' && (
+                <DeleteScenarioModal
+                    name={dialog.name}
+                    source={source}
+                    onClose={() => setDialog(null)}
+                    onConfirm={async (remote) => {
+                        const result = await api(
+                            `/scenarios/${encodeURIComponent(dialog.name)}${remote ? '?remote=true' : ''}`,
+                            { method: 'DELETE' }
+                        );
+                        if (result && result.remote_key) {
+                            notify(
+                                result.remote_existed
+                                    ? `Scenario deleted, and ${result.remote_key} removed from the scenario source`
+                                    : `Scenario deleted (${result.remote_key} was not in the scenario source)`,
+                                'success'
+                            );
+                        } else {
+                            notify('Scenario deleted', 'success');
+                        }
                         reload();
                     }}
                 />

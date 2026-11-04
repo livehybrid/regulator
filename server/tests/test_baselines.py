@@ -221,3 +221,22 @@ def test_a_run_that_has_not_finished_cannot_be_compared(client):
     response = client.post(f"/api/runs/{run_id}/compare", json={"gates": []})
     assert response.status_code == 409
     assert "has not finished" in response.text
+
+
+def test_a_finished_run_can_be_deleted(client):
+    run_id = seed_run()
+    assert client.delete(f"/api/runs/{run_id}").status_code == 204
+    assert client.get(f"/api/runs/{run_id}").status_code == 404
+
+
+def test_a_baseline_run_cannot_be_deleted_until_the_baseline_goes(client):
+    """The baseline would cascade away with it and a gate would lose its reference."""
+    run_id = seed_run()
+    client.post("/api/baselines", json={"run_id": run_id, "label": "main-green"})
+    refused = client.delete(f"/api/runs/{run_id}")
+    assert refused.status_code == 409
+    assert "main-green" in refused.json()["detail"]
+    assert [b["label"] for b in client.get("/api/baselines").json()] == ["main-green"]
+
+    assert client.delete("/api/baselines/main-green").status_code == 204
+    assert client.delete(f"/api/runs/{run_id}").status_code == 204

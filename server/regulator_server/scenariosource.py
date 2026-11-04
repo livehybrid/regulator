@@ -34,7 +34,7 @@ import logging
 import os
 import posixpath
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import urlparse
 
 from .adapters import user_scenarios_dir
@@ -74,6 +74,10 @@ class Store:
     def put(self, key: str, data: bytes) -> None:
         raise NotImplementedError
 
+    def delete(self, key: str) -> bool:
+        """Remove ``key``. True when it existed, False when there was nothing."""
+        raise NotImplementedError
+
 
 class DirectoryStore(Store):
     """A local directory: a mounted volume, an NFS share, and the tests."""
@@ -99,6 +103,13 @@ class DirectoryStore(Store):
         with open(temporary, "wb") as handle:
             handle.write(data)
         os.replace(temporary, os.path.join(self.path, key))
+
+    def delete(self, key: str) -> bool:
+        try:
+            os.remove(os.path.join(self.path, key))
+        except FileNotFoundError:
+            return False
+        return True
 
 
 class S3Store(Store):
@@ -157,6 +168,20 @@ class S3Store(Store):
         self.client.put_object(
             Bucket=self.bucket, Key=self._key(key), Body=data, ContentType="application/gzip"
         )
+
+    def delete(self, key: str) -> bool:
+        # DeleteObject succeeds on a missing key, so ask first: the caller
+        # reports "was not in the bucket" differently from "removed".
+        full = self._key(key)
+        try:
+            self.client.head_object(Bucket=self.bucket, Key=full)
+        except Exception as exc:  # noqa: BLE001 - botocore's ClientError
+            code = str(getattr(exc, "response", {}).get("Error", {}).get("Code", ""))
+            if code in ("404", "NoSuchKey", "NotFound"):
+                return False
+            raise
+        self.client.delete_object(Bucket=self.bucket, Key=full)
+        return True
 
 
 def open_store(source: str) -> Store:
@@ -306,6 +331,36 @@ def publish_scenario(
         return None
     log.info("published scenario %r to the scenario source as %s", name, key)
     return key
+
+
+def unpublish_scenario(
+    name: str,
+    store: Optional[Store] = None,
+    env: Optional[Dict[str, str]] = None,
+) -> Tuple[str, bool]:
+    """Remove a scenario's archive from the configured source.
+
+    Returns ``(key, existed)``. Unlike :func:`publish_scenario` this RAISES
+    (:class:`ScenarioSourceError`) when the source is unset, read-only or
+    refuses the delete: the caller removes the local copy only after this
+    succeeds, so a failure must stop it. Otherwise the scenario is gone
+    locally, still in the bucket, and quietly re-imported at the next boot.
+    """
+    if store is None:
+        if not writes_enabled(env):
+            raise ScenarioSourceError(f"the scenario source is read-only (set {WRITE_ENV}=1)")
+        store = store_from_env(env)
+    if store is None:
+        raise ScenarioSourceError(f"no scenario source is configured (set {SOURCE_ENV})")
+    key = archive_name(name)
+    try:
+        existed = store.delete(key)
+    except ScenarioSourceError:
+        raise
+    except Exception as exc:  # noqa: BLE001 - any client error, reported
+        raise ScenarioSourceError(f"could not delete {key} from the scenario source: {exc}")
+    log.info("removed scenario %r from the scenario source (%s, existed=%s)", name, key, existed)
+    return key, existed
 
 
 # --------------------------------------------------------------------------- #

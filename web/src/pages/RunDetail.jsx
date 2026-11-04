@@ -25,6 +25,7 @@ import WaitSpinner from '@splunk/react-ui/WaitSpinner';
 import BusyButton from '../components/BusyButton';
 import ComparisonPanel from '../components/ComparisonPanel';
 import CompareModal from '../modals/CompareModal';
+import DeleteRunsModal, { DELETABLE_STATES } from '../modals/DeleteRunsModal';
 import EditRunModal from '../modals/EditRunModal';
 import FleetLogsModal from '../modals/FleetLogsModal';
 import PromoteBaselineModal from '../modals/PromoteBaselineModal';
@@ -486,6 +487,13 @@ export default function RunDetail({ runId, navigate, onLaunch }) {
                         label="Download"
                         to={apiDownloadUrl(`/runs/${encodeURIComponent(runId)}/export`)}
                     />
+                    {DELETABLE_STATES.has(run.state) && (
+                        <Button
+                            appearance="destructive"
+                            label="Delete"
+                            onClick={() => setDialog({ kind: 'delete' })}
+                        />
+                    )}
                 </Toolbar>
             </PageHead>
 
@@ -743,6 +751,18 @@ export default function RunDetail({ runId, navigate, onLaunch }) {
                     onSaved={(updated) => {
                         setRun((current) => ({ ...current, ...updated, stats: current.stats }));
                         setDialog(null);
+                    }}
+                />
+            )}
+            {dialog && dialog.kind === 'delete' && (
+                <DeleteRunsModal
+                    ids={[run.id]}
+                    notify={notify}
+                    onClose={() => setDialog(null)}
+                    onDeleted={(gone) => {
+                        if (gone.length) {
+                            navigate('runs');
+                        }
                     }}
                 />
             )}

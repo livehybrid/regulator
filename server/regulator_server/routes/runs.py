@@ -20,7 +20,7 @@ from ..adapters import load_named_scenario
 from ..audit import record as audit_record
 from ..config import get_settings
 from ..db import get_session
-from ..models import Run, Target, is_terminal
+from ..models import Baseline, Run, Target, is_terminal
 from .. import runcontrol
 from ..fleet import paused_seconds
 from .. import configsource, runarchive
@@ -492,6 +492,19 @@ def delete_run(run_id: int, session: Session = Depends(get_session)) -> Response
         raise HTTPException(status_code=404, detail=f"no run with id {run_id}")
     if not is_terminal(run.state):
         raise HTTPException(status_code=409, detail="stop the run before deleting it")
+    # A baseline row cascades with its run, so without this a pipeline gating
+    # on that label would quietly lose its reference. Make it an explicit step.
+    labels = list(
+        session.execute(select(Baseline.label).where(Baseline.run_id == run_id)).scalars()
+    )
+    if labels:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"run {run_id} is the baseline {', '.join(sorted(labels))}; "
+                "delete or re-point the baseline first"
+            ),
+        )
     # Or the next pull from the config source brings it back.
     configsource.forget_run(run.uid)
     session.delete(run)

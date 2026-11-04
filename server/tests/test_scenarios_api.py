@@ -296,3 +296,96 @@ def test_no_auth_is_refused_unless_allowed(tmp_path, monkeypatch):
             pass
     db.reset_engine()
     set_settings(None)
+
+
+# ---------------------------------------------------- delete from the source
+
+
+@pytest.fixture
+def bucket(tmp_path, monkeypatch):
+    from regulator_server import scenariosource
+
+    path = tmp_path / "bucket"
+    path.mkdir()
+    monkeypatch.setenv(scenariosource.SOURCE_ENV, str(path))
+    monkeypatch.setenv(scenariosource.WRITE_ENV, "1")
+    return path
+
+
+def test_a_remote_delete_removes_the_archive_then_the_scenario(client, bucket):
+    client.post("/api/scenarios", json={"name": "mirrored", "savedsearches": CONF})
+    # Created with writes on, so it was mirrored on save.
+    assert (bucket / "mirrored.tar.gz").exists()
+
+    response = client.delete("/api/scenarios/mirrored?remote=true")
+    assert response.status_code == 200, response.text
+    assert response.json() == {"remote_key": "mirrored.tar.gz", "remote_existed": True}
+    assert not (bucket / "mirrored.tar.gz").exists()
+    assert client.get("/api/scenarios/mirrored").status_code == 404
+
+
+def test_a_plain_delete_leaves_the_archive(client, bucket):
+    client.post("/api/scenarios", json={"name": "kept", "savedsearches": CONF})
+    assert client.delete("/api/scenarios/kept").status_code == 204
+    assert (bucket / "kept.tar.gz").exists()
+
+
+def test_a_remote_delete_of_a_scenario_not_in_the_bucket_still_deletes(client, bucket):
+    client.post("/api/scenarios", json={"name": "unmirrored", "savedsearches": CONF})
+    (bucket / "unmirrored.tar.gz").unlink()
+    response = client.delete("/api/scenarios/unmirrored?remote=true")
+    assert response.status_code == 200, response.text
+    assert response.json()["remote_existed"] is False
+
+
+def test_a_failed_remote_delete_keeps_the_local_scenario(client, bucket, monkeypatch):
+    from regulator_server import scenariosource
+
+    client.post("/api/scenarios", json={"name": "stuck", "savedsearches": CONF})
+
+    def refuse(self, key):
+        raise RuntimeError("AccessDenied")
+
+    monkeypatch.setattr(scenariosource.DirectoryStore, "delete", refuse)
+    response = client.delete("/api/scenarios/stuck?remote=true")
+    assert response.status_code == 502
+    assert "local scenario was kept" in response.json()["detail"]
+    assert client.get("/api/scenarios/stuck").status_code == 200
+
+
+def test_a_remote_delete_is_refused_on_a_read_only_source(client, bucket, monkeypatch):
+    from regulator_server import scenariosource
+
+    client.post("/api/scenarios", json={"name": "ro", "savedsearches": CONF})
+    monkeypatch.delenv(scenariosource.WRITE_ENV)
+    assert client.delete("/api/scenarios/ro?remote=true").status_code == 409
+    assert (bucket / "ro.tar.gz").exists()
+    assert client.get("/api/scenarios/ro").status_code == 200
+
+
+def test_s3_store_delete_reports_absence_and_raises_on_denial():
+    from regulator_server.scenariosource import S3Store
+
+    class FakeS3:
+        def __init__(self):
+            self.keys = {"lib/x.tar.gz"}
+
+        def head_object(self, Bucket, Key):
+            if Key == "lib/denied.tar.gz":
+                exc = Exception("Forbidden")
+                exc.response = {"Error": {"Code": "403"}}
+                raise exc
+            if Key not in self.keys:
+                exc = Exception("Not Found")
+                exc.response = {"Error": {"Code": "404"}}
+                raise exc
+
+        def delete_object(self, Bucket, Key):
+            self.keys.discard(Key)
+
+    s3 = FakeS3()
+    store = S3Store("b", "/lib/", client=s3)
+    assert store.delete("x.tar.gz") is True and s3.keys == set()
+    assert store.delete("x.tar.gz") is False
+    with pytest.raises(Exception, match="Forbidden"):
+        store.delete("denied.tar.gz")

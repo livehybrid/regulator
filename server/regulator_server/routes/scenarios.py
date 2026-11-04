@@ -22,7 +22,7 @@ from typing import Any, Dict, List, Optional
 
 import yaml
 from fastapi import APIRouter, File, Form, HTTPException, Request, UploadFile
-from fastapi.responses import PlainTextResponse, Response
+from fastapi.responses import JSONResponse, PlainTextResponse, Response
 
 from regulator_agent import savedsearches as ss
 from regulator_agent.scenario import ScenarioError, lint, load_scenario
@@ -283,7 +283,18 @@ def create_scenario(body: ScenarioCreate, request: Request) -> Dict[str, Any]:
 
 
 @router.delete("/{name}", status_code=204)
-def delete_scenario(name: str, request: Request) -> None:
+def delete_scenario(name: str, request: Request, remote: bool = False) -> Response:
+    """Delete a user scenario; ``?remote=true`` removes it from the source too.
+
+    Without ``remote`` a scenario that is also in the scenario source comes
+    straight back at the next boot, because the boot sync imports whatever the
+    local library lacks. The remote delete runs after the built-in guard and
+    BEFORE the local one, and a remote failure (502) keeps the local copy, so
+    the two cannot drift apart in the direction that resurrects it. A source
+    that is unset or read-only is a 409. The response is then 200 with
+    ``{"remote_key", "remote_existed"}`` so the console can say whether the
+    archive was actually there.
+    """
     try:
         directory, origin = scenario_path(name)
     except FileNotFoundError as exc:
@@ -292,8 +303,35 @@ def delete_scenario(name: str, request: Request) -> None:
         raise HTTPException(
             status_code=403, detail="built-in scenarios ship with the image and cannot be deleted"
         )
+    result: Optional[Dict[str, Any]] = None
+    if remote:
+        info = scenariosource.describe()
+        if not info["configured"]:
+            raise HTTPException(
+                status_code=409,
+                detail=f"no scenario source is configured (set {scenariosource.SOURCE_ENV})",
+            )
+        if info.get("error"):
+            raise HTTPException(status_code=409, detail=info["error"])
+        if not info["writable"]:
+            raise HTTPException(
+                status_code=409,
+                detail=f"the scenario source is read-only (set {scenariosource.WRITE_ENV}=1)",
+            )
+        try:
+            key, existed = scenariosource.unpublish_scenario(directory.name)
+        except scenariosource.ScenarioSourceError as exc:
+            raise HTTPException(status_code=502, detail=f"{exc}; the local scenario was kept")
+        result = {"remote_key": key, "remote_existed": existed}
     shutil.rmtree(directory)
-    audit_record("scenario_deleted", request=request, detail=name)
+    audit_record(
+        "scenario_deleted",
+        request=request,
+        detail=name if result is None else f"{name} (and {result['remote_key']} from the source)",
+    )
+    if result is not None:
+        return JSONResponse(status_code=200, content=result)
+    return Response(status_code=204)
 
 
 @router.get("/{name}/savedsearches.conf", response_class=PlainTextResponse)
