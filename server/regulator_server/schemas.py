@@ -301,6 +301,10 @@ class ScenarioDuplicate(BaseModel):
         return value
 
 
+class ScenarioRename(ScenarioDuplicate):
+    """``POST /api/scenarios/{name}/rename``: the scenario's new name."""
+
+
 class SavedSearchRow(BaseModel):
     """One saved search as the scenario editor shows it."""
 
