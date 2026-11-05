@@ -43,7 +43,7 @@ from ..adapters import (
 from ..audit import record as audit_record
 from ..config import get_settings
 from ..db import get_session
-from ..models import Target
+from ..models import TERMINAL_STATES, Baseline, Run, Target
 from ..scenarioarchive import (
     ArchiveLimits,
     ScenarioArchiveError,
@@ -56,6 +56,7 @@ from ..schemas import (
     ScenarioCreate,
     ScenarioDuplicate,
     ScenarioOut,
+    ScenarioRename,
     ScenarioTags,
     ScenarioUpdate,
 )
@@ -619,6 +620,148 @@ def duplicate_scenario(name: str, body: ScenarioDuplicate, request: Request) -> 
     audit_record("scenario_duplicated", request=request, detail=f"{name} -> {body.name}")
     scenariosource.publish_scenario(body.name, target)
     return scenario_summary(scenario, "user")
+
+
+@router.post("/{name}/rename")
+def rename_scenario(
+    name: str,
+    body: ScenarioRename,
+    request: Request,
+    session: Session = Depends(get_session),
+) -> Dict[str, Any]:
+    """Rename one of the operator's own scenarios, and carry its history with it.
+
+    A scenario's name is its directory, the ``name`` in its ``scenario.yaml``,
+    its key in the scenario source, and the string every run and baseline row
+    stores. All four move together:
+
+    * the directory is copied to the new name with ``scenario.yaml`` rewritten,
+      loaded to prove it still parses, and only then swapped in;
+    * runs and baselines that name the old scenario are updated in the same
+      transaction, so the Runs page, comparisons and baselines follow it;
+    * with a writable source the archive is published under the new name and
+      only then is the old key removed, so the scenario is never missing from
+      the bucket. A bucket that cannot follow does not undo the rename; the
+      response's ``warning`` says what is left behind (an old archive the
+      boot sync would import again as a second scenario).
+
+    Refused for a built-in (403: it ships with the image, duplicate it
+    instead), for a name already taken in either library (409; a built-in
+    would shadow it), and while a run of the scenario has not finished (409:
+    the runner resolves the scenario by name while it runs).
+    """
+    try:
+        directory, origin = scenario_path(name)
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
+    if origin != "user":
+        raise HTTPException(
+            status_code=403,
+            detail="built-in scenarios ship with the image and cannot be renamed: duplicate it",
+        )
+    new = body.name
+    if new == name:
+        raise HTTPException(status_code=422, detail="that is already the scenario's name")
+    try:
+        scenario_path(new)
+    except FileNotFoundError:
+        pass
+    else:
+        raise HTTPException(status_code=409, detail=f"a scenario named {new!r} already exists")
+    target = directory.parent / new
+    if target.exists():
+        raise HTTPException(status_code=409, detail=f"a scenario named {new!r} already exists")
+    live = session.scalar(
+        select(Run.id)
+        .where(Run.scenario == name, Run.state.not_in(TERMINAL_STATES))
+        .limit(1)
+    )
+    if live is not None:
+        raise HTTPException(
+            status_code=409,
+            detail=f"run {live} of {name!r} has not finished; rename it once the run ends",
+        )
+
+    staging = directory.parent / f".rename-{new}-{uuid.uuid4().hex[:8]}"
+    shutil.copytree(directory, staging)
+    try:
+        text = (staging / "scenario.yaml").read_text(encoding="utf-8")
+        (staging / "scenario.yaml").write_text(
+            _apply_yaml_fields(text, {"name": new}, {}), encoding="utf-8"
+        )
+        renamed = load_scenario(staging)
+        if renamed.name != new:
+            raise HTTPException(
+                status_code=422, detail=f"the renamed scenario loads as {renamed.name!r}"
+            )
+    except HTTPException:
+        shutil.rmtree(staging, ignore_errors=True)
+        raise
+    except Exception as exc:  # noqa: BLE001 - never leave a half-written copy behind
+        shutil.rmtree(staging, ignore_errors=True)
+        raise HTTPException(status_code=422, detail=f"the renamed scenario does not load: {exc}")
+
+    runs = session.query(Run).filter(Run.scenario == name).update(
+        {Run.scenario: new}, synchronize_session=False
+    )
+    baselines = session.query(Baseline).filter(Baseline.scenario == name).update(
+        {Baseline.scenario: new}, synchronize_session=False
+    )
+    staging.rename(target)
+    try:
+        session.commit()
+    except Exception:
+        # The rows still say the old name, so the old directory must stay.
+        shutil.rmtree(target, ignore_errors=True)
+        raise
+    shutil.rmtree(directory, ignore_errors=True)
+    scenario = load_scenario(target)
+    audit_record(
+        "scenario_renamed",
+        request=request,
+        detail=f"{name} -> {new} ({runs} run(s), {baselines} baseline(s))",
+    )
+    remote = _swap_remote(name, new, target)
+    summary = scenario_summary(scenario, "user")
+    summary.update(
+        {"old_name": name, "runs_updated": runs, "baselines_updated": baselines, **remote}
+    )
+    return summary
+
+
+def _swap_remote(old: str, new: str, directory: Path) -> Dict[str, Any]:
+    """Publish the renamed scenario, then remove the old archive. Never raises."""
+    out: Dict[str, Any] = {
+        "remote_key": None,
+        "old_remote_key": None,
+        "old_remote_removed": False,
+        "warning": None,
+    }
+    if not scenariosource.writes_enabled():
+        if scenariosource.describe().get("configured"):
+            out["warning"] = (
+                f"the scenario source is read-only, so its copy is still named {old!r} "
+                "and will be imported again at the next restart"
+            )
+        return out
+    store = scenariosource.store_from_env()
+    if store is None:
+        return out
+    key = scenariosource.publish_scenario(new, directory, store=store)
+    out["remote_key"] = key
+    if key is None:
+        out["warning"] = f"the scenario source refused the new archive; its copy is still named {old!r}"
+        return out
+    try:
+        old_key, existed = scenariosource.unpublish_scenario(old, store=store)
+        out["old_remote_key"] = old_key
+        out["old_remote_removed"] = existed
+    except scenariosource.ScenarioSourceError as exc:
+        out["old_remote_key"] = archive_name(old)
+        out["warning"] = (
+            f"{exc}; delete it from the scenario source or it returns at the next restart"
+        )
+    return out
 
 
 @router.delete("/{name}", status_code=204)

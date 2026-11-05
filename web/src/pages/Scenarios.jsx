@@ -29,6 +29,7 @@ import { variables } from '@splunk/themes';
 
 import BusyButton from '../components/BusyButton';
 import DuplicateScenarioModal from '../modals/DuplicateScenarioModal';
+import RenameScenarioModal from '../modals/RenameScenarioModal';
 import ImportScenarioModal from '../modals/ImportScenarioModal';
 import DeleteScenarioModal from '../modals/DeleteScenarioModal';
 import ScenarioDetailModal from '../modals/ScenarioDetailModal';
@@ -509,6 +510,13 @@ export default function Scenarios({ onLaunch }) {
                                             >
                                                 Duplicate&hellip;
                                             </Menu.Item>
+                                            {s.origin === 'user' && (
+                                                <Menu.Item
+                                                    onClick={() => setDialog({ kind: 'rename', scenario: s })}
+                                                >
+                                                    Rename&hellip;
+                                                </Menu.Item>
+                                            )}
                                             {/* A plain link, not a fetch: the browser
                                                 streams the archive to disk and sends
                                                 the session cookie itself. */}
@@ -590,6 +598,30 @@ export default function Scenarios({ onLaunch }) {
                         notify(`Created \u201c${created.name}\u201d`, 'success');
                         afterChange();
                         openEdit(created.name);
+                    }}
+                />
+            )}
+            {dialog && dialog.kind === 'rename' && (
+                <RenameScenarioModal
+                    scenario={dialog.scenario}
+                    onClose={() => setDialog(null)}
+                    onRenamed={(renamed) => {
+                        setDialog(null);
+                        const moved = renamed.runs_updated
+                            ? ` (${renamed.runs_updated} run${renamed.runs_updated === 1 ? '' : 's'} moved)`
+                            : '';
+                        if (renamed.warning) {
+                            notify(
+                                `Renamed \u201c${renamed.old_name}\u201d to \u201c${renamed.name}\u201d, but ${renamed.warning}`,
+                                'warning'
+                            );
+                        } else {
+                            notify(
+                                `Renamed \u201c${renamed.old_name}\u201d to \u201c${renamed.name}\u201d${moved}`,
+                                'success'
+                            );
+                        }
+                        afterChange();
                     }}
                 />
             )}
