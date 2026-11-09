@@ -51,7 +51,6 @@ import asyncio
 import dataclasses
 import fnmatch
 import logging
-import re
 import time
 from dataclasses import dataclass, field
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
