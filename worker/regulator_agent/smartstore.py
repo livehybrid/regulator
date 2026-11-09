@@ -88,8 +88,9 @@ CACHEMAN_PAGE = 5000
 CACHEMAN_SPL = (
     "| rest splunk_server=* /services/admin/cacheman count=0 "
     "| eval bid=title, status='cm:bucket.status', "
-    "size=coalesce('cm:bucket.estimated_size', 'cm:bucket.journal_size') "
-    "| fields splunk_server, bid, status, size"
+    "size=coalesce('cm:bucket.estimated_size', 'cm:bucket.journal_size'), "
+    "earliest='cm:bucket.earliest_time', latest='cm:bucket.latest_time' "
+    "| fields splunk_server, bid, status, size, earliest, latest"
 )
 
 # A ceiling on what the search route will accept. Past this the reading is not
@@ -149,6 +150,37 @@ class IndexCache:
         return (100.0 * self.local_buckets / total) if total else 0.0
 
 
+def _epoch(value: Any) -> Optional[float]:
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    return number if number > 0 else None
+
+
+@dataclass(frozen=True)
+class Bucket:
+    """One bucket copy on one indexer, with the time range it covers.
+
+    The time range is what lets a forecast say which buckets a search will
+    touch: a bucket is read by a search whose window overlaps
+    ``[earliest, latest]``. Either edge is ``None`` when the cache manager did
+    not report it.
+    """
+
+    server: str
+    bid: str
+    index: str
+    status: str
+    size: int
+    earliest: Optional[float] = None
+    latest: Optional[float] = None
+
+    @property
+    def is_local(self) -> bool:
+        return self.status.lower() == STATUS_LOCAL
+
+
 @dataclass
 class CacheState:
     """A point-in-time picture of what is on local disk."""
@@ -173,6 +205,9 @@ class CacheState:
     # and is the normal behaviour of a cache at its ceiling.
     local_ids: Set[str] = field(default_factory=set)
     local_bytes_by_id: Dict[str, int] = field(default_factory=dict)
+    # Every bucket copy, with its time range, for the forecast. Not in
+    # to_dict: on a large estate it is tens of thousands of rows.
+    buckets: List[Bucket] = field(default_factory=list)
 
     @property
     def total_buckets(self) -> int:
@@ -455,6 +490,10 @@ def _state_from_search_rows(rows: Sequence[Dict[str, Any]]) -> CacheState:
         name = f"{server}|{bid}" if multi else bid
         index = _index_of(bid)
         size = _int(row.get("size"))
+        state.buckets.append(Bucket(
+            server=server, bid=bid, index=index, status=str(row.get("status") or ""),
+            size=size, earliest=_epoch(row.get("earliest")), latest=_epoch(row.get("latest")),
+        ))
         per = state.per_index.setdefault(index, IndexCache(index=index))
         per.total_bytes += size
         state.total_bytes += size
@@ -550,6 +589,12 @@ async def cache_state(client: SplunkClient, **where: Any) -> CacheState:
                 name = f"{indexer.name}|{bid}" if len(indexers) > 1 else bid
                 index = _index_of(bid)
                 size = _int(bucket.get("estimated_size")) or _int(bucket.get("journal_size"))
+                state.buckets.append(Bucket(
+                    server=indexer.name, bid=bid, index=index,
+                    status=str(bucket.get("status") or ""), size=size,
+                    earliest=_epoch(bucket.get("earliest_time")),
+                    latest=_epoch(bucket.get("latest_time")),
+                ))
                 per = state.per_index.setdefault(index, IndexCache(index=index))
                 per.total_bytes += size
                 state.total_bytes += size

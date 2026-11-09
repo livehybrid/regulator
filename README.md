@@ -735,10 +735,67 @@ rather than a fault). Without `--index` or `--all-indexes` it refuses: there is
 no undo beyond waiting for everything to re-download, and on a shared cluster
 most of that cache belongs to other people's dashboards.
 
+**Forecast before a run.** Every window a run dispatches is a deterministic
+function of the step's time policy, the start and the duration, so the whole
+range each step can search is known before anything is dispatched. Each
+indexer's cache manager lists every bucket it holds, local or remote, with the
+time range it covers, read through the search head with
+`| rest splunk_server=* /services/admin/cacheman`. Nothing needs listing in S3
+and `dbinspect` is not needed. Intersect the two per index and the answer is
+"this run reads 412 buckets, 61% local, 38.2 GB to download, and the working set
+is 74% of the cache". Every run logs that line and records it in the summary
+under `cache.forecast`; `--cache-forecast` prints it as JSON and exits without
+running anything.
+
+```bash
+python -m regulator_agent --cache-forecast
+```
+
+The indexes come from `index=`, `index::` and `index IN (...)` in each search,
+and from the scenario's corpus index for a search that names none (a macro, an
+eventtype or a data model hides its index from the search string). A bucket
+counts as local when any indexer holding a copy has it local, which is an upper
+bound where replicas differ. A working set larger than the cache is called out:
+it cannot all be local at once.
+
+**Warm before a run.** `REG_WARM_CACHE=1` reads the remote buckets the forecast
+found before the measured run starts, then forecasts again and records both under
+`cache.warm`. `--warm-cache` does the same and exits. Warming uses ordinary
+oneshot searches, cut into chunks and skipping any chunk whose buckets are
+already local. It never uses the cache manager's undocumented `_localize`
+action, which community reports say stops the indexer evicting normally until it
+restarts. Which bucket files a search downloads depends on the search, hence
+three modes:
+
+| `REG_WARM_CACHE_MODE` | Search | Warms |
+|---|---|---|
+| `tsidx` (default) | `\| tstats count where index=X by _time` | Index files of every bucket in range, no raw data. Cheap. Full for tstats and accelerated searches; raw searches still fetch the journal |
+| `full` | reads `_raw` for every event in range | Everything, at the cost of reading all the data once |
+| `replay` | each of the scenario's own searches, once, over its whole range | What those search shapes download, for one parameter draw |
+
+The cache manager fetches a bucket's files as a search needs them (Splunk's
+cache manager documentation says so), so a bucket the cache manager lists as
+`local` may hold its index files without its journal. That `tsidx` mode fetches
+no journal is inferred from what tstats reads, not confirmed on a live cluster:
+use `full` when the run's searches read raw events and you need them warm.
+
+The warm-up is load on the target and is reported as such. It is opt-in and
+cannot be combined with `REG_EVICT_CACHE`.
+
+```bash
+REG_WARM_CACHE=1 REG_WARM_CACHE_MODE=full python -m regulator_agent
+python -m regulator_agent --warm-cache
+```
+
 | Variable | Default | Notes |
 |---|---|---|
 | `REG_EVICT_CACHE` | `0` | Evict before the run, so it measures the cold path. Opt-in and never a default |
 | `REG_EVICT_CACHE_INDEXES` | the scenario's corpus index | Comma-separated. Also supplies the default index list for `--evict-cache` |
+| `REG_WARM_CACHE` | `0` | Warm the buckets the run will read before it starts. Opt-in; not with `REG_EVICT_CACHE` |
+| `REG_WARM_CACHE_MODE` | `tsidx` | `tsidx`, `full` or `replay`, as above |
+| `REG_WARM_CACHE_CONCURRENCY` | `4` | Warm-up searches at once |
+| `REG_WARM_CACHE_BUDGET_S` | `1800` | Stop starting warm-up searches after this long; the rest are reported as not started |
+| `REG_WARM_CACHE_CHUNK_S` | `86400` | Each warm-up search covers at most this much time, so none outlives the read timeout |
 | `REG_INDEXER_URLS` | the search peers | The cache lives on the indexers, and on a distributed target the search head has none. Empty means discover the search peers and reuse the target's credential on each; set it to name them outright |
 | `REG_INDEXER_TOKEN`, or `REG_INDEXER_USERNAME` and `REG_INDEXER_PASSWORD` | the target's | A credential valid on the indexers when the search head's is not |
 

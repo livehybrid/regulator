@@ -322,6 +322,14 @@ class Config:
     # floor. Their jobs are left running on the target for that long (never
     # past read_timeout_s). 0 cancels them at the end of the drain, as before.
     harvest_s: float = 240.0
+    # SmartStore warm-up before the measured run: read the buckets the run
+    # will touch so it starts from local disk. Opt-in, like eviction, and the
+    # two are mutually exclusive. See cachewarm.py for the modes.
+    warm_cache: bool = False
+    warm_cache_mode: str = "tsidx"
+    warm_cache_budget_s: float = 1800.0
+    warm_cache_concurrency: int = 4
+    warm_cache_chunk_s: float = 86400.0
     # The longest a run may stay paused, in total, before it is stopped. A
     # forgotten pause must not hold a run slot forever, nor resume load
     # unattended on a cluster somebody paused it to protect.
@@ -454,6 +462,16 @@ def load_config(env: Optional[Mapping[str, str]] = None) -> Config:
             f"REG_POLL_MAX_MS ({poll_max}) must be >= REG_POLL_INITIAL_MS ({poll_initial})"
         )
 
+    warm_mode = (_get(env, "REG_WARM_CACHE_MODE", "tsidx") or "tsidx").strip().lower()
+    if warm_mode not in ("tsidx", "full", "replay"):
+        raise ConfigError(
+            f"REG_WARM_CACHE_MODE must be tsidx, full or replay, got {warm_mode!r}"
+        )
+    if _boolean(env, "REG_WARM_CACHE", False) and _boolean(env, "REG_EVICT_CACHE", False):
+        raise ConfigError(
+            "set REG_WARM_CACHE (start warm) or REG_EVICT_CACHE (start cold), not both"
+        )
+
     log_level = (_get(env, "REG_LOG_LEVEL", "INFO") or "INFO").upper()
     if log_level not in ("DEBUG", "INFO", "WARNING", "ERROR"):
         raise ConfigError(
@@ -491,6 +509,11 @@ def load_config(env: Optional[Mapping[str, str]] = None) -> Config:
         poll_max_ms=poll_max,
         cache_bust=_boolean(env, "REG_CACHE_BUST", True),
         evict_cache=_boolean(env, "REG_EVICT_CACHE", False),
+        warm_cache=_boolean(env, "REG_WARM_CACHE", False),
+        warm_cache_mode=warm_mode,
+        warm_cache_budget_s=_number(env, "REG_WARM_CACHE_BUDGET_S", 1800.0, minimum=0.0),
+        warm_cache_concurrency=_integer(env, "REG_WARM_CACHE_CONCURRENCY", 4, minimum=1),
+        warm_cache_chunk_s=_number(env, "REG_WARM_CACHE_CHUNK_S", 86400.0, minimum=60.0),
         evict_cache_indexes=tuple(
             part.strip()
             for part in (_get(env, "REG_EVICT_CACHE_INDEXES", "") or "").split(",")

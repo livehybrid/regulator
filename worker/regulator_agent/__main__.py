@@ -38,6 +38,7 @@ import time
 from pathlib import Path
 from typing import Any, List, Optional
 
+from . import cachewarm
 from .compare import GateError, compare_runs
 from .config import Config, ConfigError, load_config, load_managed_boot
 from .engines import BrowserUnavailable, get_engine
@@ -430,6 +431,11 @@ async def _run(config: Config, args: argparse.Namespace) -> int:
             capabilities=capabilities,
         )
 
+        if args.cache_forecast or args.warm_cache:
+            return await _forecast_or_warm(
+                config, args, scenario, engine, resolver, scheduler.duration_s
+            )
+
         loop = asyncio.get_running_loop()
         for sig in (signal.SIGINT, signal.SIGTERM):
             with contextlib.suppress(NotImplementedError):
@@ -463,9 +469,18 @@ async def _run(config: Config, args: argparse.Namespace) -> int:
         else:
             eviction = None
 
+        warmed = None
+        if config.warm_cache:
+            warmed = await _warm(config, scenario, engine, resolver, scheduler.duration_s)
+
         cache_before = await cache_state(engine.client, **_indexer_kwargs(config))
+        cache_forecast = None
         if cache_before.available:
             log.info(render_cache(cache_before).splitlines()[0])
+            cache_forecast = cachewarm.forecast(
+                scenario, cache_before, time.time(), scheduler.duration_s
+            )
+            _log_forecast(cache_forecast)
 
         progress_task = asyncio.create_task(_progress(stats, stop_progress), name="progress")
         summary = await scheduler.run()
@@ -474,6 +489,10 @@ async def _run(config: Config, args: argparse.Namespace) -> int:
         summary.cache = await _cache_provenance(
             engine.client, cache_before, eviction, _indexer_kwargs(config)
         )
+        if summary.cache is not None and cache_forecast is not None:
+            summary.cache["forecast"] = cache_forecast.to_dict()
+        if summary.cache is not None and warmed is not None:
+            summary.cache["warm"] = warmed.to_dict()
         summary.scenario_digest = scenario_digest(scenario)
 
         # Ask the cluster its own opinion of what just happened. Best effort:
@@ -527,6 +546,86 @@ async def _run(config: Config, args: argparse.Namespace) -> int:
                     close()
         with contextlib.suppress(Exception):
             await engine.close()
+
+
+def _log_forecast(fc: "cachewarm.Forecast") -> None:
+    log.info(fc.summary_line())
+    for name, entry in sorted(fc.per_index.items()):
+        log.info(
+            "  %-24s %5d bucket(s), %5d local (%3.0f%%), %.1f GB to download",
+            name, entry.buckets, entry.local, entry.local_pct, entry.bytes_remote / 1e9,
+        )
+    for note in fc.notes:
+        log.warning("cache forecast: %s", note)
+
+
+async def _warm(
+    config: Config, scenario: Any, engine: Any, resolver: ParameterResolver, duration_s: float
+) -> Optional["cachewarm.WarmResult"]:
+    """Forecast, warm what is remote, and forecast again. Never raises for the run."""
+    client = getattr(engine, "client", None)
+    if client is None:
+        log.warning("cache warm-up skipped: the %s engine has no REST client", engine.name)
+        return None
+    where = _indexer_kwargs(config)
+    state = await cache_state(client, **where)
+    before = cachewarm.forecast(scenario, state, time.time(), duration_s)
+    if not before.available:
+        log.warning("cache warm-up skipped: %s", before.reason)
+        return None
+    _log_forecast(before)
+    planned, skipped = cachewarm.warm_searches(
+        scenario, before, config.warm_cache_mode, config.warm_cache_chunk_s, resolver
+    )
+    if not planned:
+        log.info("cache warm-up: nothing to do, every bucket this run reads is already local")
+        result = cachewarm.WarmResult(mode=config.warm_cache_mode, skipped_local=skipped)
+        result.before = result.after = before.to_dict()
+        return result
+    log.warning(
+        "cache warm-up (%s): %d search(es) over %d remote bucket(s), %.1f GB, at most %d "
+        "at once within %.0fs. This is load on the target, run before the measurement",
+        config.warm_cache_mode, len(planned), before.remote, before.bytes_remote / 1e9,
+        config.warm_cache_concurrency, config.warm_cache_budget_s,
+    )
+    result = await cachewarm.warm(
+        client, planned, mode=config.warm_cache_mode,
+        concurrency=config.warm_cache_concurrency, budget_s=config.warm_cache_budget_s,
+        skipped_local=skipped,
+    )
+    after = cachewarm.forecast(scenario, await cache_state(client, **where), time.time(), duration_s)
+    result.before, result.after = before.to_dict(), after.to_dict()
+    log.warning(
+        "cache warm-up: %d search(es) in %.0fs (%d failed, %d not started within the budget); "
+        "local %.0f%% -> %.0f%% of the buckets this run reads",
+        result.searches, result.seconds, result.failed, result.not_started,
+        before.local_pct, after.local_pct,
+    )
+    for error in result.errors:
+        log.warning("cache warm-up: %s", error)
+    return result
+
+
+async def _forecast_or_warm(
+    config: Config, args: argparse.Namespace, scenario: Any, engine: Any,
+    resolver: ParameterResolver, duration_s: float,
+) -> int:
+    """``--cache-forecast`` and ``--warm-cache``: answer, print JSON, exit."""
+    client = getattr(engine, "client", None)
+    if client is None:
+        log.error("the %s engine has no REST client to read the cache with", engine.name)
+        return EXIT_FAILED
+    if args.warm_cache:
+        result = await _warm(config, scenario, engine, resolver, duration_s)
+        if result is None:
+            return EXIT_FAILED
+        print(json.dumps(result.to_dict(), indent=2, default=str))
+        return EXIT_OK if not result.failed else EXIT_FAILED
+    state = await cache_state(client, **_indexer_kwargs(config))
+    fc = cachewarm.forecast(scenario, state, time.time(), duration_s)
+    _log_forecast(fc)
+    print(json.dumps(fc.to_dict(), indent=2, default=str))
+    return EXIT_OK if fc.available else EXIT_FAILED
 
 
 async def _cache_provenance(client, before: CacheState, eviction, where: dict) -> Optional[dict]:
@@ -720,6 +819,22 @@ def main(argv: Optional[List[str]] = None) -> int:
         help=(
             "with --evict-cache, flush the entire cache rather than named indexes. On a "
             "shared cluster this drops other people's cached data too"
+        ),
+    )
+    parser.add_argument(
+        "--cache-forecast",
+        action="store_true",
+        help=(
+            "say how many of the SmartStore buckets this scenario's run would read are "
+            "already local, as JSON, without running it"
+        ),
+    )
+    parser.add_argument(
+        "--warm-cache",
+        action="store_true",
+        help=(
+            "read the SmartStore buckets this scenario's run would touch, so a run "
+            "started afterwards begins warm, then exit. REG_WARM_CACHE_MODE picks how"
         ),
     )
     parser.add_argument(
