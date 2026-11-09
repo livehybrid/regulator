@@ -89,8 +89,9 @@ CACHEMAN_SPL = (
     "| rest splunk_server=* /services/admin/cacheman count=0 "
     "| eval bid=title, status='cm:bucket.status', "
     "size=coalesce('cm:bucket.estimated_size', 'cm:bucket.journal_size'), "
-    "earliest='cm:bucket.earliest_time', latest='cm:bucket.latest_time' "
-    "| fields splunk_server, bid, status, size, earliest, latest"
+    "earliest='cm:bucket.earliest_time', latest='cm:bucket.latest_time', "
+    "journal='cm:bucket.journal_size' "
+    "| fields splunk_server, bid, status, size, earliest, latest, journal"
 )
 
 # A ceiling on what the search route will accept. Past this the reading is not
@@ -175,6 +176,9 @@ class Bucket:
     size: int
     earliest: Optional[float] = None
     latest: Optional[float] = None
+    # The rawdata journal's share of the size, when reported. What separates
+    # "index files only" from "partly downloaded" in the residency check.
+    journal_size: Optional[int] = None
 
     @property
     def is_local(self) -> bool:
@@ -493,6 +497,7 @@ def _state_from_search_rows(rows: Sequence[Dict[str, Any]]) -> CacheState:
         state.buckets.append(Bucket(
             server=server, bid=bid, index=index, status=str(row.get("status") or ""),
             size=size, earliest=_epoch(row.get("earliest")), latest=_epoch(row.get("latest")),
+            journal_size=_int(row.get("journal")) or None,
         ))
         per = state.per_index.setdefault(index, IndexCache(index=index))
         per.total_bytes += size
@@ -594,6 +599,7 @@ async def cache_state(client: SplunkClient, **where: Any) -> CacheState:
                     status=str(bucket.get("status") or ""), size=size,
                     earliest=_epoch(bucket.get("earliest_time")),
                     latest=_epoch(bucket.get("latest_time")),
+                    journal_size=_int(bucket.get("journal_size")) or None,
                 ))
                 per = state.per_index.setdefault(index, IndexCache(index=index))
                 per.total_bytes += size

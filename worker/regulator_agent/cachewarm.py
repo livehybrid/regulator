@@ -36,10 +36,10 @@ the search:
     Downloads what those search shapes download, but with one parameter draw,
     so a search that filters on a drawn value warms only what that value hits.
 
-The cache manager fetches a bucket's files as a search needs them, so a bucket
-it lists as ``local`` may hold its index files and not its journal: a forecast
-after a ``tsidx`` warm-up can read 100% local for data a raw search would still
-download. That tstats reads no journal is inferred, not verified on a cluster.
+The cache manager fetches a bucket's files as a search needs them (Splunk's
+documentation: tstats and metadata searches do not need the journal), so a
+bucket it lists as ``local`` may hold only its index files. ``dbinspect`` tells
+the two apart: see :func:`read_residency`.
 
 The warm-up is itself load on the target. It runs before the measured run, at
 bounded concurrency and within a time budget, and is reported, not hidden.
@@ -58,7 +58,8 @@ from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 from .params import DrawContext, ParameterResolver
 from .scenario import Scenario, Step, TimePolicy
-from .smartstore import Bucket, CacheState
+from .smartstore import CACHEMAN_SEARCH_MAX_ROWS, Bucket, CacheState
+from .splscope import Clause, all_indexes, clause_span, read_scope
 from .splunk import SplunkClient
 from .timepolicy import TimeWindow, resolve_window
 
@@ -66,40 +67,42 @@ log = logging.getLogger("regulator.cachewarm")
 
 WARM_MODES = ("tsidx", "full", "replay")
 
-# index=foo, index="foo", index::foo, index=foo*  (not index!=foo)
-_INDEX_EQ = re.compile(r'(?<![\w!])index\s*(?:=|::)\s*"?([A-Za-z0-9_\-\*\.]+)"?', re.IGNORECASE)
-# index IN (a, "b", c*)
-_INDEX_IN = re.compile(r'(?<![\w!])index\s+IN\s*\(([^)]*)\)', re.IGNORECASE)
-
 Interval = Tuple[float, float]
 
 
 def index_terms(spl: str) -> List[str]:
-    """The index names (or wildcards) a search names, lower-cased, in order.
+    """Every index name (or wildcard) the search names, in any clause."""
+    return all_indexes(read_scope(spl).clauses)
 
-    A best effort and deliberately simple: a macro, an eventtype or a data
-    model that hides its index cannot be seen from the search string, and a
-    step whose search names none falls back to the scenario's corpus index.
+
+def _fallback_indexes(scenario: Scenario, metrics: bool) -> List[str]:
+    """What an index-less clause reads, approximated by the corpus indexes.
+
+    Splunk would search the user's default indexes, which Regulator cannot
+    see; the scenario's corpus is the best stand-in it has.
     """
-    found: List[str] = []
-    for match in _INDEX_EQ.finditer(spl or ""):
-        found.append(match.group(1).lower())
-    for match in _INDEX_IN.finditer(spl or ""):
-        for part in match.group(1).split(","):
-            name = part.strip().strip('"').strip("'").lower()
-            if name:
-                found.append(name)
-    return list(dict.fromkeys(found))
+    names = [scenario.corpus.index] if scenario.corpus.index else []
+    if metrics and scenario.corpus.metric_index:
+        names = [scenario.corpus.metric_index]
+    return [name.lower() for name in names]
+
+
+def step_clauses(scenario: Scenario, step: Step) -> Tuple[List[Clause], List[str]]:
+    """The clauses a step reads, with the corpus standing in for no index."""
+    if not step.spl:
+        # A dashboard, or a saved search dispatched by name: its searches are
+        # not visible here, so it reads the corpus over its window.
+        return [Clause(indexes=tuple(_fallback_indexes(scenario, False)))], []
+    scope = read_scope(step.spl)
+    clauses = [
+        c if c.indexes else Clause(tuple(_fallback_indexes(scenario, c.metrics)), c.earliest, c.latest, c.origin, c.metrics)
+        for c in scope.clauses
+    ]
+    return clauses, scope.notes
 
 
 def step_indexes(scenario: Scenario, step: Step) -> List[str]:
-    names = index_terms(step.spl or "")
-    if names:
-        return names
-    fallback = [scenario.corpus.index] if scenario.corpus.index else []
-    if scenario.corpus.metric_index and re.search(r"\|\s*m(stats|catalog)\b", step.spl or ""):
-        fallback.append(scenario.corpus.metric_index)
-    return [name.lower() for name in fallback]
+    return all_indexes(step_clauses(scenario, step)[0])
 
 
 def policy_span(policy: TimePolicy, start: float, duration_s: float) -> Interval:
@@ -144,14 +147,18 @@ def _overlaps(bucket: Bucket, spans: Sequence[Interval]) -> bool:
 
 @dataclass
 class StepSpan:
+    """One clause of one step: which indexes it reads, over what range."""
+
     step_id: str
     indexes: List[str]
     earliest: float
     latest: float
+    origin: str = "search"
 
     def to_dict(self) -> Dict[str, Any]:
         return {
             "step_id": self.step_id,
+            "origin": self.origin,
             "indexes": list(self.indexes),
             "earliest": round(self.earliest),
             "latest": round(self.latest),
@@ -202,6 +209,10 @@ class Forecast:
     # Per touched bucket id: is any copy local. For the warm-up's chunking.
     touched: Dict[str, Bucket] = field(default_factory=dict)
     touched_local: Dict[str, bool] = field(default_factory=dict)
+    # Each step's dispatch window over the run, before inline bounds.
+    windows: Dict[str, Interval] = field(default_factory=dict)
+    # How much of each touched bucket is on disk, from dbinspect, when read.
+    residency: Optional["Residency"] = None
 
     @property
     def buckets(self) -> int:
@@ -243,6 +254,13 @@ class Forecast:
         )
         if self.capacity_pct is not None:
             line += f"; working set is {self.capacity_pct:.0f}% of the cache"
+        if self.residency is not None and self.residency.available:
+            c = self.residency.counts()
+            line += (
+                f". On disk per dbinspect: {c[FULL]} full, {c[INDEX_ONLY]} index files only, "
+                f"{c[PARTIAL]} partial, {c[STUB]} evicted to a stub; "
+                f"{self.residency.bytes_outstanding / 1e9:.1f} GB not yet local"
+            )
         return line
 
     def to_dict(self) -> Dict[str, Any]:
@@ -262,6 +280,7 @@ class Forecast:
             "per_index": {name: f.to_dict() for name, f in sorted(self.per_index.items())},
             "steps": [s.to_dict() for s in self.steps],
             "notes": list(self.notes),
+            "residency": self.residency.to_dict() if self.residency is not None else None,
         }
 
 
@@ -278,12 +297,19 @@ def forecast(
         return result
 
     wanted: Dict[str, List[Interval]] = {}
+    end = start + max(0.0, duration_s)
     for step in scenario.steps:
-        lo, hi = policy_span(scenario.resolve_time_policy(step), start, duration_s)
-        names = step_indexes(scenario, step)
-        result.steps.append(StepSpan(step.id, names, lo, hi))
-        for name in names:
-            wanted.setdefault(name, []).append((lo, hi))
+        window = policy_span(scenario.resolve_time_policy(step), start, duration_s)
+        result.windows[step.id] = window
+        clauses, notes = step_clauses(scenario, step)
+        for clause in clauses:
+            (lo, hi), span_notes = clause_span(clause, window, start, end)
+            notes = notes + span_notes
+            names = list(clause.indexes)
+            result.steps.append(StepSpan(step.id, names, lo, hi, clause.origin))
+            for name in names:
+                wanted.setdefault(name, []).append((lo, hi))
+        result.notes.extend(f"step {step.id}: {note}" for note in dict.fromkeys(notes))
     if not wanted:
         result.reason = "no step names an index and the scenario declares no corpus index"
         return result
@@ -323,6 +349,7 @@ def forecast(
         result.touched[bid] = first
         result.touched_local[bid] = is_local
 
+    result.notes = list(dict.fromkeys(result.notes))
     result.available = True
     if state.max_cache_size_mb:
         result.capacity_bytes = int(state.max_cache_size_mb) * 1024 * 1024
@@ -349,6 +376,183 @@ def forecast(
             "so warming will evict part of what it fetched and the run will churn"
         )
     return result
+
+
+# ---------------------------------------------------------------- residency
+
+# How much of a bucket is on local disk, from dbinspect. The cache manager's
+# status says "local" as soon as any of a bucket's files are, and it fetches
+# files as a search needs them, so a tstats leaves a bucket "local" with its
+# index files and no journal. dbinspect cached=false examines the indexer's
+# local copy and cached=true the remote manifest; the ratio of their sizes is
+# how much of the bucket is here. dbinspect reads no bucket content, so asking
+# downloads nothing.
+FULL = "full"
+INDEX_ONLY = "index_only"
+PARTIAL = "partial"
+STUB = "stub"
+RESIDENCY_CLASSES = (FULL, INDEX_ONLY, PARTIAL, STUB)
+
+_FULL_RATIO = 0.95
+_STUB_RATIO = 0.02
+_STUB_FLOOR = 2 * 1024 * 1024
+_MIB = 1024 * 1024
+
+
+def classify(local_bytes: float, full_bytes: float, journal_bytes: Optional[int]) -> str:
+    """Full, index files only, partly downloaded, or evicted to a stub.
+
+    ``stub`` is what eviction leaves: the directory with the small files the
+    cache manager keeps (bloomfilter, metadata). ``index_only`` is a bucket
+    holding roughly everything but its journal, which is what a tstats or a
+    metadata search downloads.
+    """
+    if full_bytes <= 0:
+        return PARTIAL if local_bytes > _STUB_FLOOR else STUB
+    if local_bytes >= _FULL_RATIO * full_bytes:
+        return FULL
+    if local_bytes <= max(_STUB_RATIO * full_bytes, _STUB_FLOOR):
+        return STUB
+    if journal_bytes and 0 < journal_bytes < full_bytes:
+        without_journal = full_bytes - journal_bytes
+        if abs(local_bytes - without_journal) <= 0.15 * full_bytes:
+            return INDEX_ONLY
+    return PARTIAL
+
+
+@dataclass
+class BucketResidency:
+    cls: str
+    local_bytes: int
+    full_bytes: int
+
+
+@dataclass
+class Residency:
+    available: bool = False
+    reason: str = ""
+    per_bid: Dict[str, BucketResidency] = field(default_factory=dict)
+    unmatched: int = 0
+    notes: List[str] = field(default_factory=list)
+
+    def counts(self) -> Dict[str, int]:
+        out = {name: 0 for name in RESIDENCY_CLASSES}
+        for entry in self.per_bid.values():
+            out[entry.cls] = out.get(entry.cls, 0) + 1
+        return out
+
+    @property
+    def bytes_outstanding(self) -> int:
+        return sum(max(0, e.full_bytes - e.local_bytes) for e in self.per_bid.values())
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "available": self.available,
+            "reason": self.reason,
+            "buckets": len(self.per_bid),
+            "counts": self.counts(),
+            "bytes_outstanding": self.bytes_outstanding,
+            "unmatched": self.unmatched,
+            "notes": list(self.notes),
+        }
+
+
+def _dbinspect_spl(index: str, cached: bool, spans: Sequence[Interval]) -> str:
+    quoted = '"' + index.replace('"', '\\"') + '"'
+    where = " OR ".join(
+        f"(endEpoch>={int(lo)} AND startEpoch<={int(hi)})" for lo, hi in spans
+    )
+    spl = (
+        f"| dbinspect index={quoted} cached={'true' if cached else 'false'} timeformat=%s "
+        "| eval bytes=sizeOnDiskMB*1048576"
+    )
+    if where:
+        spl += f" | where isnull(startEpoch) OR {where}"
+    return spl + " | fields splunk_server, bucketId, bytes"
+
+
+async def read_residency(client: SplunkClient, fc: Forecast) -> Residency:
+    """How much of each bucket the forecast touches is on local disk.
+
+    Never raises: an account that may not run dbinspect, or a release that
+    answers differently, leaves the forecast as the cache manager reported it,
+    with a note.
+    """
+    result = Residency()
+    if not fc.available or not fc.touched:
+        result.reason = "nothing to inspect"
+        return result
+    local: Dict[str, float] = {}
+    full: Dict[str, float] = {}
+    try:
+        for index, entry in sorted(fc.per_index.items()):
+            window = TimeWindow(
+                earliest=min(lo for lo, _ in entry.spans) if entry.spans else 0.0,
+                latest=max(hi for _, hi in entry.spans) if entry.spans else time.time(),
+            )
+            for cached, into in ((False, local), (True, full)):
+                rows, _ = await client.oneshot(
+                    _dbinspect_spl(index, cached, entry.spans), window,
+                    count=CACHEMAN_SEARCH_MAX_ROWS,
+                )
+                for row in rows:
+                    bid = f"bid|{row.get('bucketId') or ''}|"
+                    try:
+                        size = float(row.get("bytes") or 0.0)
+                    except (TypeError, ValueError):
+                        continue
+                    # A replicated bucket has a row per peer; the copy with
+                    # the most on disk is the one most likely to be read.
+                    into[bid] = max(into.get(bid, 0.0), size)
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:  # noqa: BLE001 - absence of the answer is a note
+        result.reason = f"dbinspect could not be read: {str(exc)[:200]}"
+        return result
+    if not local and not full:
+        result.reason = "dbinspect returned no buckets for the indexes this run reads"
+        return result
+    for bid, bucket in fc.touched.items():
+        if bid not in local:
+            result.unmatched += 1
+            continue
+        full_bytes = full.get(bid) or float(bucket.size or 0)
+        result.per_bid[bid] = BucketResidency(
+            cls=classify(local[bid], full_bytes, bucket.journal_size),
+            local_bytes=int(local[bid]),
+            full_bytes=int(full_bytes),
+        )
+    result.available = bool(result.per_bid)
+    if not result.available:
+        result.reason = "no dbinspect row matched a bucket the run reads"
+    if result.unmatched:
+        result.notes.append(
+            f"{result.unmatched} bucket(s) the run reads had no dbinspect row and are "
+            "left as the cache manager reported them"
+        )
+    return result
+
+
+async def forecast_on_disk(
+    client: SplunkClient, scenario: Scenario, state: CacheState, start: float, duration_s: float
+) -> Forecast:
+    """The forecast, refined by dbinspect where it can be read."""
+    fc = forecast(scenario, state, start, duration_s)
+    if fc.available and fc.touched:
+        fc.residency = await read_residency(client, fc)
+        if not fc.residency.available:
+            fc.notes.append(f"bucket residency not read: {fc.residency.reason}")
+    return fc
+
+
+def needs_warming(fc: Forecast, bid: str, mode: str) -> bool:
+    """Whether a warm-up in ``mode`` has anything left to fetch for a bucket."""
+    entry = fc.residency.per_bid.get(bid) if fc.residency and fc.residency.available else None
+    if entry is None:
+        return not fc.touched_local.get(bid)
+    if mode == "tsidx":
+        return entry.cls in (STUB, PARTIAL)
+    return entry.cls != FULL
 
 
 # ---------------------------------------------------------------- warming
@@ -381,10 +585,10 @@ def _chunks(spans: Sequence[Interval], chunk_s: float) -> List[Interval]:
     return out
 
 
-def _chunk_needs_warming(index: str, chunk: Interval, fc: Forecast) -> bool:
+def _chunk_needs_warming(index: str, chunk: Interval, fc: Forecast, mode: str) -> bool:
     lo, hi = chunk
     for bid, bucket in fc.touched.items():
-        if bucket.index != index or fc.touched_local.get(bid):
+        if bucket.index != index or not needs_warming(fc, bid, mode):
             continue
         if bucket.earliest is None or bucket.latest is None:
             return True
@@ -407,18 +611,24 @@ def warm_searches(
     skipped = 0
     if mode == "replay":
         seen = set()
-        for step, span in zip(scenario.steps, fc.steps):
+        for step in scenario.steps:
             if step.type != "search" or not step.spl or step.dispatch == "saved":
                 continue
             spl = step.spl
             if resolver is not None:
                 spl, _ = resolver.render(spl, DrawContext(scenario.seed, 0, 0, step.id))
+            patterns = {p for span in fc.steps if span.step_id == step.id for p in span.indexes}
             mine = [
                 index for index in fc.per_index
-                if any(fnmatch.fnmatchcase(index.lower(), p) for p in span.indexes)
+                if any(fnmatch.fnmatchcase(index.lower(), p) for p in patterns)
             ]
-            for lo, hi in _chunks([(span.earliest, span.latest)], chunk_s):
-                if not any(_chunk_needs_warming(i, (lo, hi), fc) for i in mine):
+            # Chunked over the dispatch window: a clause with its own inline
+            # bounds reads those whatever window it is dispatched with.
+            window = fc.windows.get(step.id)
+            if window is None:
+                continue
+            for lo, hi in _chunks([window], chunk_s):
+                if not any(_chunk_needs_warming(i, (lo, hi), fc, mode) for i in mine):
                     skipped += 1
                     continue
                 key = (spl, lo, hi)
@@ -435,7 +645,7 @@ def warm_searches(
         else:
             spl = f"search index={quoted} | eval regulator_warm=len(_raw) | stats sum(regulator_warm)"
         for chunk in _chunks(entry.spans, chunk_s):
-            if not _chunk_needs_warming(index, chunk, fc):
+            if not _chunk_needs_warming(index, chunk, fc, mode):
                 skipped += 1
                 continue
             planned.append((spl, TimeWindow(earliest=chunk[0], latest=chunk[1])))

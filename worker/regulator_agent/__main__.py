@@ -477,8 +477,8 @@ async def _run(config: Config, args: argparse.Namespace) -> int:
         cache_forecast = None
         if cache_before.available:
             log.info(render_cache(cache_before).splitlines()[0])
-            cache_forecast = cachewarm.forecast(
-                scenario, cache_before, time.time(), scheduler.duration_s
+            cache_forecast = await cachewarm.forecast_on_disk(
+                engine.client, scenario, cache_before, time.time(), scheduler.duration_s
             )
             _log_forecast(cache_forecast)
 
@@ -569,7 +569,7 @@ async def _warm(
         return None
     where = _indexer_kwargs(config)
     state = await cache_state(client, **where)
-    before = cachewarm.forecast(scenario, state, time.time(), duration_s)
+    before = await cachewarm.forecast_on_disk(client, scenario, state, time.time(), duration_s)
     if not before.available:
         log.warning("cache warm-up skipped: %s", before.reason)
         return None
@@ -593,7 +593,9 @@ async def _warm(
         concurrency=config.warm_cache_concurrency, budget_s=config.warm_cache_budget_s,
         skipped_local=skipped,
     )
-    after = cachewarm.forecast(scenario, await cache_state(client, **where), time.time(), duration_s)
+    after = await cachewarm.forecast_on_disk(
+        client, scenario, await cache_state(client, **where), time.time(), duration_s
+    )
     result.before, result.after = before.to_dict(), after.to_dict()
     log.warning(
         "cache warm-up: %d search(es) in %.0fs (%d failed, %d not started within the budget); "
@@ -622,7 +624,7 @@ async def _forecast_or_warm(
         print(json.dumps(result.to_dict(), indent=2, default=str))
         return EXIT_OK if not result.failed else EXIT_FAILED
     state = await cache_state(client, **_indexer_kwargs(config))
-    fc = cachewarm.forecast(scenario, state, time.time(), duration_s)
+    fc = await cachewarm.forecast_on_disk(client, scenario, state, time.time(), duration_s)
     _log_forecast(fc)
     print(json.dumps(fc.to_dict(), indent=2, default=str))
     return EXIT_OK if fc.available else EXIT_FAILED

@@ -751,12 +751,48 @@ running anything.
 python -m regulator_agent --cache-forecast
 ```
 
-The indexes come from `index=`, `index::` and `index IN (...)` in each search,
-and from the scenario's corpus index for a search that names none (a macro, an
-eventtype or a data model hides its index from the search string). A bucket
-counts as local when any indexer holding a copy has it local, which is an upper
-bound where replicas differ. A working set larger than the cache is called out:
-it cannot all be local at once.
+Each search is read for every part that selects events, each with its own
+indexes and time range:
+
+- `index=`, `index::` and `index IN (...)` in the base search, a later
+  `| search`, and the `where` clause of `tstats` and `mstats`;
+- inline `earliest=` and `latest=` (relative, epoch, or `%m/%d/%Y:%H:%M:%S`),
+  which override the dispatch window for that part. A relative bound moves with
+  the run, so its range is taken from the first dispatch to the last;
+- parenthesised groups joined by `OR`, each with its own index and bounds:
+  `(index=a earliest=-1h) OR (index=b earliest=-7d)` reads an hour of `a` and a
+  week of `b`. Splunk binds `OR` tighter than the implicit `AND`, so in
+  `index=web (A earliest=-1h) OR (B earliest=-2h)` both groups are in `web`;
+- every subsearch (`append`, `appendcols`, `join`, `union`, `multisearch`, a
+  `[search ...]` filter, nested ones) and `map search="..."`, each read on its
+  own terms and inheriting the dispatch window where it sets no bound.
+
+Field assignments that look like bounds (`eval earliest=...`, `stats
+earliest(_time)`, text inside quotes) are not read as bounds. Generating commands
+that read no buckets (`inputlookup`, `makeresults`, `rest` and the like) add
+nothing. What cannot be seen from the search string is noted rather than guessed:
+a macro, an eventtype or a tag hides its index, a `$token$` hides a bound (the
+dispatch window is used), and absolute dates are read as UTC. A part that names
+no index falls back to the scenario's corpus index.
+
+A bucket counts as local when any indexer holding a copy has it local, which is
+an upper bound where replicas differ. A working set larger than the cache is
+called out: it cannot all be local at once.
+
+**Full or partial, from `dbinspect`.** The cache manager reports a bucket as
+`local` as soon as any of its files are, and it fetches files as a search needs
+them: Splunk's documentation says tstats and `metadata` searches do not need the
+rawdata journal, and that eviction keeps small files such as the bloomfilter.
+So the forecast also runs `| dbinspect cached=false` (the indexer's local copy)
+and `cached=true` (the remote manifest) for each index the run reads, and
+compares the sizes per bucket: `full`, `index_only` (everything but roughly the
+journal, using the cache manager's `journal_size`), `partial`, or `stub` (what
+eviction leaves). The forecast line then reads, for example, "On disk per
+dbinspect: 180 full, 220 index files only, 0 partial, 12 evicted to a stub;
+94.1 GB not yet local". `dbinspect` reads no bucket content, so asking downloads
+nothing. If the account may not run it, the forecast stands on the cache
+manager's status and says so. The size comparison is an inference from what the
+two `cached` modes examine; it is not documented, so check it on your release.
 
 **Warm before a run.** `REG_WARM_CACHE=1` reads the remote buckets the forecast
 found before the measured run starts, then forecasts again and records both under
@@ -773,11 +809,9 @@ three modes:
 | `full` | reads `_raw` for every event in range | Everything, at the cost of reading all the data once |
 | `replay` | each of the scenario's own searches, once, over its whole range | What those search shapes download, for one parameter draw |
 
-The cache manager fetches a bucket's files as a search needs them (Splunk's
-cache manager documentation says so), so a bucket the cache manager lists as
-`local` may hold its index files without its journal. That `tsidx` mode fetches
-no journal is inferred from what tstats reads, not confirmed on a live cluster:
-use `full` when the run's searches read raw events and you need them warm.
+Warming uses the residency where it was read: a `tsidx` warm-up skips buckets
+whose index files are already local, and `full` and `replay` warm-ups skip only
+buckets that are fully local. Use `full` when the run's searches read raw events.
 
 The warm-up is load on the target and is reported as such. It is opt-in and
 cannot be combined with `REG_EVICT_CACHE`.

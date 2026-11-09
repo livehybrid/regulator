@@ -22,6 +22,7 @@ fake_splunk = pytest.importorskip("tools.fake_splunk", reason="the fake splunkd 
 FakeSplunk = fake_splunk.FakeSplunk
 
 GB = 1_000_000_000
+MB = 1024 * 1024
 
 
 def scenario(**time_policy):
@@ -312,3 +313,136 @@ def test_a_run_with_warm_up_starts_warm_and_says_so(monkeypatch, tmp_path, write
         assert cache["forecast"]["local_pct"] == 100.0
     finally:
         splunkd.close()
+
+
+# ------------------------------------------------------------ search shape
+
+
+def scenario_with(spl, **time_policy):
+    doc = tiny_scenario_dict()
+    doc["time_policy"] = time_policy or {"mode": "rolling", "window": "1h", "jitter": "0s", "align": "1m"}
+    doc["personas"][0]["steps"] = [{"id": "s", "type": "search", "engine": "api", "spl": spl}]
+    return parse_scenario(doc)
+
+
+def test_an_inline_earliest_widens_what_the_forecast_counts():
+    start = 10_000_000.0
+    buckets = [bucket(n, earliest=start - (n + 1) * 86400, latest=start - n * 86400 - 1) for n in range(5)]
+    plain = cachewarm.forecast(scenario_with("search index=main"), state_of(buckets), start, 60.0)
+    wide = cachewarm.forecast(scenario_with("search index=main earliest=-3d"), state_of(buckets), start, 60.0)
+    assert plain.buckets == 1
+    assert wide.buckets == 3
+
+
+def test_or_groups_and_appended_searches_each_count_their_own_range():
+    start = 10_000_000.0
+    buckets = (
+        [bucket(n, index="main", earliest=start - (n + 1) * 86400, latest=start - n * 86400 - 1) for n in range(5)]
+        + [bucket(10 + n, index="web", earliest=start - (n + 1) * 86400, latest=start - n * 86400 - 1) for n in range(5)]
+        + [bucket(20 + n, index="fw", earliest=start - (n + 1) * 86400, latest=start - n * 86400 - 1) for n in range(5)]
+    )
+    spl = "(index=main earliest=-2d) OR (index=web) | append [search index=fw earliest=-4d latest=-1d]"
+    fc = cachewarm.forecast(scenario_with(spl), state_of(buckets), start, 60.0)
+    assert fc.per_index["main"].buckets == 2
+    assert fc.per_index["web"].buckets == 1
+    # -4d to -1d (taken at the run's end) overlaps the four newest days.
+    assert fc.per_index["fw"].buckets == 4
+    assert {s.origin for s in fc.steps} == {"or-group", "subsearch"}
+
+
+def test_a_search_that_reads_no_buckets_adds_nothing():
+    start = 10_000_000.0
+    fc = cachewarm.forecast(
+        scenario_with("| inputlookup hosts.csv"),
+        state_of([bucket(1, earliest=start - 60, latest=start)]), start, 60.0,
+    )
+    assert fc.buckets == 0
+
+
+# ------------------------------------------------------------ residency
+
+
+@pytest.mark.parametrize(
+    "local, full, journal, expected",
+    [
+        (1000 * MB, 1000 * MB, 700 * MB, cachewarm.FULL),
+        (960 * MB, 1000 * MB, 700 * MB, cachewarm.FULL),
+        (300 * MB, 1000 * MB, 700 * MB, cachewarm.INDEX_ONLY),
+        (600 * MB, 1000 * MB, 700 * MB, cachewarm.PARTIAL),
+        (500 * MB, 1000 * MB, None, cachewarm.PARTIAL),
+        (0, 1000 * 1024 * 1024, 700, cachewarm.STUB),
+        (512 * 1024, 750 * 1024 * 1024, 525 * 1024 * 1024, cachewarm.STUB),
+    ],
+)
+def test_classify(local, full, journal, expected):
+    assert cachewarm.classify(local, full, journal) == expected
+
+
+def _fake(**overrides):
+    defaults = dict(
+        port=0, base_latency_ms=2.0, jitter_ms=0.0, dispatch_latency_ms=1.0,
+        smartstore_buckets=40, smartstore_local_pct=0, smartstore_bucket_span_s=3600.0,
+    )
+    defaults.update(overrides)
+    return FakeSplunk(**defaults)
+
+
+def test_dbinspect_tells_index_files_only_from_a_full_download(env):
+    """The cache manager says local after a tstats; dbinspect says how much."""
+
+    async def go():
+        splunkd = _fake()
+        try:
+            config = load_config(env(REG_TARGET_URL=splunkd.base_url, REG_TARGET_VERIFY_TLS="0"))
+            client = SplunkClient(config.target)
+            await client.start()
+            try:
+                scn = scenario(mode="rolling", window="1h", jitter="5m", align="1m")
+
+                async def look():
+                    return await cachewarm.forecast_on_disk(
+                        client, scn, await cache_state(client), time.time(), 1.0
+                    )
+
+                cold = await look()
+                planned, _ = cachewarm.warm_searches(scn, cold, "tsidx", 86400.0)
+                await cachewarm.warm(client, planned, mode="tsidx")
+                after_tsidx = await look()
+                again, _ = cachewarm.warm_searches(scn, after_tsidx, "tsidx", 86400.0)
+                need_full, _ = cachewarm.warm_searches(scn, after_tsidx, "full", 86400.0)
+                await cachewarm.warm(client, need_full, mode="full")
+                after_full = await look()
+                return cold, after_tsidx, again, need_full, after_full
+            finally:
+                await client.close()
+        finally:
+            splunkd.close()
+
+    cold, after_tsidx, again, need_full, after_full = run_async(go())
+    assert cold.residency.available
+    assert cold.residency.counts()[cachewarm.STUB] == 2
+    # The cache manager now calls them local; dbinspect says index files only.
+    assert after_tsidx.local == 2
+    assert after_tsidx.residency.counts()[cachewarm.INDEX_ONLY] == 2
+    assert after_tsidx.residency.bytes_outstanding > 0
+    assert "index files only" in after_tsidx.summary_line()
+    # A tsidx warm-up has nothing left to do; a full one still has.
+    assert again == [] and need_full
+    assert after_full.residency.counts()[cachewarm.FULL] == 2
+    assert after_full.residency.bytes_outstanding == 0
+
+
+def test_without_dbinspect_the_forecast_stands_on_the_cache_manager():
+    class Client:
+        async def oneshot(self, spl, window, count=1):
+            raise RuntimeError("dbinspect is not permitted")
+
+    start = 10_000_000.0
+    scn = scenario(mode="rolling", window="1h", jitter="0s", align="1m")
+    state = state_of([bucket(1, status="local", earliest=start - 600, latest=start)])
+    fc = run_async(cachewarm.forecast_on_disk(Client(), scn, state, start, 60.0))
+    assert fc.available and fc.local == 1
+    assert fc.residency is not None and not fc.residency.available
+    assert any("residency not read" in note for note in fc.notes)
+    # Falls back to the cache manager's status for what to warm.
+    assert cachewarm.warm_searches(scn, fc, "full", 86400.0)[0] == []

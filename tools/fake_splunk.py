@@ -113,6 +113,9 @@ class FakeSplunkConfig:
     # this many seconds each. A search over an index pulls every remote bucket
     # its window overlaps into the cache, which is what SmartStore does.
     smartstore_bucket_span_s: float = 86400.0
+    # The rawdata journal's share of a bucket. A tstats downloads the rest
+    # (the index files) and not the journal, as the real cache manager does.
+    smartstore_journal_pct: int = 70
     # Indexes that /services/data/indexes/<name> reports as existing. Anything
     # else 404s, so a scenario naming an index that is not there is caught by
     # the online lint exactly as it would be against a real cluster.
@@ -704,21 +707,59 @@ class FakeSplunk:
             # Default-index searches are not modelled, and neither the cache
             # manager reading (| rest) nor a makeresults reads a bucket.
             return
+        if re.match(r"\s*\|\s*(dbinspect|rest|metadata|eventcount)\b", spl):
+            return  # these read no bucket content
+        index_only = bool(re.match(r"\s*\|\s*tstats\b", spl))
         try:
             earliest = float(_first(form, "earliest_time", "0") or 0)
             latest = float(_first(form, "latest_time", "") or time.time())
         except ValueError:
             return
         for bid, status in self._buckets.items():
-            if status != "remote":
+            if status == "local" or (status == "tsidx" and index_only):
                 continue
             index = bid.split("|", 1)[1].split("~", 1)[0].lower()
             if not any(fnmatch.fnmatchcase(index, n) for n in names):
                 continue
             lo, hi = self._bucket_ranges.get(bid, (0.0, 0.0))
             if lo <= latest and hi >= earliest:
-                self._buckets[bid] = "local"
-                self.stats.buckets_localised += 1
+                if status == "remote":
+                    self.stats.buckets_localised += 1
+                self._buckets[bid] = "tsidx" if index_only else "local"
+
+    def _journal_bytes(self) -> int:
+        pct = max(0, min(100, int(self.config.smartstore_journal_pct)))
+        return self.config.smartstore_bucket_bytes * pct // 100
+
+    def _dbinspect(self, spl: str) -> Tuple[int, Any]:
+        """Bucket sizes on local disk (cached=false) or in the manifest (true)."""
+        names = {m.lower() for m in re.findall(r'index\s*=\s*"?([A-Za-z0-9_\-\*]+)', spl)}
+        manifest = bool(re.search(r"cached\s*=\s*(true|t|1)\b", spl, re.IGNORECASE))
+        full = self.config.smartstore_bucket_bytes
+        rows = []
+        with self._lock:
+            for bid, status in sorted(self._buckets.items()):
+                inner = bid.split("|", 1)[1].rstrip("|")
+                index = inner.split("~", 1)[0].lower()
+                if names and not any(fnmatch.fnmatchcase(index, n) for n in names):
+                    continue
+                if manifest or status == "local":
+                    size = full
+                elif status == "tsidx":
+                    size = full - self._journal_bytes()
+                else:
+                    size = 512 * 1024  # what eviction leaves: bloomfilter, metadata
+                lo, hi = self._bucket_ranges.get(bid, (0.0, 0.0))
+                rows.append({
+                    "splunk_server": "fake-idx",
+                    "bucketId": inner,
+                    "index": index,
+                    "bytes": str(size),
+                    "sizeOnDiskMB": f"{size / 1048576:.3f}",
+                    "startEpoch": str(int(lo)),
+                    "endEpoch": str(int(hi)),
+                })
+        return 200, {"messages": [], "fields": list(rows[0]) if rows else [], "results": rows}
 
     def _cacheman_list(self) -> Tuple[int, Any]:
         entries = []
@@ -728,9 +769,11 @@ class FakeSplunk:
                     "name": bid,
                     "content": {
                         "cm:bucket": {
-                            "status": status,
+                            # Any files local reads as local, as on a real
+                            # indexer: only dbinspect shows how much.
+                            "status": "remote" if status == "remote" else "local",
                             "estimated_size": self.config.smartstore_bucket_bytes,
-                            "journal_size": self.config.smartstore_bucket_bytes,
+                            "journal_size": self._journal_bytes(),
                             "cache_priority": 0,
                             "ref_count": 0,
                             "stable": True,
@@ -837,6 +880,8 @@ class FakeSplunk:
         _sleep_ms(self.config.dispatch_latency_ms)
 
         exec_mode = _first(form, "exec_mode", "normal")
+        if exec_mode == "oneshot" and re.match(r"\s*\|\s*dbinspect\b", spl):
+            return self._dbinspect(spl)
         if exec_mode == "oneshot":
             return self._oneshot(spl, form, api_version)
 
