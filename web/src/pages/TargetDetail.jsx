@@ -16,6 +16,7 @@ import WaitSpinner from '@splunk/react-ui/WaitSpinner';
 import CacheModal from '../modals/CacheModal';
 import LineChart from '../components/LineChart';
 import PurgeModal from '../modals/PurgeModal';
+import WarmModal from '../modals/WarmModal';
 import useLoader from '../useLoader';
 import { Mono, Muted, PageHead, Panel, RelTime, Toolbar } from '../components/primitives';
 import { api } from '../api';
@@ -68,8 +69,8 @@ export default function TargetDetail({ targetId, navigate }) {
             title="SmartStore cache"
             leftTitle="%"
             markers={samples
-                .filter((s) => s.kind === 'evict')
-                .map((s) => ({ at: s.at, label: 'evict', kind: 'evict' }))}
+                .filter((s) => s.kind === 'evict' || s.kind === 'warm')
+                .map((s) => ({ at: s.at, label: s.kind, kind: s.kind }))}
             series={[
                 { label: 'local %', points: samples.map((s) => [s.at, s.local_pct]) },
                 { label: 'fill %', points: samples.map((s) => [s.at, s.fill_pct]) },
@@ -95,6 +96,7 @@ export default function TargetDetail({ targetId, navigate }) {
                 <Toolbar>
                     <Button label="All targets" onClick={() => navigate('targets')} />
                     <Button label="Read the cache now" onClick={() => openWith('cache')} />
+                    <Button label="Warm cache" onClick={() => setDialog({ kind: 'warm' })} />
                     <Button
                         appearance="destructive"
                         label="Purge cache"
@@ -168,6 +170,9 @@ export default function TargetDetail({ targetId, navigate }) {
                     loading={dialog.loading}
                     onClose={() => setDialog(null)}
                 />
+            )}
+            {dialog && dialog.kind === 'warm' && (
+                <WarmModal targetId={targetId} onClose={() => setDialog(null)} onDone={reload} />
             )}
             {dialog && dialog.kind === 'purge' && (
                 <PurgeModal

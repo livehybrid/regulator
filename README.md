@@ -334,6 +334,8 @@ docker run --rm -p 8080:8080 -v regulator-data:/data \
 Add a target, and the buttons do the rest: **Test** probes it, **Report**
 describes the whole cluster and says which scenarios its data fits, **Cache**
 shows what SmartStore holds locally on every indexer, **Evict** drops it,
+**Warm cache** suggests the indexes and time ranges a scenario reads for you to
+edit and confirm, then warms exactly those,
 **Saved searches** lists what the target already runs and turns it into a
 scenario, and **Run** launches a scenario with live latency, throughput and
 queueing while it goes. A finished run can be made a **baseline** and any run
@@ -794,39 +796,64 @@ nothing. If the account may not run it, the forecast stands on the cache
 manager's status and says so. The size comparison is an inference from what the
 two `cached` modes examine; it is not documented, so check it on your release.
 
-**Warm before a run.** `REG_WARM_CACHE=1` reads the remote buckets the forecast
-found before the measured run starts, then forecasts again and records both under
-`cache.warm`. `--warm-cache` does the same and exits. Warming uses ordinary
-oneshot searches, cut into chunks and skipping any chunk whose buckets are
-already local. It never uses the cache manager's undocumented `_localize`
-action, which community reports say stops the indexer evicting normally until it
+**Warm from a plan you confirm.** Regulator never warms values it derived on its
+own. The forecast *suggests* a plan, a list of indexes each with an earliest and
+latest time; you check it, edit it, and only the plan as you left it is warmed.
+Reading a search string is a best effort (see above), and warming the wrong range
+is real load on somebody's cluster, so the tool proposes and the operator decides.
+
+In the console, **Warm cache** on a target opens the dialog: pick a scenario,
+**Suggest a plan** fills an editable table (index, earliest, latest) alongside
+what the forecast could not be sure of, you edit or add lines, tick that you
+have checked them, and **Warm**. Editing a line after ticking clears the tick.
+The warm-up runs in the background; the audit trail records the confirmed plan,
+who started it, where the suggestion came from, and what it did, and the
+target's cache chart marks it.
+
+From the command line, the same in two steps:
+
+```bash
+python -m regulator_agent --cache-forecast --plan-out plan.json   # a suggestion: review and edit it
+python -m regulator_agent --warm-cache --warm-plan plan.json       # warm exactly that, then exit
+REG_WARM_CACHE=1 REG_WARM_CACHE_PLAN=plan.json python -m regulator_agent   # or warm, then run
+```
+
+`plan.json` is a list of `{"index", "earliest", "latest"}` (the file `--plan-out`
+writes also carries a note and the scenario it came from). Times take ISO 8601
+(UTC unless a zone is given), an epoch, `%m/%d/%Y:%H:%M:%S`, or a Splunk modifier
+such as `-7d@d`, resolved when the warm-up starts. `--warm-plan` also takes the
+JSON inline. A plan is refused outright for a bare `*` index, a latest not after
+its earliest, or a time it cannot read; `REG_WARM_CACHE=1` without a plan, and
+`--warm-cache` without `--warm-plan`, refuse to start and say how to get one.
+
+Every warm-up search stays inside a confirmed line: its index is the line's
+index and its window a chunk of the line's range. Chunks whose buckets are
+already as local as the mode would make them are skipped. Warming uses ordinary
+oneshot searches, never the cache manager's undocumented `_localize` action,
+which community reports say stops the indexer evicting normally until it
 restarts. Which bucket files a search downloads depends on the search, hence
-three modes:
+two modes:
 
 | `REG_WARM_CACHE_MODE` | Search | Warms |
 |---|---|---|
-| `tsidx` (default) | `\| tstats count where index=X by _time` | Index files of every bucket in range, no raw data. Cheap. Full for tstats and accelerated searches; raw searches still fetch the journal |
+| `tsidx` (default) | `\| tstats count where index=X by _time` | Index files of every bucket in range, no raw data. Cheap. Enough for tstats and accelerated searches; raw searches still fetch the journal |
 | `full` | reads `_raw` for every event in range | Everything, at the cost of reading all the data once |
-| `replay` | each of the scenario's own searches, once, over its whole range | What those search shapes download, for one parameter draw |
 
-Warming uses the residency where it was read: a `tsidx` warm-up skips buckets
-whose index files are already local, and `full` and `replay` warm-ups skip only
-buckets that are fully local. Use `full` when the run's searches read raw events.
+There is deliberately no mode that replays the scenario's own searches: their
+inline `earliest`/`latest` could read outside the ranges you confirmed. Warming
+uses the residency where it was read: a `tsidx` warm-up skips buckets whose index
+files are already local, and `full` skips only buckets that are fully local.
 
 The warm-up is load on the target and is reported as such. It is opt-in and
 cannot be combined with `REG_EVICT_CACHE`.
-
-```bash
-REG_WARM_CACHE=1 REG_WARM_CACHE_MODE=full python -m regulator_agent
-python -m regulator_agent --warm-cache
-```
 
 | Variable | Default | Notes |
 |---|---|---|
 | `REG_EVICT_CACHE` | `0` | Evict before the run, so it measures the cold path. Opt-in and never a default |
 | `REG_EVICT_CACHE_INDEXES` | the scenario's corpus index | Comma-separated. Also supplies the default index list for `--evict-cache` |
-| `REG_WARM_CACHE` | `0` | Warm the buckets the run will read before it starts. Opt-in; not with `REG_EVICT_CACHE` |
-| `REG_WARM_CACHE_MODE` | `tsidx` | `tsidx`, `full` or `replay`, as above |
+| `REG_WARM_CACHE` | `0` | Warm a confirmed plan before the run starts. Opt-in; needs `REG_WARM_CACHE_PLAN`; not with `REG_EVICT_CACHE` |
+| `REG_WARM_CACHE_PLAN` | none | The plan to warm: a path to a JSON file, or the JSON itself. Also the default for `--warm-cache` |
+| `REG_WARM_CACHE_MODE` | `tsidx` | `tsidx` or `full`, as above |
 | `REG_WARM_CACHE_CONCURRENCY` | `4` | Warm-up searches at once |
 | `REG_WARM_CACHE_BUDGET_S` | `1800` | Stop starting warm-up searches after this long; the rest are reported as not started |
 | `REG_WARM_CACHE_CHUNK_S` | `86400` | Each warm-up search covers at most this much time, so none outlives the read timeout |

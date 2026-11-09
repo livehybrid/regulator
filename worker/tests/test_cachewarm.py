@@ -11,7 +11,6 @@ import pytest
 from conftest import run_async, tiny_scenario_dict
 from regulator_agent import cachewarm
 from regulator_agent.config import ConfigError, load_config
-from regulator_agent.params import ParameterResolver
 from regulator_agent.scenario import TimePolicy, parse_scenario
 from regulator_agent.smartstore import Bucket, CacheState, IndexCache, cache_state
 from regulator_agent.splunk import SplunkClient
@@ -144,12 +143,20 @@ def test_no_cache_is_an_answer_not_an_error():
 # ------------------------------------------------------------ planning
 
 
+def suggested_searches(fc, mode, chunk_s=86400.0):
+    """What warming the forecast's own suggestion, unedited, would run."""
+    return cachewarm.plan_searches(cachewarm.suggest_plan(fc, mode), fc, mode, chunk_s)
+
+
 def test_chunks_that_are_already_local_are_not_searched():
     start = 10_000_000.0
     scn = scenario(mode="rolling", window="1h", jitter="0s", align="1m")
     all_local = state_of([bucket(1, status="local", earliest=start - 1800, latest=start)])
     fc = cachewarm.forecast(scn, all_local, start, duration_s=60.0)
-    planned, skipped = cachewarm.warm_searches(scn, fc, "tsidx", 86400.0)
+    assert cachewarm.suggest_plan(fc, "tsidx") == []
+    # An operator can still insist; the already-local chunk is skipped.
+    plan = [cachewarm.WarmTarget("main", start - 3600, start)]
+    planned, skipped = cachewarm.plan_searches(plan, fc, "tsidx", 86400.0)
     assert planned == [] and skipped == 1
 
 
@@ -159,20 +166,15 @@ def test_the_shapes_of_the_warm_up_searches():
     state = state_of([bucket(1, earliest=start - 1800, latest=start)])
     fc = cachewarm.forecast(scn, state, start, duration_s=60.0)
 
-    (tsidx, window), = cachewarm.warm_searches(scn, fc, "tsidx", 86400.0)[0]
+    (tsidx, window), = suggested_searches(fc, "tsidx", 86400.0)[0]
     assert tsidx.startswith('| tstats count where index="main"')
     assert window.earliest <= start - 3600 and window.latest >= start
 
-    (full, _), = cachewarm.warm_searches(scn, fc, "full", 86400.0)[0]
+    (full, _), = suggested_searches(fc, "full", 86400.0)[0]
     assert "len(_raw)" in full
 
-    replay, _ = cachewarm.warm_searches(scn, fc, "replay", 86400.0, ParameterResolver(scn))
-    spls = [spl for spl, _ in replay]
-    assert "| tstats count where index=main" in spls
-    assert any(spl.startswith("search index=main n=") and "{{" not in spl for spl in spls)
-
     with pytest.raises(ValueError):
-        cachewarm.warm_searches(scn, fc, "nope", 86400.0)
+        cachewarm.plan_searches([], fc, "replay", 86400.0)
 
 
 def test_a_long_range_is_cut_into_chunks():
@@ -180,7 +182,7 @@ def test_a_long_range_is_cut_into_chunks():
     scn = scenario(mode="rolling", window="3d", jitter="0s", align="1m")
     state = state_of([bucket(n, earliest=start - (n + 1) * 86400, latest=start - n * 86400) for n in range(3)])
     fc = cachewarm.forecast(scn, state, start, duration_s=60.0)
-    planned, _ = cachewarm.warm_searches(scn, fc, "tsidx", 86400.0)
+    planned, _ = suggested_searches(fc, "tsidx", 86400.0)
     assert len(planned) >= 3
     assert all(w.span_s <= 86400.0 for _, w in planned)
 
@@ -201,7 +203,7 @@ def test_warming_makes_the_buckets_the_run_reads_local(env):
             try:
                 scn = scenario(mode="rolling", window="1h", jitter="5m", align="1m")
                 before = cachewarm.forecast(scn, await cache_state(client), time.time(), 1.0)
-                planned, _ = cachewarm.warm_searches(scn, before, "tsidx", 86400.0)
+                planned, _ = suggested_searches(before, "tsidx", 86400.0)
                 result = await cachewarm.warm(client, planned, mode="tsidx", concurrency=2)
                 after = cachewarm.forecast(scn, await cache_state(client), time.time(), 1.0)
                 return before, result, after, splunkd.stats.buckets_localised
@@ -239,12 +241,19 @@ def test_a_spent_budget_stops_starting_searches():
 
 def test_warm_and_evict_together_is_refused(env):
     with pytest.raises(ConfigError):
-        load_config(env(REG_WARM_CACHE="1", REG_EVICT_CACHE="1"))
+        load_config(env(REG_WARM_CACHE="1", REG_WARM_CACHE_PLAN="p.json", REG_EVICT_CACHE="1"))
 
 
-def test_an_unknown_warm_mode_is_refused(env):
+def test_warming_before_a_run_needs_a_plan_somebody_checked(env):
+    with pytest.raises(ConfigError, match="REG_WARM_CACHE_PLAN"):
+        load_config(env(REG_WARM_CACHE="1"))
+    assert load_config(env(REG_WARM_CACHE="1", REG_WARM_CACHE_PLAN="p.json")).warm_cache_plan == "p.json"
+
+
+@pytest.mark.parametrize("mode", ["hot", "replay"])
+def test_an_unknown_warm_mode_is_refused(env, mode):
     with pytest.raises(ConfigError):
-        load_config(env(REG_WARM_CACHE_MODE="hot"))
+        load_config(env(REG_WARM_CACHE_MODE=mode))
 
 
 def test_warm_up_defaults(env):
@@ -302,12 +311,23 @@ def test_a_run_with_warm_up_starts_warm_and_says_so(monkeypatch, tmp_path, write
     )
     try:
         summary = tmp_path / "summary.json"
+        plan = tmp_path / "plan.json"
+        scenario_dir = write_scenario(tiny_scenario_dict())
+        _cli_env(monkeypatch, splunkd, scenario_dir)
+        assert main(["--cache-forecast", "--plan-out", str(plan)]) == 0
+        written = json.loads(plan.read_text())
+        assert "SUGGESTION" in written["_note"]
+        assert [line["index"] for line in written["plan"]] == ["main"]
+        assert written["plan"][0]["earliest"].endswith("Z")  # readable, not an epoch
+
         _cli_env(
-            monkeypatch, splunkd, write_scenario(tiny_scenario_dict()),
-            REG_WARM_CACHE="1", REG_SUMMARY_PATH=str(summary), REG_OUTPUT=str(tmp_path / "r.ndjson"),
+            monkeypatch, splunkd, scenario_dir,
+            REG_WARM_CACHE="1", REG_WARM_CACHE_PLAN=str(plan),
+            REG_SUMMARY_PATH=str(summary), REG_OUTPUT=str(tmp_path / "r.ndjson"),
         )
         main([])
         cache = json.loads(summary.read_text())["cache"]
+        assert cache["warm"]["plan"][0]["index"] == "main"
         assert cache["warm"]["before"]["local"] == 0
         assert cache["warm"]["after"]["local"] == 2
         assert cache["forecast"]["local_pct"] == 100.0
@@ -405,11 +425,11 @@ def test_dbinspect_tells_index_files_only_from_a_full_download(env):
                     )
 
                 cold = await look()
-                planned, _ = cachewarm.warm_searches(scn, cold, "tsidx", 86400.0)
+                planned, _ = suggested_searches(cold, "tsidx", 86400.0)
                 await cachewarm.warm(client, planned, mode="tsidx")
                 after_tsidx = await look()
-                again, _ = cachewarm.warm_searches(scn, after_tsidx, "tsidx", 86400.0)
-                need_full, _ = cachewarm.warm_searches(scn, after_tsidx, "full", 86400.0)
+                again, _ = suggested_searches(after_tsidx, "tsidx", 86400.0)
+                need_full, _ = suggested_searches(after_tsidx, "full", 86400.0)
                 await cachewarm.warm(client, need_full, mode="full")
                 after_full = await look()
                 return cold, after_tsidx, again, need_full, after_full
@@ -445,4 +465,109 @@ def test_without_dbinspect_the_forecast_stands_on_the_cache_manager():
     assert fc.residency is not None and not fc.residency.available
     assert any("residency not read" in note for note in fc.notes)
     # Falls back to the cache manager's status for what to warm.
-    assert cachewarm.warm_searches(scn, fc, "full", 86400.0)[0] == []
+    assert suggested_searches(fc, "full", 86400.0)[0] == []
+
+
+# ------------------------------------------------------------ the plan
+
+
+NOW = 1_800_000_000.0
+
+
+def test_a_plan_reads_every_time_format_an_operator_might_type():
+    plan = cachewarm.parse_plan([
+        {"index": "main", "earliest": "-7d@d", "latest": "now"},
+        {"index": "web", "earliest": "2027-01-01T00:00:00Z", "latest": "2027-01-02T00:00:00"},
+        {"index": "fw*", "earliest": 1_799_000_000, "latest": "1799900000"},
+        {"index": "net", "earliest": "01/01/2027:00:00:00", "latest": "01/02/2027:00:00:00"},
+    ], now=NOW)
+    assert [t.index for t in plan] == ["main", "web", "fw*", "net"]
+    assert plan[0].latest == NOW and plan[0].earliest < NOW - 6 * 86400
+    assert plan[1].latest - plan[1].earliest == 86400
+    assert plan[2].earliest == 1_799_000_000.0
+
+
+def test_the_forecast_json_can_be_handed_straight_back():
+    line = {"index": "main", "earliest": NOW - 60, "latest": NOW}
+    assert cachewarm.parse_plan({"suggested_plan": [line]}, now=NOW)[0].index == "main"
+    assert cachewarm.parse_plan({"plan": [line]}, now=NOW)[0].index == "main"
+
+
+@pytest.mark.parametrize(
+    "plan, message",
+    [
+        ([], "non-empty"),
+        ([{"index": "main", "earliest": "-1d", "latest": "-2d"}], "not after"),
+        ([{"index": "*", "earliest": "-1d"}], "bare wildcard"),
+        ([{"index": "main | delete", "earliest": "-1d"}], "not an index"),
+        ([{"index": "main", "earliest": "yesterday-ish"}], "cannot read"),
+        ([{"index": "main"}], "empty"),
+        (["main"], "expected an object"),
+    ],
+)
+def test_a_plan_that_cannot_be_warmed_as_written_is_refused(plan, message):
+    with pytest.raises(cachewarm.PlanError, match=message):
+        cachewarm.parse_plan(plan, now=NOW)
+
+
+def test_every_warm_up_search_stays_inside_a_confirmed_line():
+    start = 10_000_000.0
+    state = state_of([bucket(n, earliest=start - (n + 1) * 86400, latest=start - n * 86400 - 1) for n in range(10)])
+    plan = [cachewarm.WarmTarget("main", start - 3 * 86400, start - 86400)]
+    fc = cachewarm.plan_forecast(plan, state)
+    assert fc.buckets == 3  # what the plan covers, not what a scenario would
+    planned, _ = cachewarm.plan_searches(plan, fc, "full", 3600.0)
+    assert planned
+    assert all(start - 3 * 86400 <= w.earliest and w.latest <= start - 86400 for _, w in planned)
+    assert all('index="main"' in spl for spl, _ in planned)
+
+
+def test_a_plan_is_warmed_as_written_when_the_cache_cannot_be_read():
+    plan = [cachewarm.WarmTarget("main", 0.0, 7200.0)]
+    fc = cachewarm.plan_forecast(plan, CacheState(available=False, reason="no SmartStore"))
+    planned, skipped = cachewarm.plan_searches(plan, fc, "tsidx", 3600.0)
+    assert len(planned) == 2 and skipped == 0
+
+
+def test_the_warm_command_refuses_without_a_plan(monkeypatch, capsys):
+    from regulator_agent.__main__ import main
+
+    splunkd = FakeSplunk(port=0, smartstore_buckets=4)
+    try:
+        for key, value in {
+            "REG_STANDALONE": "1", "REG_TARGET_URL": splunkd.base_url,
+            "REG_TARGET_TOKEN": "t", "REG_TARGET_VERIFY_TLS": "0",
+        }.items():
+            monkeypatch.setenv(key, value)
+        monkeypatch.delenv("REG_SCENARIO", raising=False)
+        monkeypatch.delenv("REG_WARM_CACHE_PLAN", raising=False)
+        assert main(["--warm-cache"]) == 1
+        assert splunkd.stats.oneshots == 0
+    finally:
+        splunkd.close()
+
+
+def test_the_warm_command_warms_exactly_the_plan(monkeypatch, capsys):
+    import json
+    from regulator_agent.__main__ import main
+
+    splunkd = FakeSplunk(
+        port=0, base_latency_ms=2.0, smartstore_buckets=40, smartstore_local_pct=0,
+        smartstore_bucket_span_s=3600.0,
+    )
+    try:
+        for key, value in {
+            "REG_STANDALONE": "1", "REG_TARGET_URL": splunkd.base_url,
+            "REG_TARGET_TOKEN": "t", "REG_TARGET_VERIFY_TLS": "0", "REG_WARM_CACHE_MODE": "full",
+        }.items():
+            monkeypatch.setenv(key, value)
+        monkeypatch.delenv("REG_SCENARIO", raising=False)
+        # Three hours of main: the newest three hourly buckets of that index.
+        plan = json.dumps([{"index": "main", "earliest": "-3h", "latest": "now"}])
+        assert main(["--warm-cache", "--warm-plan", plan]) == 0
+        result = json.loads(capsys.readouterr().out)
+        assert result["mode"] == "full" and result["plan"][0]["index"] == "main"
+        assert result["after"]["residency"]["counts"]["full"] == result["after"]["buckets"]
+        assert splunkd.stats.buckets_localised == result["after"]["buckets"] <= 4
+    finally:
+        splunkd.close()

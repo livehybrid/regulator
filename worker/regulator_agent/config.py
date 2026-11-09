@@ -322,10 +322,13 @@ class Config:
     # floor. Their jobs are left running on the target for that long (never
     # past read_timeout_s). 0 cancels them at the end of the drain, as before.
     harvest_s: float = 240.0
-    # SmartStore warm-up before the measured run: read the buckets the run
-    # will touch so it starts from local disk. Opt-in, like eviction, and the
-    # two are mutually exclusive. See cachewarm.py for the modes.
+    # SmartStore warm-up before the measured run, from a plan the operator
+    # confirmed (indexes with earliest and latest times): a path to a JSON
+    # file, or the JSON itself. Never derived and warmed unseen: the forecast
+    # suggests a plan, a person checks it. Opt-in, like eviction, and the two
+    # are mutually exclusive. See cachewarm.py.
     warm_cache: bool = False
+    warm_cache_plan: Optional[str] = None
     warm_cache_mode: str = "tsidx"
     warm_cache_budget_s: float = 1800.0
     warm_cache_concurrency: int = 4
@@ -463,9 +466,17 @@ def load_config(env: Optional[Mapping[str, str]] = None) -> Config:
         )
 
     warm_mode = (_get(env, "REG_WARM_CACHE_MODE", "tsidx") or "tsidx").strip().lower()
-    if warm_mode not in ("tsidx", "full", "replay"):
+    if warm_mode not in ("tsidx", "full"):
         raise ConfigError(
-            f"REG_WARM_CACHE_MODE must be tsidx, full or replay, got {warm_mode!r}"
+            f"REG_WARM_CACHE_MODE must be tsidx or full, got {warm_mode!r}"
+        )
+    warm_plan = (_get(env, "REG_WARM_CACHE_PLAN") or "").strip() or None
+    if _boolean(env, "REG_WARM_CACHE", False) and not warm_plan:
+        raise ConfigError(
+            "REG_WARM_CACHE needs REG_WARM_CACHE_PLAN: the indexes and time ranges to warm, "
+            "checked by you. Get a suggested plan with "
+            "`python -m regulator_agent --cache-forecast --plan-out plan.json`, review and "
+            "edit it, then set REG_WARM_CACHE_PLAN=plan.json"
         )
     if _boolean(env, "REG_WARM_CACHE", False) and _boolean(env, "REG_EVICT_CACHE", False):
         raise ConfigError(
@@ -510,6 +521,7 @@ def load_config(env: Optional[Mapping[str, str]] = None) -> Config:
         cache_bust=_boolean(env, "REG_CACHE_BUST", True),
         evict_cache=_boolean(env, "REG_EVICT_CACHE", False),
         warm_cache=_boolean(env, "REG_WARM_CACHE", False),
+        warm_cache_plan=warm_plan,
         warm_cache_mode=warm_mode,
         warm_cache_budget_s=_number(env, "REG_WARM_CACHE_BUDGET_S", 1800.0, minimum=0.0),
         warm_cache_concurrency=_integer(env, "REG_WARM_CACHE_CONCURRENCY", 4, minimum=1),

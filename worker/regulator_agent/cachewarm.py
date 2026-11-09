@@ -14,13 +14,20 @@ object storage". Nothing has to be listed in S3 and ``dbinspect`` is not
 needed: the cache manager already knows every bucket on its indexer, including
 the ones that exist only remotely.
 
-**Warm.** Optionally, read those buckets once before the measured run so it
-starts from local disk. Warming goes through ordinary searches, never the
-cache manager's undocumented ``_localize`` action, which community reports say
-stops the indexer evicting normally until it is restarted: a benchmark tool
-must not leave a cluster's cache unable to evict.
+**Warm.** Optionally, read buckets once before the measured run so it starts
+from local disk. What gets warmed is a **plan the operator confirmed**: a list
+of indexes, each with an earliest and latest time. The forecast *suggests* one
+(:func:`suggest_plan`), the operator checks and edits it, and only the edited
+plan is ever warmed (:func:`parse_plan`, :func:`plan_searches`). A reading of a
+search string is a best effort, and warming the wrong range is real load on
+somebody's cluster, so the tool proposes and the person decides.
 
-Three warm-up shapes, because which bucket files a search downloads depends on
+Warming goes through ordinary searches, never the cache manager's undocumented
+``_localize`` action, which community reports say stops the indexer evicting
+normally until it is restarted: a benchmark tool must not leave a cluster's
+cache unable to evict.
+
+Two warm-up shapes, because which bucket files a search downloads depends on
 the search:
 
 ``tsidx`` (default)
@@ -31,10 +38,10 @@ the search:
 ``full``
     Reads ``_raw`` for every event in range, which downloads the journal too.
     Warms everything, at the cost of reading all of the data once.
-``replay``
-    Runs each of the scenario's own searches once over its whole run range.
-    Downloads what those search shapes download, but with one parameter draw,
-    so a search that filters on a drawn value warms only what that value hits.
+
+There is deliberately no mode that replays the scenario's own searches: their
+inline ``earliest``/``latest`` can read outside the ranges the operator
+confirmed, which is exactly what the plan exists to prevent.
 
 The cache manager fetches a bucket's files as a search needs them (Splunk's
 documentation: tstats and metadata searches do not need the journal), so a
@@ -49,22 +56,26 @@ from __future__ import annotations
 
 import asyncio
 import dataclasses
+import datetime as _dt
 import fnmatch
 import logging
+import math
+import re
 import time
 from dataclasses import dataclass, field
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
-from .params import DrawContext, ParameterResolver
+from .params import DrawContext
 from .scenario import Scenario, Step, TimePolicy
 from .smartstore import CACHEMAN_SEARCH_MAX_ROWS, Bucket, CacheState
 from .splscope import Clause, all_indexes, clause_span, read_scope
+from .splscope import evaluate as splscope_evaluate
 from .splunk import SplunkClient
 from .timepolicy import TimeWindow, resolve_window
 
 log = logging.getLogger("regulator.cachewarm")
 
-WARM_MODES = ("tsidx", "full", "replay")
+WARM_MODES = ("tsidx", "full")
 
 Interval = Tuple[float, float]
 
@@ -312,6 +323,11 @@ def forecast(
     if not wanted:
         result.reason = "no step names an index and the scenario declares no corpus index"
         return result
+    return _intersect(result, wanted, state)
+
+
+def _intersect(result: Forecast, wanted: Dict[str, List[Interval]], state: CacheState) -> Forecast:
+    """Fill ``result`` with the buckets the wanted index ranges touch."""
     patterns = {name: merge(spans) for name, spans in wanted.items()}
 
     # One entry per bucket id: a replicated bucket is listed once per indexer
@@ -560,6 +576,7 @@ def needs_warming(fc: Forecast, bid: str, mode: str) -> bool:
 @dataclass
 class WarmResult:
     mode: str
+    plan: List[Dict[str, Any]] = field(default_factory=list)
     searches: int = 0
     failed: int = 0
     skipped_local: int = 0
@@ -596,55 +613,160 @@ def _chunk_needs_warming(index: str, chunk: Interval, fc: Forecast, mode: str) -
     return False
 
 
-def warm_searches(
-    scenario: Scenario,
-    fc: Forecast,
-    mode: str,
-    chunk_s: float,
-    resolver: Optional[ParameterResolver] = None,
+@dataclass(frozen=True)
+class WarmTarget:
+    """One line of a warm-up plan: an index (or wildcard) and a time range."""
+
+    index: str
+    earliest: float
+    latest: float
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "index": self.index,
+            "earliest": int(self.earliest),
+            "latest": int(self.latest),
+            "earliest_iso": _iso(self.earliest),
+            "latest_iso": _iso(self.latest),
+        }
+
+
+class PlanError(ValueError):
+    """A warm-up plan that cannot be warmed as written."""
+
+
+_PLAN_INDEX = re.compile(r"^[A-Za-z0-9_\-\*\.]{1,256}$")
+MAX_PLAN_LINES = 100
+
+
+def _iso(epoch: float) -> str:
+    return _dt.datetime.fromtimestamp(epoch, tz=_dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def parse_time(value: Any, now: float) -> float:
+    """An epoch, an ISO 8601 time, a ``%m/%d/%Y:%H:%M:%S`` date, or a Splunk
+    relative modifier such as ``-7d@d``, as an epoch. Times without a zone are
+    UTC."""
+    if isinstance(value, bool):
+        raise PlanError(f"not a time: {value!r}")
+    if isinstance(value, (int, float)):
+        return float(value)
+    text = str(value or "").strip()
+    if not text:
+        raise PlanError("a time is empty")
+    try:
+        parsed = _dt.datetime.fromisoformat(text.replace("Z", "+00:00"))
+    except ValueError:
+        parsed = None
+    if parsed is not None:
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=_dt.timezone.utc)
+        return parsed.timestamp()
+    epoch = splscope_evaluate(text, now)
+    if epoch is None:
+        raise PlanError(f"cannot read the time {text!r}")
+    return epoch
+
+
+def parse_plan(raw: Any, now: Optional[float] = None) -> List[WarmTarget]:
+    """Read a plan the operator wrote or edited. Raises :class:`PlanError`.
+
+    Accepts a list of ``{"index", "earliest", "latest"}`` objects, or an object
+    carrying one under ``plan`` or ``suggested_plan`` (so the forecast's own
+    JSON can be edited and handed straight back).
+    """
+    now = time.time() if now is None else now
+    if isinstance(raw, dict):
+        raw = raw.get("plan", raw.get("suggested_plan"))
+    if not isinstance(raw, list) or not raw:
+        raise PlanError("a warm-up plan is a non-empty list of {index, earliest, latest}")
+    if len(raw) > MAX_PLAN_LINES:
+        raise PlanError(f"a warm-up plan has at most {MAX_PLAN_LINES} lines, this one has {len(raw)}")
+    plan: List[WarmTarget] = []
+    for n, line in enumerate(raw, 1):
+        if not isinstance(line, dict):
+            raise PlanError(f"line {n}: expected an object with index, earliest and latest")
+        index = str(line.get("index") or "").strip()
+        if not _PLAN_INDEX.match(index):
+            raise PlanError(f"line {n}: {index!r} is not an index name")
+        if index.strip("*") == "":
+            raise PlanError(f"line {n}: a bare wildcard would warm every index; name them")
+        try:
+            earliest = parse_time(line.get("earliest"), now)
+            latest = parse_time(line.get("latest", "now"), now)
+        except PlanError as exc:
+            raise PlanError(f"line {n}: {exc}") from None
+        if latest <= earliest:
+            raise PlanError(f"line {n}: latest ({_iso(latest)}) is not after earliest ({_iso(earliest)})")
+        # Whole seconds, outward: a search window is sent to splunkd in whole
+        # seconds, so the forecast of the plan must use exactly those bounds or
+        # it disagrees with the searches about a bucket ending in that second.
+        plan.append(WarmTarget(index=index, earliest=float(math.floor(earliest)), latest=float(math.ceil(latest))))
+    return plan
+
+
+def suggest_plan(fc: Forecast, mode: str = "tsidx") -> List[WarmTarget]:
+    """What the forecast thinks is worth warming: a suggestion, never a decision.
+
+    One line per index and merged range the run reads, keeping only the ranges
+    that hold something a warm-up in ``mode`` would still fetch.
+    """
+    plan: List[WarmTarget] = []
+    for index, entry in sorted(fc.per_index.items()):
+        for lo, hi in entry.spans:
+            if _chunk_needs_warming(index, (lo, hi), fc, mode):
+                plan.append(WarmTarget(index=index, earliest=float(int(lo)), latest=float(int(hi) + 1)))
+    return plan
+
+
+def plan_forecast(plan: Sequence[WarmTarget], state: CacheState) -> Forecast:
+    """The forecast for exactly the plan: which buckets it covers, how local."""
+    result = Forecast(start=min((t.earliest for t in plan), default=0.0))
+    if not state.available:
+        result.reason = state.reason or "the SmartStore cache could not be read"
+        return result
+    if not state.buckets:
+        result.reason = "the cache manager listed no buckets"
+        return result
+    wanted: Dict[str, List[Interval]] = {}
+    for target in plan:
+        wanted.setdefault(target.index.lower(), []).append((target.earliest, target.latest))
+    return _intersect(result, wanted, state)
+
+
+async def plan_on_disk(client: SplunkClient, plan: Sequence[WarmTarget], state: CacheState) -> Forecast:
+    fc = plan_forecast(plan, state)
+    if fc.available and fc.touched:
+        fc.residency = await read_residency(client, fc)
+        if not fc.residency.available:
+            fc.notes.append(f"bucket residency not read: {fc.residency.reason}")
+    return fc
+
+
+def plan_searches(
+    plan: Sequence[WarmTarget], fc: Forecast, mode: str, chunk_s: float
 ) -> Tuple[List[Tuple[str, TimeWindow]], int]:
-    """The searches a warm-up will run, and how many chunks were already local."""
+    """The searches that warm exactly the plan, and how many chunks were skipped.
+
+    Every search stays inside a confirmed line: its index is the line's index
+    and its window a chunk of the line's range. A chunk whose buckets are
+    already as local as ``mode`` would make them is skipped, when the forecast
+    could tell; when it could not, the chunk is searched.
+    """
     if mode not in WARM_MODES:
         raise ValueError(f"warm-up mode must be one of {', '.join(WARM_MODES)}, got {mode!r}")
     planned: List[Tuple[str, TimeWindow]] = []
     skipped = 0
-    if mode == "replay":
-        seen = set()
-        for step in scenario.steps:
-            if step.type != "search" or not step.spl or step.dispatch == "saved":
-                continue
-            spl = step.spl
-            if resolver is not None:
-                spl, _ = resolver.render(spl, DrawContext(scenario.seed, 0, 0, step.id))
-            patterns = {p for span in fc.steps if span.step_id == step.id for p in span.indexes}
-            mine = [
-                index for index in fc.per_index
-                if any(fnmatch.fnmatchcase(index.lower(), p) for p in patterns)
-            ]
-            # Chunked over the dispatch window: a clause with its own inline
-            # bounds reads those whatever window it is dispatched with.
-            window = fc.windows.get(step.id)
-            if window is None:
-                continue
-            for lo, hi in _chunks([window], chunk_s):
-                if not any(_chunk_needs_warming(i, (lo, hi), fc, mode) for i in mine):
-                    skipped += 1
-                    continue
-                key = (spl, lo, hi)
-                if key in seen:
-                    continue
-                seen.add(key)
-                planned.append((spl, TimeWindow(earliest=lo, latest=hi)))
-        return planned, skipped
-
-    for index, entry in sorted(fc.per_index.items()):
-        quoted = '"' + index.replace('"', '\\"') + '"'
+    for target in plan:
+        quoted = '"' + target.index.replace('"', '\\"') + '"'
         if mode == "tsidx":
             spl = f"| tstats count where index={quoted} by _time span=1h"
         else:
             spl = f"search index={quoted} | eval regulator_warm=len(_raw) | stats sum(regulator_warm)"
-        for chunk in _chunks(entry.spans, chunk_s):
-            if not _chunk_needs_warming(index, chunk, fc, mode):
+        pattern = target.index.lower()
+        mine = [i for i in fc.per_index if fnmatch.fnmatchcase(i.lower(), pattern)]
+        for chunk in _chunks([(target.earliest, target.latest)], chunk_s):
+            if fc.available and mine and not any(_chunk_needs_warming(i, chunk, fc, mode) for i in mine):
                 skipped += 1
                 continue
             planned.append((spl, TimeWindow(earliest=chunk[0], latest=chunk[1])))

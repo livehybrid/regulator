@@ -369,6 +369,52 @@ const ROUTES = {
     },
     '/targets/1/samples': SAMPLES,
     '/targets/1/cache': CACHE,
+    '/targets/1/warm/suggest': {
+        scenario: 'web-dashboards',
+        duration_s: 600,
+        mode: 'tsidx',
+        plan: [
+            {
+                index: 'cultivar_web',
+                earliest: 1757000000,
+                latest: 1757086400,
+                earliest_iso: '2025-09-04T15:33:20Z',
+                latest_iso: '2025-09-05T15:33:20Z',
+            },
+        ],
+        forecast: {
+            available: true,
+            buckets: 12,
+            local: 3,
+            local_pct: 25,
+            bytes_total: 9000000000,
+            bytes_remote: 6750000000,
+            capacity_pct: 12,
+            notes: ['step one: a macro hides what it expands to; its indexes and time bounds are not seen'],
+            residency: {
+                available: true,
+                counts: { full: 1, index_only: 2, partial: 0, stub: 9 },
+                bytes_outstanding: 7000000000,
+            },
+        },
+    },
+    // GET of the status and the POST that starts one both answer with the
+    // job; this one has already finished, so the dialog renders the result.
+    '/targets/1/warm': {
+        state: 'done',
+        mode: 'tsidx',
+        plan: [{ index: 'cultivar_web' }],
+        result: {
+            searches: 1,
+            seconds: 4.2,
+            failed: 0,
+            not_started: 0,
+            skipped_local: 0,
+            errors: [],
+            before: { available: true, buckets: 12, local: 3, local_pct: 25, bytes_total: 9000000000 },
+            after: { available: true, buckets: 12, local: 12, local_pct: 100, bytes_total: 9000000000 },
+        },
+    },
 };
 
 function lookup(url) {
@@ -681,6 +727,48 @@ const go = async (hash) => {
 
     await go('#target/1');
     await check('target detail', 'SmartStore cache');
+
+    // Warm-up: the suggestion fills an editable plan, and nothing is posted to
+    // /warm until the operator confirms it.
+    clickByText('Warm cache', 'open the warm dialog');
+    await check('warm dialog', 'You decide what gets warmed');
+    await waitFor('warm dialog: scenarios loaded', () =>
+        Array.from(window.document.querySelectorAll('button')).some(
+            (b) => (b.textContent || '').trim() === 'Suggest a plan' && !b.disabled
+        )
+    );
+    clickByText('Suggest a plan', 'ask for a suggestion');
+    await waitFor('warm dialog: the suggestion fills the plan', () =>
+        Array.from(window.document.querySelectorAll('input')).some((i) => i.value === 'cultivar_web')
+    );
+    await check('warm dialog: residency shown', 'index files only');
+    await check('warm dialog: what it could not see', 'a macro hides');
+    const warmPosts = () => posted.filter((x) => x.url.endsWith('/targets/1/warm'));
+    clickByText('Warm', 'warm before confirming');
+    await settle(300);
+    if (warmPosts().length) {
+        problems.push('warm dialog: posted a warm-up before the plan was confirmed');
+    } else {
+        process.stdout.write('  ok  warm dialog: nothing warmed unconfirmed\n');
+    }
+    // Splunk's Checkbox is a wrapper carrying data-test-value, around a toggle button.
+    const box = window.document.querySelector('[data-test="checkbox"][data-test-value="confirmed"]');
+    const confirm = box && (box.querySelector('[data-test="toggle"]') || box.querySelector('button'));
+    if (!confirm) {
+        problems.push('warm dialog: no confirmation checkbox');
+    } else {
+        confirm.dispatchEvent(new window.MouseEvent('click', { bubbles: true, cancelable: true }));
+        await settle(100);
+        clickByText('Warm', 'warm the confirmed plan');
+        await waitFor('warm dialog: posts the confirmed plan', () =>
+            warmPosts().some(
+                (x) => x.body && x.body.confirmed === true && x.body.plan[0].index === 'cultivar_web'
+            )
+        );
+        await check('warm dialog: result', 'Plan, after');
+    }
+    clickByText('Close', 'close the warm dialog');
+    await settle(100);
 
     await go('#baselines');
     await check('baselines', 'main-green');
