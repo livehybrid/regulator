@@ -17,7 +17,7 @@ from sqlalchemy import select, func
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
-from regulator_agent import cachewarm
+from regulator_agent import bucketmap, cachewarm
 from regulator_agent import savedsearches as ss
 from regulator_agent.ceilings import search_ceilings
 from regulator_agent.engines.api import ApiEngine
@@ -452,6 +452,92 @@ async def evict_target_cache(
     for run_id in in_flight:
         manager.mark_cache_epoch(run_id, eviction)
     return outcome
+
+
+# --------------------------------------------------------------- bucket map
+
+# dbinspect examines every bucket of every index it is given, so the on-disk
+# detail is only read for a handful of named indexes at a time.
+MAX_DETAIL_INDEXES = 10
+
+
+@router.get("/{target_id}/buckets")
+async def target_bucket_map(
+    target_id: int,
+    indexes: Optional[str] = Query(default=None, description="comma-separated; default the largest"),
+    earliest: Optional[str] = Query(default=None, description="epoch, ISO 8601 or a modifier such as -30d"),
+    latest: Optional[str] = Query(default=None),
+    bins: int = Query(default=120, ge=bucketmap.MIN_BINS, le=bucketmap.MAX_BINS),
+    detail: bool = Query(default=False, description="also read dbinspect for full or partial"),
+    scenario: Optional[str] = Query(default=None, description="overlay the ranges its searches read"),
+    duration_s: Optional[float] = Query(default=None, gt=0, le=7 * 86400),
+    session: Session = Depends(get_session),
+) -> Dict[str, Any]:
+    """Buckets by index and time, by how much of each is on local disk.
+
+    Read on demand only. Listing every bucket is load on the cluster under
+    test, and the on-disk detail more so, which is why ``detail`` needs named
+    indexes.
+    """
+    import time as _time
+
+    target = _get_target(session, target_id)
+    names = [n.strip() for n in (indexes or "").split(",") if n.strip()]
+    if detail and not names:
+        raise HTTPException(status_code=422, detail="name the indexes to read on-disk detail for")
+    if detail and len(names) > MAX_DETAIL_INDEXES:
+        raise HTTPException(
+            status_code=422,
+            detail=f"on-disk detail reads dbinspect per index; name at most {MAX_DETAIL_INDEXES}",
+        )
+    now = _time.time()
+    try:
+        lo = cachewarm.parse_time(earliest, now) if earliest else None
+        hi = cachewarm.parse_time(latest, now) if latest else None
+    except cachewarm.PlanError as exc:
+        raise HTTPException(status_code=422, detail=str(exc))
+    if lo is not None and hi is not None and hi <= lo:
+        raise HTTPException(status_code=422, detail="latest is not after earliest")
+    chosen = None
+    if scenario:
+        try:
+            chosen = load_named_scenario(scenario)
+        except (FileNotFoundError, ValueError) as exc:
+            raise HTTPException(status_code=404, detail=str(exc))
+    extra = _cache_kwargs(target)
+
+    async def read(client: SplunkClient) -> Dict[str, Any]:
+        state = await cache_state(client, **extra)
+        residency = None
+        if detail and state.available:
+            copies = bucketmap.group_by_id(state.buckets, names)
+            firsts = {bid: held[0] for bid, held in copies.items()}
+            dated = [b for b in firsts.values() if b.earliest is not None and b.latest is not None]
+            span = (
+                lo if lo is not None else min((b.earliest for b in dated), default=0.0),
+                hi if hi is not None else max((b.latest for b in dated), default=now),
+            )
+            residency = await cachewarm.inspect_buckets(
+                client, firsts, {name: [span] for name in sorted({b.index for b in firsts.values()})}
+            )
+        document = bucketmap.build(
+            state, indexes=names or None, earliest=lo, latest=hi, bins=bins, residency=residency, now=now
+        )
+        if chosen is not None and document["available"]:
+            duration = float(duration_s or _scenario_duration(chosen))
+            fc = cachewarm.forecast(chosen, state, now, duration)
+            document["overlay"] = {
+                "scenario": chosen.name,
+                "duration_s": duration,
+                "spans": bucketmap.overlay(
+                    fc.steps, [row["index"] for row in document["indexes"]],
+                    document["earliest"], document["latest"],
+                ),
+                "notes": [n for n in fc.notes if n.startswith("step ")],
+            }
+        return document
+
+    return await _with_client(target, read, ACTION_TIMEOUT_S * 2)
 
 
 # --------------------------------------------------------------- warm-up

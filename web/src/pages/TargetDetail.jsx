@@ -13,6 +13,7 @@ import P from '@splunk/react-ui/Paragraph';
 import Table from '@splunk/react-ui/Table';
 import WaitSpinner from '@splunk/react-ui/WaitSpinner';
 
+import BucketMap from '../components/BucketMap';
 import CacheModal from '../modals/CacheModal';
 import LineChart from '../components/LineChart';
 import PurgeModal from '../modals/PurgeModal';
@@ -106,6 +107,8 @@ export default function TargetDetail({ targetId, navigate }) {
             </PageHead>
 
             {chart}
+
+            <BucketMap targetId={targetId} />
 
             {samples.length > 0 && (
                 <Panel flush>

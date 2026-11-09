@@ -154,3 +154,60 @@ def test_one_warm_up_at_a_time(client, cold):  # noqa: F811
 def test_status_is_idle_before_any_warm_up(client, cold):  # noqa: F811
     target = make_target(client, cold)
     assert client.get(f"/api/targets/{target['id']}/warm").json() == {"state": "idle"}
+
+
+# ------------------------------------------------------------------ bucket map
+
+
+def test_the_bucket_map_lays_buckets_out_by_index_and_time(client, cold):  # noqa: F811
+    target = make_target(client, cold)
+    body = client.get(f"/api/targets/{target['id']}/buckets", params={"bins": 20}).json()
+    assert body["available"] is True and body["detail"] == "cache"
+    assert body["states"] == ["remote"]
+    assert sorted(row["index"] for row in body["indexes"]) == ["main", "stoker_metrics"]
+    main = next(row for row in body["indexes"] if row["index"] == "main")
+    assert main["buckets"] == 20 and main["cells"]
+    # Reading the map warms nothing.
+    assert cold.stats.buckets_localised == 0
+
+
+def test_the_bucket_map_reads_on_disk_detail_for_named_indexes(client, cold):  # noqa: F811
+    target = make_target(client, cold)
+    base = f"/api/targets/{target['id']}"
+    # A tstats warm-up of two hours leaves index files only; the map must say so.
+    client.post(f"{base}/warm", json={
+        "plan": [{"index": "main", "earliest": "-2h", "latest": "now"}], "confirmed": True,
+    })
+    plain = client.get(f"{base}/buckets", params={"indexes": "main"}).json()
+    assert plain["states"] == ["remote", "local"]
+    detailed = client.get(f"{base}/buckets", params={"indexes": "main", "detail": "true"}).json()
+    assert detailed["detail"] == "disk"
+    assert detailed["states"] == ["remote", "index_only"]
+    by_state = detailed["indexes"][0]["by_state"]
+    assert by_state["index_only"]["buckets"] == plain["indexes"][0]["by_state"]["local"]["buckets"]
+
+
+def test_on_disk_detail_needs_named_indexes(client, cold):  # noqa: F811
+    target = make_target(client, cold)
+    response = client.get(f"/api/targets/{target['id']}/buckets", params={"detail": "true"})
+    assert response.status_code == 422
+    assert cold.stats.oneshots == 0
+
+
+def test_the_bucket_map_overlays_what_a_scenario_reads(client, cold, scenario):  # noqa: F811
+    target = make_target(client, cold)
+    body = client.get(
+        f"/api/targets/{target['id']}/buckets", params={"scenario": scenario, "earliest": "-12h"}
+    ).json()
+    spans = body["overlay"]["spans"]
+    assert [s["index"] for s in spans] == ["main"]
+    # The subsearch's earliest=-3h, not just the 1h dispatch window.
+    assert spans[0]["latest"] - spans[0]["earliest"] >= 3 * 3600
+    assert body["overlay"]["scenario"] == "warmable"
+
+
+def test_a_bad_range_is_refused(client, cold):  # noqa: F811
+    target = make_target(client, cold)
+    base = f"/api/targets/{target['id']}/buckets"
+    assert client.get(base, params={"earliest": "-1h", "latest": "-2h"}).status_code == 422
+    assert client.get(base, params={"earliest": "whenever"}).status_code == 422
