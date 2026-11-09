@@ -809,6 +809,10 @@ def merge_summaries(run_label: str, scenario: str, summaries: Sequence[Dict[str,
         "errors_by_class": errors_by_class,
         "epochs": epochs_out,
         "partial": total("partial"),
+        "unknown_sid": {
+            key: int(sum(int((st.get("unknown_sid") or {}).get(key) or 0) for st in stats_list))
+            for key in ("searches", "responses")
+        },
         "abandoned": total("abandoned"),
         "unfinished": {
             "count": total("abandoned"),

@@ -103,6 +103,11 @@ class FakeSplunkConfig:
     scan_count_base: int = 100000
     fail_rate: float = 0.0
     log_requests: bool = False
+    # For this long after a dispatch, every request about the new job answers
+    # 404 "Unknown sid." as a search head cluster member does when a load
+    # balancer sends it a poll for a job another member dispatched before it
+    # has heard of it. 0 means jobs are visible at once.
+    unknown_sid_ms: float = 0.0
     # SmartStore simulation. 0 buckets means the cache manager reports nothing,
     # which is how a non-SmartStore instance behaves and is the default.
     smartstore_buckets: int = 0
@@ -178,6 +183,7 @@ class _Stats:
     saved_dispatches: int = 0
     buckets_evicted: int = 0
     buckets_localised: int = 0
+    unknown_sid_answers: int = 0
     requests_by_path: Dict[str, int] = field(default_factory=dict)
     searches: List[str] = field(default_factory=list)
 
@@ -980,6 +986,10 @@ class FakeSplunk:
             job = self._jobs.get(sid)
         if job is None or job.internal:
             return 404, _UNKNOWN_SID_BODY
+        if (now - job.created_at) * 1000.0 < self.config.unknown_sid_ms:
+            with self._lock:
+                self.stats.unknown_sid_answers += 1
+            return 404, _UNKNOWN_SID_BODY
 
         if tail == "" and method == "GET":
             return 200, self._job_entry(job, time.monotonic())
@@ -1323,6 +1333,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--seed", type=int, default=None, help="seed for the jitter and failure RNG")
     parser.add_argument("--scan-count-base", type=int, default=100000, help="scanCount for a raw search")
     parser.add_argument("--fail-rate", type=float, default=0.0, help="fraction of jobs that end FAILED")
+    parser.add_argument("--unknown-sid-ms", type=float, default=0.0, help="404 a new sid for this long, like a cluster member that has not heard of it yet")
     parser.add_argument("--verbose", action="store_true", help="log every request")
     return parser
 
@@ -1344,6 +1355,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         scan_count_base=args.scan_count_base,
         fail_rate=args.fail_rate,
         log_requests=args.verbose,
+        unknown_sid_ms=args.unknown_sid_ms,
     )
     splunkd = FakeSplunk(config)
     print(f"fake splunkd listening on {splunkd.base_url}", flush=True)

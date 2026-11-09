@@ -948,6 +948,7 @@ set it high or leave it out.
 |---|---|---|
 | `REG_POLL_INITIAL_MS` / `REG_POLL_MAX_MS` | `250` / `1000` | Adaptive job polling. Polling hard is itself load on the target: a thousand users at 100 ms is ten thousand REST calls a second |
 | `REG_DELETE_JOBS` | `1` | Clean up artefacts on the search head. Leaving thousands behind is itself a load characteristic |
+| `REG_UNKNOWN_SID_GRACE_MS` | `10000` | How long after dispatch a 404 for that sid means "this member has not heard of the job yet" rather than "the job is gone". A search head cluster behind a load balancer without stickiness sends each poll to whichever member is next, and a member asked about a job another member dispatched moments ago answers 404 until it learns of it. Inside the grace the request is asked again (status, results and delete) and counted on the record as `unknown_sid_count`; after it the 404 fails the step. `0` fails on the first 404 |
 | `REG_CACHE_BUST` | `1` | The nonce comment. Only turn it off to demonstrate what the cache is worth |
 | `REG_HTTP2`, `REG_CONNECT_TIMEOUT_S`, `REG_READ_TIMEOUT_S` | `0`, `10`, `300` | Every dispatched job also carries `auto_cancel` a minute past the read timeout, so a search this worker gives up on is cancelled by splunkd rather than run to completion for nobody |
 
@@ -1221,7 +1222,9 @@ Per step execution, both halves:
 (raw), `late_by_ms`, `dispatch_ms` (POST to sid, which dominates short searches
 on a wide cluster), `ttfr_ms` (time to first result, which is what a user
 perceives), `queued_ms` (detects crossing the concurrency ceiling),
-`results_fetch_ms`, `result_bytes`, `poll_count`.
+`results_fetch_ms`, `result_bytes`, `poll_count`, `unknown_sid_count` (404s for
+the job's own sid absorbed inside `REG_UNKNOWN_SID_GRACE_MS`; the run summary
+totals them under `unknown_sid`).
 
 **Server side, from the job's own REST record.** `run_duration_s`, `scan_count`,
 `event_count`, `result_count`, `dispatch_state`, `is_finalized`, and the derived
