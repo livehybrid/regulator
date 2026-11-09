@@ -211,3 +211,114 @@ def test_a_bad_range_is_refused(client, cold):  # noqa: F811
     base = f"/api/targets/{target['id']}/buckets"
     assert client.get(base, params={"earliest": "-1h", "latest": "-2h"}).status_code == 422
     assert client.get(base, params={"earliest": "whenever"}).status_code == 422
+
+
+# ------------------------------------------------------------------ at launch
+
+
+from test_api import wait_for_terminal  # noqa: E402
+
+
+def _launch(client, target, scenario, **extra):  # noqa: F811
+    body = {"target_id": target["id"], "scenario": scenario, "virtual_users": 1, "duration_s": 2}
+    body.update(extra)
+    return client.post("/api/runs", json=body)
+
+
+def test_a_run_launched_with_a_confirmed_plan_starts_warm_and_records_it(client, cold, scenario):  # noqa: F811
+    target = make_target(client, cold)
+    created = _launch(
+        client, target, scenario,
+        warm_plan=[{"index": "main", "earliest": "-3h", "latest": "now"}],
+        warm_mode="full", warm_confirmed=True,
+    )
+    assert created.status_code == 201, created.text
+    run = created.json()
+    assert run["warm"]["plan"] == [{"index": "main", "earliest": "-3h", "latest": "now"}]
+    assert run["warm"]["mode"] == "full"
+
+    finished = wait_for_terminal(client, run["id"])
+    assert finished["state"] == "completed", finished.get("error")
+    cache = finished["summary"]["cache"]
+    warm = cache["warm"]
+    assert warm["before"]["local"] == 0
+    assert warm["after"]["local"] == warm["after"]["buckets"] > 0
+    assert warm["failed"] == 0
+    # The forecast is taken after the warm-up, so the run is forecast warm.
+    assert cache["forecast"]["available"] is True
+    assert cache["forecast"]["local_pct"] == 100.0
+    assert cache["forecast"]["residency"]["counts"]["full"] == cache["forecast"]["buckets"]
+
+    started = next(row for row in audit_rows(client) if row["action"] == "run_started")
+    assert "cache warm-up of a confirmed plan" in started["detail"] and "main -3h..now" in started["detail"]
+    samples = client.get(f"/api/targets/{target['id']}/samples").json()["samples"]
+    assert [s["kind"] for s in samples if s["run_id"] == run["id"]][:2] == ["warm", "before"]
+
+
+def test_every_run_carries_a_forecast_even_without_a_warm_up(client, cold, scenario):  # noqa: F811
+    target = make_target(client, cold)
+    run_id = _launch(client, target, scenario).json()["id"]
+    cache = wait_for_terminal(client, run_id)["summary"]["cache"]
+    assert cache["forecast"]["available"] is True
+    assert cache["forecast"]["local"] == 0
+    assert "warm" not in cache
+
+
+@pytest.mark.parametrize(
+    "extra, message",
+    [
+        ({"warm_plan": [{"index": "main", "earliest": "-3h"}]}, "confirm the warm-up plan"),
+        ({"warm_plan": [{"index": "main", "earliest": "-3h"}], "warm_confirmed": True,
+          "evict_cache": True, "evict_cache_indexes": ["main"]}, "not both"),
+        ({"warm_plan": [{"index": "*", "earliest": "-3h"}], "warm_confirmed": True}, "bare wildcard"),
+        ({"warm_plan": [{"index": "main", "earliest": "-1h", "latest": "-2h"}], "warm_confirmed": True}, "not after"),
+    ],
+)
+def test_a_launch_with_a_bad_or_unconfirmed_plan_is_refused(client, cold, scenario, extra, message):  # noqa: F811
+    target = make_target(client, cold)
+    response = _launch(client, target, scenario, **extra)
+    assert response.status_code == 422
+    assert message in response.text
+    assert cold.stats.oneshots == 0 and cold.stats.jobs_created == 0
+
+
+def test_a_warm_up_that_fails_is_recorded_and_does_not_raise():
+    import asyncio
+
+    from regulator_server import warmup
+
+    class Broken:
+        async def oneshot(self, *args, **kwargs):
+            raise RuntimeError("search head unavailable")
+
+        async def entries(self, *args, **kwargs):
+            raise RuntimeError("search head unavailable")
+
+    spec = {"plan": [{"index": "main", "earliest": "-1h", "latest": "now"}], "mode": "tsidx"}
+    outcome = asyncio.run(warmup.warm_before_run(Broken(), spec, where={}, target_id=1))
+    result = outcome["result"]
+    assert outcome["cache_after"] is None or isinstance(outcome["cache_after"], dict)
+    assert result["plan"][0]["index"] == "main"
+    assert result.get("error") or result.get("failed")
+
+
+def test_a_stop_before_the_warm_up_starts_no_searches():
+    import asyncio
+
+    from regulator_agent import cachewarm
+    from regulator_agent.timepolicy import TimeWindow
+    from regulator_server.warmup import StopFlag
+
+    class Owner:
+        stop_requested = True
+
+    class Client:
+        calls = 0
+
+        async def oneshot(self, *args, **kwargs):
+            Client.calls += 1
+            return [], 0
+
+    planned = [("| makeresults", TimeWindow(0.0, 1.0))] * 3
+    result = asyncio.run(cachewarm.warm(Client(), planned, mode="tsidx", abort=StopFlag(Owner())))
+    assert Client.calls == 0 and result.not_started == 3

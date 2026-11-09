@@ -663,17 +663,12 @@ async def warm_target_cache(
     who = {"actor": actor_of(request), "client": request.client.host if request.client else None}
 
     async def do_warm(client: SplunkClient) -> Dict[str, Any]:
-        before = await cachewarm.plan_on_disk(client, plan, await cache_state(client, **extra))
-        planned, skipped = cachewarm.plan_searches(plan, before, body.mode, body.chunk_s)
-        result = await cachewarm.warm(
-            client, planned, mode=body.mode, concurrency=body.concurrency,
-            budget_s=body.budget_s, skipped_local=skipped,
+        from ..warmup import run_plan
+
+        return await run_plan(
+            client, plan, mode=body.mode, where=extra, concurrency=body.concurrency,
+            budget_s=body.budget_s, chunk_s=body.chunk_s,
         )
-        result.plan = lines
-        state_after = await cache_state(client, **extra)
-        after = await cachewarm.plan_on_disk(client, plan, state_after)
-        result.before, result.after = before.to_dict(), after.to_dict()
-        return {"result": result.to_dict(), "cache_after": state_after.to_dict()}
 
     async def run_in_background() -> None:
         from ..db import session_scope

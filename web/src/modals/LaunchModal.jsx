@@ -22,6 +22,7 @@ import WaitSpinner from '@splunk/react-ui/WaitSpinner';
 
 import BusyButton from '../components/BusyButton';
 import Dialog from '../components/Dialog';
+import WarmPlanEditor, { emptyPlan, planIsValid, planLines } from '../components/WarmPlanEditor';
 import { Grid2, Mono, Muted, Note, SectionHeading } from '../components/primitives';
 import { api, isAuthError } from '../api';
 import { useNotify } from '../Notifications';
@@ -55,7 +56,22 @@ export default function LaunchModal({ scenario, initial, onClose, onLaunched }) 
     const [evictIndexes, setEvictIndexes] = useState(fromIndexes);
     const [evictAll, setEvictAll] = useState((from.evict_cache_indexes || '').split(',').includes('*'));
     const [cacheIndexes, setCacheIndexes] = useState(null);
+    // A warm-up carried over from an earlier run arrives with its lines but
+    // never its confirmation: relative times have moved, so it is checked again.
+    const fromWarm = from.warm && Array.isArray(from.warm.plan) ? from.warm : null;
+    const [warm, setWarm] = useState(Boolean(fromWarm));
+    const [warmPlan, setWarmPlan] = useState(() =>
+        fromWarm
+            ? { ...emptyPlan(), mode: fromWarm.mode || 'tsidx', rows: fromWarm.plan.map((l) => ({ ...l })) }
+            : emptyPlan()
+    );
     const notify = useNotify();
+
+    // The plan was suggested for one target and one scenario. Changing either
+    // withdraws the confirmation, since it is no longer what was checked.
+    useEffect(() => {
+        setWarmPlan((p) => (p.confirmed ? { ...p, confirmed: false } : p));
+    }, [form.target_id, form.scenario]);
 
     useEffect(() => {
         let live = true;
@@ -178,6 +194,18 @@ export default function LaunchModal({ scenario, initial, onClose, onLaunched }) 
             if (evictAll) {
                 body.evict_all_indexes = true;
             }
+        }
+        if (warm) {
+            if (!planIsValid(warmPlan) || !warmPlan.confirmed) {
+                notify(
+                    'Warm-up is on: check the plan and tick the confirmation, or turn the warm-up off',
+                    'warning'
+                );
+                return;
+            }
+            body.warm_plan = planLines(warmPlan);
+            body.warm_mode = warmPlan.mode;
+            body.warm_confirmed = true;
         }
         const run = await api('/runs', { method: 'POST', body });
         onLaunched(run.id);
@@ -311,9 +339,44 @@ export default function LaunchModal({ scenario, initial, onClose, onLaunched }) 
                     </Note>
 
                     <SectionHeading>SmartStore cache</SectionHeading>
-                    <Checkbox checked={evict} onChange={() => setEvict((v) => !v)}>
+                    <Checkbox
+                        checked={evict}
+                        onChange={() => {
+                            setEvict((v) => !v);
+                            setWarm(false);
+                        }}
+                    >
                         Evict the SmartStore cache first (measures the cold path)
                     </Checkbox>
+                    <Checkbox
+                        checked={warm}
+                        onChange={() => {
+                            setWarm((v) => !v);
+                            setEvict(false);
+                        }}
+                        value="warm"
+                    >
+                        Warm the SmartStore cache first, from a plan you confirm (measures the
+                        warm path)
+                    </Checkbox>
+
+                    {warm && (
+                        <>
+                            <Note>
+                                Regulator suggests the indexes and time ranges this scenario reads;
+                                you check and edit them, and only the lines as you leave them are
+                                warmed, once, before any worker starts. The suggestion is a reading
+                                of the search strings, and warming is load on the target.
+                            </Note>
+                            <WarmPlanEditor
+                                targetId={form.target_id}
+                                scenario={form.scenario}
+                                durationS={form.duration_s}
+                                value={warmPlan}
+                                onChange={setWarmPlan}
+                            />
+                        </>
+                    )}
 
                     {evict && (
                         <>
@@ -400,6 +463,7 @@ LaunchModal.propTypes = {
         evict_cache_indexes: PropTypes.string,
         evict_every_s: PropTypes.number,
         cold_window_s: PropTypes.number,
+        warm: PropTypes.shape({ plan: PropTypes.array, mode: PropTypes.string }),
     }),
     onClose: PropTypes.func.isRequired,
     onLaunched: PropTypes.func.isRequired,

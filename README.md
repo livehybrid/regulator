@@ -828,6 +828,21 @@ The warm-up runs in the background; the audit trail records the confirmed plan,
 who started it, where the suggestion came from, and what it did, and the
 target's cache chart marks it.
 
+**At launch.** The Launch dialog offers the same thing for one run: tick *Warm
+the SmartStore cache first*, **Suggest a plan** for the chosen scenario and
+duration, edit and confirm it, and launch. The control plane warms the plan once,
+before the reading the run's provenance starts from and before any worker is
+started, so a fleet of N workers never fetches the same buckets N times. The run
+stores the plan as you wrote it (relative times are resolved when the run starts)
+and records the result under `cache.warm`. A warm-up that fails or runs out of
+budget is flagged on the run and the run goes ahead: the forecast says what state
+it really started in. Warm and evict-before-run are mutually exclusive. *Run
+again* carries the plan forward but asks for it to be confirmed again. Over the
+API: `warm_plan`, `warm_mode` and `warm_confirmed` on `POST /api/runs`.
+
+Every run launched from the console now carries the forecast too
+(`cache.forecast`), warm-up or not, and the run page states it.
+
 From the command line, the same in two steps:
 
 ```bash

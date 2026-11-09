@@ -30,7 +30,7 @@ import Table from '@splunk/react-ui/Table';
 import { useSplunkTheme, variables } from '@splunk/themes';
 
 import BusyButton from './BusyButton';
-import { Grid2, Mono, Muted, Note, Panel } from './primitives';
+import { Actions, Grid2, Mono, Muted, Note, Panel } from './primitives';
 import { api } from '../api';
 import { fmtBytes, fmtInt, fmtPct } from '../format';
 
@@ -137,14 +137,6 @@ const Axis = styled.div`
 
 // One vertical rhythm for the panel: spacingMedium between its parts
 // (controls, action, map, table), spacingSmall inside a part.
-const Actions = styled.div`
-    display: flex;
-    flex-wrap: wrap;
-    align-items: center;
-    gap: ${variables.spacingSmall};
-    margin: ${variables.spacingMedium} 0;
-`;
-
 const Caption = styled.div`
     margin-top: ${variables.spacingSmall};
 `;

@@ -11,8 +11,6 @@
  */
 import React, { useEffect, useRef, useState } from 'react';
 import PropTypes from 'prop-types';
-import Button from '@splunk/react-ui/Button';
-import Checkbox from '@splunk/react-ui/Checkbox';
 import ControlGroup from '@splunk/react-ui/ControlGroup';
 import DL from '@splunk/react-ui/DefinitionList';
 import Message from '@splunk/react-ui/Message';
@@ -20,71 +18,30 @@ import Message from '@splunk/react-ui/Message';
 import NumberInput from '@splunk/react-ui/Number';
 import P from '@splunk/react-ui/Paragraph';
 import Select from '@splunk/react-ui/Select';
-import Table from '@splunk/react-ui/Table';
-import Text from '@splunk/react-ui/Text';
 import WaitSpinner from '@splunk/react-ui/WaitSpinner';
 
 import BusyButton from '../components/BusyButton';
 import Dialog from '../components/Dialog';
-import { Grid2, Mono, Muted, Note, SectionHeading } from '../components/primitives';
+import WarmPlanEditor, {
+    ForecastSummary,
+    emptyPlan,
+    planIsValid,
+    planLines,
+} from '../components/WarmPlanEditor';
+import { Grid2, Note, SectionHeading } from '../components/primitives';
 import { api, isAuthError } from '../api';
-import { fmtBytes, fmtInt, fmtPct } from '../format';
+import { fmtInt } from '../format';
 import { useNotify } from '../Notifications';
 
 const POLL_MS = 2000;
-const emptyRow = () => ({ index: '', earliest: '-24h', latest: 'now' });
-
-function ForecastSummary({ forecast, label }) {
-    if (!forecast) {
-        return null;
-    }
-    if (!forecast.available) {
-        return <Note>{label}: the cache could not be read ({forecast.reason}).</Note>;
-    }
-    const residency = forecast.residency && forecast.residency.available ? forecast.residency : null;
-    const counts = (residency && residency.counts) || {};
-    return (
-        <DL termWidth="200px">
-            <DL.Term>{label}</DL.Term>
-            <DL.Description>
-                {fmtInt(forecast.buckets)} buckets, {fmtBytes(forecast.bytes_total)};{' '}
-                {fmtInt(forecast.local)} local ({fmtPct(forecast.local_pct, 0)})
-            </DL.Description>
-            {residency && (
-                <>
-                    <DL.Term>On disk (dbinspect)</DL.Term>
-                    <DL.Description>
-                        {fmtInt(counts.full)} full, {fmtInt(counts.index_only)} index files only,{' '}
-                        {fmtInt(counts.partial)} partial, {fmtInt(counts.stub)} evicted;{' '}
-                        {fmtBytes(residency.bytes_outstanding)} not yet local
-                    </DL.Description>
-                </>
-            )}
-            {forecast.capacity_pct !== null && forecast.capacity_pct !== undefined && (
-                <>
-                    <DL.Term>Share of the cache</DL.Term>
-                    <DL.Description>{fmtPct(forecast.capacity_pct, 0)}</DL.Description>
-                </>
-            )}
-        </DL>
-    );
-}
-
-ForecastSummary.propTypes = {
-    forecast: PropTypes.object,
-    label: PropTypes.string.isRequired,
-};
 
 export default function WarmModal({ targetId, onClose, onDone }) {
     const [scenarios, setScenarios] = useState([]);
     const [scenario, setScenario] = useState('');
     const [duration, setDuration] = useState('');
-    const [mode, setMode] = useState('tsidx');
     const [concurrency, setConcurrency] = useState(4);
     const [budgetMin, setBudgetMin] = useState(30);
-    const [rows, setRows] = useState([]);
-    const [suggestion, setSuggestion] = useState(null);
-    const [confirmed, setConfirmed] = useState(false);
+    const [plan, setPlan] = useState(emptyPlan);
     const [job, setJob] = useState(null);
     const [loading, setLoading] = useState(true);
     const notify = useNotify();
@@ -92,6 +49,7 @@ export default function WarmModal({ targetId, onClose, onDone }) {
     const base = `/targets/${encodeURIComponent(targetId)}`;
 
     useEffect(() => {
+        live.current = true;
         (async () => {
             try {
                 const [list, status] = await Promise.all([
@@ -145,51 +103,18 @@ export default function WarmModal({ targetId, onClose, onDone }) {
         return () => clearTimeout(timer);
     }, [job, base, notify, onDone]);
 
-    // Any edit to the plan withdraws the confirmation: what was checked is
-    // what gets warmed, not something edited afterwards.
-    const edit = (next) => {
-        setRows(next);
-        setConfirmed(false);
-    };
-    const setCell = (i, key) => (e, { value }) =>
-        edit(rows.map((row, n) => (n === i ? { ...row, [key]: value } : row)));
-
-    const suggest = async () => {
-        const body = { scenario, mode };
-        if (duration !== '' && duration !== null) {
-            body.duration_s = Number(duration);
-        }
-        const r = await api(`${base}/warm/suggest`, { method: 'POST', body });
-        setSuggestion(r);
-        edit(
-            (r.plan || []).map((line) => ({
-                index: line.index,
-                earliest: line.earliest_iso,
-                latest: line.latest_iso,
-            }))
-        );
-        if (!(r.plan || []).length) {
-            notify('Nothing to suggest: what this scenario reads is already local, or not SmartStore', 'info');
-        }
-    };
-
-    const valid = rows.length > 0 && rows.every((r) => r.index.trim() && String(r.earliest).trim());
-    const running = job && job.state === 'running';
+    const running = Boolean(job && job.state === 'running');
 
     const warm = async () => {
         const r = await api(`${base}/warm`, {
             method: 'POST',
             body: {
-                plan: rows.map((r2) => ({
-                    index: r2.index.trim(),
-                    earliest: String(r2.earliest).trim(),
-                    latest: String(r2.latest).trim() || 'now',
-                })),
-                mode,
+                plan: planLines(plan),
+                mode: plan.mode,
                 concurrency: Number(concurrency) || 4,
                 budget_s: (Number(budgetMin) || 30) * 60,
                 confirmed: true,
-                scenario: suggestion ? suggestion.scenario : undefined,
+                scenario: plan.suggestion ? plan.suggestion.scenario : undefined,
             },
         });
         setJob(r);
@@ -207,7 +132,7 @@ export default function WarmModal({ targetId, onClose, onDone }) {
                 <BusyButton
                     appearance="primary"
                     label="Warm"
-                    disabled={!valid || !confirmed || running}
+                    disabled={!planIsValid(plan) || !plan.confirmed || running}
                     onClick={warm}
                 />
             }
@@ -242,74 +167,18 @@ export default function WarmModal({ targetId, onClose, onDone }) {
                     >
                         <NumberInput value={duration} min={1} onChange={(e, { value }) => setDuration(value)} />
                     </ControlGroup>
-                    <ControlGroup
-                        label="Mode"
-                        labelPosition="top"
-                        help="tsidx warms index files (cheap, enough for tstats); full also reads raw events."
-                    >
-                        <Select value={mode} onChange={(e, { value }) => { setMode(value); setConfirmed(false); }}>
-                            <Select.Option value="tsidx" label="tsidx: index files only" />
-                            <Select.Option value="full" label="full: index files and raw data" />
-                        </Select>
-                    </ControlGroup>
-                    <ControlGroup label="&nbsp;" labelPosition="top">
-                        <BusyButton label="Suggest a plan" disabled={!scenario || running} onClick={suggest} />
-                    </ControlGroup>
                 </Grid2>
-            )}
-            {suggestion && <ForecastSummary forecast={suggestion.forecast} label="What the run reads" />}
-            {suggestion && ((suggestion.forecast || {}).notes || []).length > 0 && (
-                <Note>
-                    <strong>What the suggestion could not be sure of:</strong>
-                    <ul>
-                        {suggestion.forecast.notes.map((n) => (
-                            <li key={n}>{n}</li>
-                        ))}
-                    </ul>
-                </Note>
             )}
 
             <SectionHeading>Plan</SectionHeading>
-            <Muted $small>
-                Times take ISO 8601 (UTC unless a zone is given), an epoch, or a Splunk modifier
-                such as <Mono>-7d@d</Mono>. Modifiers are resolved when the warm-up starts.
-            </Muted>
-            <Table>
-                <Table.Head>
-                    <Table.HeadCell>Index</Table.HeadCell>
-                    <Table.HeadCell>Earliest</Table.HeadCell>
-                    <Table.HeadCell>Latest</Table.HeadCell>
-                    <Table.HeadCell />
-                </Table.Head>
-                <Table.Body>
-                    {rows.map((row, i) => (
-                        // Rows have no identity beyond their position while
-                        // being edited, and are never reordered.
-                        // eslint-disable-next-line react/no-array-index-key
-                        <Table.Row key={i}>
-                            <Table.Cell>
-                                <Text value={row.index} placeholder="main" onChange={setCell(i, 'index')} />
-                            </Table.Cell>
-                            <Table.Cell>
-                                <Text value={row.earliest} onChange={setCell(i, 'earliest')} />
-                            </Table.Cell>
-                            <Table.Cell>
-                                <Text value={row.latest} onChange={setCell(i, 'latest')} />
-                            </Table.Cell>
-                            <Table.Cell>
-                                <Button
-                                    appearance="subtle"
-                                    label="Remove"
-                                    onClick={() => edit(rows.filter((_, n) => n !== i))}
-                                />
-                            </Table.Cell>
-                        </Table.Row>
-                    ))}
-                </Table.Body>
-            </Table>
-            <P>
-                <Button label="Add a line" onClick={() => edit([...rows, emptyRow()])} />
-            </P>
+            <WarmPlanEditor
+                targetId={targetId}
+                scenario={scenario}
+                durationS={duration}
+                value={plan}
+                onChange={setPlan}
+                disabled={running}
+            />
 
             <Grid2>
                 <ControlGroup label="Searches at once" labelPosition="top">
@@ -323,10 +192,6 @@ export default function WarmModal({ targetId, onClose, onDone }) {
                     <NumberInput value={budgetMin} min={1} max={240} onChange={(e, { value }) => setBudgetMin(value)} />
                 </ControlGroup>
             </Grid2>
-
-            <Checkbox checked={confirmed} disabled={!valid} onChange={() => setConfirmed((v) => !v)} value="confirmed">
-                I have checked these indexes and time ranges, and want them warmed
-            </Checkbox>
 
             {job && (
                 <>

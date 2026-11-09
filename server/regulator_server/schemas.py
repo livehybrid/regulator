@@ -470,6 +470,13 @@ class RunCreate(BaseModel):
     # one run measures the cold path repeatedly; executions within
     # cold_window_s of an eviction are its cold part (default: half of N).
     evict_every_s: Optional[float] = Field(default=None, ge=10, le=86400, allow_inf_nan=False)
+    # Warm the cache before the run, from a plan the operator has checked.
+    # Never derived and warmed unseen, hence warm_confirmed.
+    warm_plan: Optional[List[WarmLine]] = Field(default=None, max_length=100)
+    warm_mode: str = Field(default="tsidx", pattern="^(tsidx|full)$")
+    warm_confirmed: bool = False
+    warm_concurrency: Optional[int] = Field(default=None, ge=1, le=16)
+    warm_budget_s: Optional[float] = Field(default=None, ge=10, le=4 * 3600, allow_inf_nan=False)
     cold_window_s: Optional[float] = Field(default=None, gt=0, le=86400, allow_inf_nan=False)
     # Where the load is generated: inprocess (this control plane), swarm or
     # k8s (worker containers). Blank means the configured default.
@@ -530,6 +537,16 @@ class RunCreate(BaseModel):
                 raise ValueError("cold_window_s cannot be longer than evict_every_s")
         elif self.cold_window_s:
             raise ValueError("cold_window_s only makes sense with evict_every_s")
+        if self.warm_plan:
+            if not self.warm_confirmed:
+                raise ValueError(
+                    "confirm the warm-up plan first: check that these are the indexes and "
+                    "time ranges you want warmed before this run"
+                )
+            if self.evict_cache:
+                raise ValueError(
+                    "a run starts warm (warm_plan) or cold (evict_cache), not both"
+                )
 
 
 class RunOut(BaseModel):

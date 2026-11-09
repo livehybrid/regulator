@@ -369,6 +369,32 @@ def test_a_stop_from_the_interface_reaches_the_workers_as_a_command(client, splu
     assert beat["command"] == "stop"
 
 
+def test_a_fleet_run_is_warmed_by_the_control_plane_before_any_worker_starts(client, splunkd, fake_driver):
+    """Workers never warm: N of them would each fetch the same buckets."""
+    seen_at_launch = {}
+    original = fake_driver.create
+
+    def create(group):
+        seen_at_launch["oneshots"] = splunkd.stats.oneshots
+        return original(group)
+
+    fake_driver.create = create
+    run_id = _launch(
+        client, splunkd, fake_driver, virtual_users=1,
+        warm_plan=[{"index": "main", "earliest": "-2h", "latest": "now"}], warm_confirmed=True,
+    )
+    deadline = time.time() + 15
+    while time.time() < deadline and not fake_driver.created_groups():
+        time.sleep(0.1)
+    assert fake_driver.created_groups(), "the fleet never launched"
+    # The plan's search had already run when the first worker group was created.
+    assert seen_at_launch["oneshots"] >= 1
+    # And the bootstrap a worker receives carries no warm-up of its own.
+    lease = client.post(f"/api/agent/runs/{run_id}/claim", json={"holder": "w-a"}, headers=_bearer(run_id)).json()
+    assert not any(key.startswith("REG_WARM_CACHE") and lease["env"][key] not in ("0", "") for key in lease["env"])
+    assert client.post(f"/api/runs/{run_id}/stop").status_code == 200
+
+
 def test_the_fleet_list_says_what_is_available(client):
     fleets = {f["kind"]: f for f in client.get("/api/fleets").json()}
     assert fleets["inprocess"]["available"] is True

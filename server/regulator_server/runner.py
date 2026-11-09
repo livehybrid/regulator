@@ -425,10 +425,35 @@ class RunManager:
                     )
                 eviction = await evict_all(engine.client, indexes=indexes, **where)
 
+            # A warm-up the operator confirmed at launch, before the reading
+            # the run's provenance starts from.
+            warmed = None
+            with session_scope() as session:
+                row = session.get(Run, run_id)
+                warm_spec = row.warm_json if row is not None else None
+                warm_target_id = row.target_id if row is not None else None
+            if warm_spec and warm_spec.get("plan") and not entry.stop_requested:
+                from . import warmup
+
+                self._lifecycle(run_id, "cache_warm_started", mode=warm_spec.get("mode"), plan=warmup.describe(warm_spec["plan"]))
+                warmed = await warmup.warm_before_run(
+                    engine.client, warm_spec, where=where, target_id=warm_target_id,
+                    abort=warmup.StopFlag(entry),
+                )
+                self._lifecycle(run_id, "cache_warmed", **warmup.summarise(warmed["result"]))
+                if warmed.get("cache_after"):
+                    self._cache_sample(run_id, "warm", warmed["cache_after"], {"warm": warmup.summarise(warmed["result"])})
+
             before = await cache_state(engine.client, **where)
             if eviction is not None:
                 self._lifecycle(run_id, "cache_evicted", **{k: v for k, v in eviction.to_dict().items() if k != "errors"})
             self._cache_sample(run_id, "before", before.to_dict())
+            from . import warmup as _warmup
+
+            cache_forecast = await _warmup.forecast_for_run(
+                engine.client, scenario, before,
+                float(config.duration_s or scenario.load.duration_s or 0.0),
+            )
             self._lifecycle(run_id, "cache_before", **_cache_facts(before.to_dict()))
 
             scheduler = Scheduler(
@@ -480,6 +505,11 @@ class RunManager:
             summary.scenario_digest = scenario_digest(scenario)
 
             summary.cache = await self._cache_provenance(engine.client, before, eviction, where)
+            if isinstance(summary.cache, dict):
+                if cache_forecast is not None:
+                    summary.cache["forecast"] = cache_forecast
+                if warmed is not None:
+                    summary.cache["warm"] = warmed["result"]
             if isinstance(summary.cache, dict) and summary.cache.get("after"):
                 self._cache_sample(run_id, "after", summary.cache["after"], {"delta": summary.cache.get("delta")})
                 self._lifecycle(run_id, "cache_after", **_cache_facts(summary.cache["after"]), delta=summary.cache.get("delta"))

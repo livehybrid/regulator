@@ -1033,6 +1033,7 @@ class FleetRun(threading.Thread):
             where = indexer_settings(target)
             evict_indexes = (run.evict_cache_indexes or "").split(",") if run.evict_cache_indexes else []
             evict = bool(run.evict_cache)
+            warm_spec = run.warm_json
             run_evict_every = float(run.evict_every_s or 0)
             corpus_index = None
             duration = float(run.duration_s or 0)
@@ -1041,6 +1042,7 @@ class FleetRun(threading.Thread):
             directory, _ = scenario_path(self._scenario_name())
             scenario = load_scenario(directory)
             corpus_index = scenario.corpus.index
+            scenario_loaded = scenario
             if not duration:
                 duration = float(scenario.load.duration_s or 0)
         except Exception:  # noqa: BLE001 - the plan already loaded it once
@@ -1049,6 +1051,9 @@ class FleetRun(threading.Thread):
         client = SplunkClient(cfg)
         await client.start()
         eviction = None
+        warmed = None
+        cache_forecast = None
+        scenario_loaded = None
         before = None
         # A ramp-only scenario has no declared duration; the deadlines then
         # cover the longest run this control plane allows rather than
@@ -1058,7 +1063,24 @@ class FleetRun(threading.Thread):
             if evict:
                 indexes = None if "*" in evict_indexes else (evict_indexes or ([corpus_index] if corpus_index else None))
                 eviction = await evict_all(client, indexes=indexes, **where)
+            # The control plane warms once, before any worker is launched.
+            # Workers never warm: N workers would each fetch the same buckets.
+            if warm_spec and warm_spec.get("plan"):
+                from . import warmup
+
+                with session_scope() as session:
+                    run = session.get(Run, self.run_id)
+                telemetry.lifecycle("cache_warm_started", run, self._target_name, mode=warm_spec.get("mode"), plan=warmup.describe(warm_spec["plan"]))
+                warmed = await warmup.warm_before_run(client, warm_spec, where=where, target_id=target_id, abort=warmup.StopFlag(self))
+                telemetry.lifecycle("cache_warmed", run, self._target_name, **warmup.summarise(warmed["result"]))
+                if warmed.get("cache_after"):
+                    with session_scope() as session:
+                        store_cache_sample(session, target_id, self.run_id, "warm", warmed["cache_after"], {"warm": warmup.summarise(warmed["result"])})
             before = await cache_state(client, **where)
+            if scenario_loaded is not None:
+                from . import warmup as _warmup
+
+                cache_forecast = await _warmup.forecast_for_run(client, scenario_loaded, before, duration)
             with session_scope() as session:
                 run = session.get(Run, self.run_id)
                 store_cache_sample(session, target_id, self.run_id, "before", before.to_dict())
@@ -1147,6 +1169,10 @@ class FleetRun(threading.Thread):
                 merged["cache"] = {"before": before.to_dict(), "after": after.to_dict(), "delta": cache_delta(before, after).to_dict()}
                 if eviction is not None:
                     merged["cache"]["eviction"] = eviction.to_dict()
+                if cache_forecast is not None:
+                    merged["cache"]["forecast"] = cache_forecast
+                if warmed is not None:
+                    merged["cache"]["warm"] = warmed["result"]
                 with session_scope() as session:
                     store_cache_sample(session, target_id, self.run_id, "after", after.to_dict(), {"delta": merged["cache"]["delta"]})
                 telemetry.lifecycle("cache_after", run, self._target_name, **_cache_facts(after.to_dict()), delta=merged["cache"]["delta"])

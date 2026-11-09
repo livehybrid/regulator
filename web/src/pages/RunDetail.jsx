@@ -300,6 +300,20 @@ export default function RunDetail({ runId, navigate, onLaunch }) {
             </Message>
         );
     }
+    const warmed = cache.warm;
+    if (warmed && (warmed.error || warmed.failed > 0 || warmed.not_started > 0)) {
+        banners.push(
+            <Message appearance="fill" type="warning" key="warm-failed">
+                <Message.Title>The warm-up before this run did not finish</Message.Title>
+                {warmed.error
+                    ? warmed.error
+                    : `${fmtInt(warmed.failed)} warm-up search(es) failed and ${fmtInt(
+                          warmed.not_started
+                      )} were not started within the budget.`}{' '}
+                The run went ahead; the forecast below says what state it really started in.
+            </Message>
+        );
+    }
     if (summary.abort_reason) {
         banners.push(
             <Message appearance="fill" type="error" key="abort">
@@ -323,6 +337,36 @@ export default function RunDetail({ runId, navigate, onLaunch }) {
             <Note key="warm">
                 Cache provenance: warm. Nothing was downloaded during the run, so these numbers
                 describe the search tier.
+            </Note>
+        );
+    }
+    if (warmed && !warmed.error) {
+        quiet.push(
+            <Note key="warmed">
+                Warmed first ({warmed.mode}) from a confirmed plan of{' '}
+                {fmtInt((warmed.plan || []).length)} line(s): {fmtInt(warmed.searches)} search(es)
+                in {fmtNum(warmed.seconds, 0)} s, taking the plan&apos;s buckets from{' '}
+                {fmtPct((warmed.before || {}).local_pct, 0)} to{' '}
+                {fmtPct((warmed.after || {}).local_pct, 0)} local.
+            </Note>
+        );
+    }
+    const { forecast } = cache;
+    if (forecast && forecast.available) {
+        const residency = forecast.residency && forecast.residency.available ? forecast.residency : null;
+        const counts = (residency && residency.counts) || {};
+        quiet.push(
+            <Note key="forecast">
+                Forecast at the start: this run reads {fmtInt(forecast.buckets)} bucket(s),{' '}
+                {fmtBytes(forecast.bytes_total)}; {fmtPct(forecast.local_pct, 0)} local,{' '}
+                {fmtBytes(forecast.bytes_remote)} to download.
+                {residency
+                    ? ` On disk: ${fmtInt(counts.full)} full, ${fmtInt(
+                          counts.index_only
+                      )} index files only, ${fmtInt(counts.partial)} partial, ${fmtInt(
+                          counts.stub
+                      )} evicted.`
+                    : ''}
             </Note>
         );
     }

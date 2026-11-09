@@ -63,6 +63,19 @@ export const Grid2 = styled.div`
     gap: 0 ${variables.spacingLarge};
 `;
 
+/**
+ * A row of buttons, with any note beside them. One vertical rhythm for
+ * every form: spacingMedium above and below, spacingSmall between items,
+ * so a button never sits flush against the control above it.
+ */
+export const Actions = styled.div`
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: ${variables.spacingSmall};
+    margin: ${variables.spacingMedium} 0;
+`;
+
 export const PageHead = styled.div`
     display: flex;
     align-items: flex-start;

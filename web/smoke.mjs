@@ -895,6 +895,37 @@ const go = async (hash) => {
     await settle(400);
     await check('launch dialog', 'Pacing decides what the latency numbers mean');
 
+    // A warm-up at launch uses the same plan editor as the Warm cache dialog,
+    // and the same rule: no run is posted with an unconfirmed plan.
+    {
+        const tick = (value) => {
+            const holder = window.document.querySelector(`[data-test="checkbox"][data-test-value="${value}"]`);
+            const toggle = holder && (holder.querySelector('[data-test="toggle"]') || holder.querySelector('button'));
+            if (!toggle) {
+                problems.push(`launch dialog: no ${value} checkbox`);
+                return;
+            }
+            toggle.dispatchEvent(new window.MouseEvent('click', { bubbles: true, cancelable: true }));
+        };
+        const runPosts = () => posted.filter((x) => x.url.endsWith('/runs'));
+        const before = runPosts().length;
+        tick('warm');
+        await check('launch dialog: warm-up explained', 'only the lines as you leave them');
+        clickByText('Suggest a plan', 'suggest a plan at launch');
+        await waitFor('launch dialog: the suggestion fills the plan', () =>
+            Array.from(window.document.querySelectorAll('input')).some((i) => i.value === 'cultivar_web')
+        );
+        clickByText('Launch', 'launch with an unconfirmed plan');
+        await settle(300);
+        if (runPosts().length !== before) {
+            problems.push('launch dialog: posted a run with an unconfirmed warm-up plan');
+        } else {
+            process.stdout.write('  ok  launch dialog: no run with an unconfirmed plan\n');
+        }
+        tick('confirmed');
+        await settle(100);
+    }
+
     // Type a user count and press Launch. Converting a typed number is what
     // crashed (React error #321): the number input was imported as `Number`,
     // shadowing the global, so Number(v) called the component as a function.
@@ -916,6 +947,16 @@ const go = async (hash) => {
             clickByText('Launch', 'press Launch');
             await waitFor('launch dialog: posts the typed user count', () =>
                 posted.some((p) => p.url.endsWith('/runs') && p.body && p.body.virtual_users === 25)
+            );
+            await waitFor('launch dialog: posts the confirmed warm-up plan', () =>
+                posted.some(
+                    (p) =>
+                        p.url.endsWith('/runs') &&
+                        p.body &&
+                        p.body.warm_confirmed === true &&
+                        p.body.warm_plan &&
+                        p.body.warm_plan[0].index === 'cultivar_web'
+                )
             );
         }
     }
