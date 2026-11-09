@@ -24,7 +24,6 @@ import PropTypes from 'prop-types';
 import styled from 'styled-components';
 import ControlGroup from '@splunk/react-ui/ControlGroup';
 import Multiselect from '@splunk/react-ui/Multiselect';
-import P from '@splunk/react-ui/Paragraph';
 import Select from '@splunk/react-ui/Select';
 import Switch from '@splunk/react-ui/Switch';
 import Table from '@splunk/react-ui/Table';
@@ -136,11 +135,29 @@ const Axis = styled.div`
     margin-top: 2px;
 `;
 
+// One vertical rhythm for the panel: spacingMedium between its parts
+// (controls, action, map, table), spacingSmall inside a part.
+const Actions = styled.div`
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: ${variables.spacingSmall};
+    margin: ${variables.spacingMedium} 0;
+`;
+
+const Caption = styled.div`
+    margin-top: ${variables.spacingSmall};
+`;
+
+const TableWrap = styled.div`
+    margin-top: ${variables.spacingMedium};
+`;
+
 const Legend = styled.div`
     display: flex;
     flex-wrap: wrap;
     gap: ${variables.spacingSmall} ${variables.spacingLarge};
-    margin: ${variables.spacingSmall} 0 ${variables.spacingMedium};
+    margin: 0 0 ${variables.spacingSmall};
     font-size: ${variables.fontSizeSmall};
     color: ${variables.contentColorDefault};
 `;
@@ -307,10 +324,10 @@ export default function BucketMap({ targetId }) {
                     </Switch>
                 </ControlGroup>
             </Grid2>
-            <P>
-                <BusyButton appearance="primary" label={map ? 'Reload bucket map' : 'Load bucket map'} onClick={load} />{' '}
+            <Actions>
+                <BusyButton appearance="primary" label={map ? 'Reload bucket map' : 'Load bucket map'} onClick={load} />
                 <Muted $small>Read on demand: listing every bucket is load on the target.</Muted>
-            </P>
+            </Actions>
 
             {map && !map.available && <Note>The bucket map could not be read: {map.reason}</Note>}
 
@@ -385,7 +402,9 @@ export default function BucketMap({ targetId }) {
                             ))}
                         </Axis>
                     </Rows>
-                    <Muted $small>Times are UTC. A bucket spanning several slices is drawn in each.</Muted>
+                    <Caption>
+                        <Muted $small>Times are UTC. A bucket spanning several slices is drawn in each.</Muted>
+                    </Caption>
 
                     {tip && (
                         <Tip style={{ left: tip.x, top: tip.y }}>
@@ -416,38 +435,40 @@ export default function BucketMap({ targetId }) {
 
                     {/* The same numbers as a table: nothing on the map is
                         reachable only by hovering. */}
-                    <Table horizontalOverflow="scroll" style={{ marginTop: 12 }}>
-                        <Table.Head>
-                            <Table.HeadCell>Index</Table.HeadCell>
-                            <Table.HeadCell align="right">Buckets</Table.HeadCell>
-                            <Table.HeadCell align="right">Size</Table.HeadCell>
-                            <Table.HeadCell align="right">Local</Table.HeadCell>
-                            {map.states.map((s) => (
-                                <Table.HeadCell key={s} align="right">
-                                    {s === 'local' && map.detail === 'disk' ? 'Local (detail not read)' : LABELS[s]}
-                                </Table.HeadCell>
-                            ))}
-                        </Table.Head>
-                        <Table.Body>
-                            {map.indexes.map((row) => (
-                                <Table.Row key={row.index}>
-                                    <Table.Cell>
-                                        <Mono>{row.index}</Mono>
-                                    </Table.Cell>
-                                    <Table.Cell align="right">{fmtInt(row.buckets)}</Table.Cell>
-                                    <Table.Cell align="right">{fmtBytes(row.bytes)}</Table.Cell>
-                                    <Table.Cell align="right">{fmtPct(row.local_pct, 0)}</Table.Cell>
-                                    {map.states.map((s) => (
-                                        <Table.Cell key={s} align="right">
-                                            {row.by_state[s]
-                                                ? `${fmtInt(row.by_state[s].buckets)} (${fmtBytes(row.by_state[s].bytes)})`
-                                                : fmtInt(0)}
+                    <TableWrap>
+                        <Table horizontalOverflow="scroll">
+                            <Table.Head>
+                                <Table.HeadCell>Index</Table.HeadCell>
+                                <Table.HeadCell align="right">Buckets</Table.HeadCell>
+                                <Table.HeadCell align="right">Size</Table.HeadCell>
+                                <Table.HeadCell align="right">Local</Table.HeadCell>
+                                {map.states.map((s) => (
+                                    <Table.HeadCell key={s} align="right">
+                                        {s === 'local' && map.detail === 'disk' ? 'Local (detail not read)' : LABELS[s]}
+                                    </Table.HeadCell>
+                                ))}
+                            </Table.Head>
+                            <Table.Body>
+                                {map.indexes.map((row) => (
+                                    <Table.Row key={row.index}>
+                                        <Table.Cell>
+                                            <Mono>{row.index}</Mono>
                                         </Table.Cell>
-                                    ))}
-                                </Table.Row>
-                            ))}
-                        </Table.Body>
-                    </Table>
+                                        <Table.Cell align="right">{fmtInt(row.buckets)}</Table.Cell>
+                                        <Table.Cell align="right">{fmtBytes(row.bytes)}</Table.Cell>
+                                        <Table.Cell align="right">{fmtPct(row.local_pct, 0)}</Table.Cell>
+                                        {map.states.map((s) => (
+                                            <Table.Cell key={s} align="right">
+                                                {row.by_state[s]
+                                                    ? `${fmtInt(row.by_state[s].buckets)} (${fmtBytes(row.by_state[s].bytes)})`
+                                                    : fmtInt(0)}
+                                            </Table.Cell>
+                                        ))}
+                                    </Table.Row>
+                                ))}
+                            </Table.Body>
+                        </Table>
+                    </TableWrap>
                 </>
             )}
         </Panel>

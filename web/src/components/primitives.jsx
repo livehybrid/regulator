@@ -76,6 +76,13 @@ const PanelCard = styled(Card)`
     width: 100%;
 `;
 
+// Card.Header's own padding is 24px a side against the body's spacingMedium,
+// which set every panel's title 12px in from the content beneath it. One
+// inset for both, so the title and the content share a left edge.
+const PanelHeader = styled(Card.Header)`
+    padding: ${variables.spacingMedium} ${variables.spacingMedium} 0;
+`;
+
 const PanelBody = styled(Card.Body)`
     padding: ${(props) => (props.$flush ? '0' : variables.spacingMedium)};
     overflow-x: auto;
@@ -90,7 +97,7 @@ export function Panel({ title, children, flush, actions }) {
     return (
         <PanelCard>
             {(title || actions) && (
-                <Card.Header title={title}>{actions}</Card.Header>
+                <PanelHeader title={title}>{actions}</PanelHeader>
             )}
             <PanelBody $flush={flush}>{children}</PanelBody>
         </PanelCard>
