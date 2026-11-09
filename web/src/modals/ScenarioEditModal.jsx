@@ -24,7 +24,7 @@ import { variables } from '@splunk/themes';
 
 import BusyButton from '../components/BusyButton';
 import Dialog from '../components/Dialog';
-import { Grid2, Muted, Note, Toolbar } from '../components/primitives';
+import { Actions, Grid2, Muted, Note, Toolbar } from '../components/primitives';
 import { api } from '../api';
 import { useNotify } from '../Notifications';
 
@@ -234,7 +234,7 @@ export default function ScenarioEditModal({ scenario, onClose, onSaved }) {
 
             {tab === 'searches' && (
                 <div>
-                    <Toolbar>
+                    <Actions>
                         <Text
                             value={filter}
                             placeholder="Filter by name or SPL"
@@ -253,7 +253,7 @@ export default function ScenarioEditModal({ scenario, onClose, onSaved }) {
                             Comments in savedsearches.conf are not kept when saving from here. Keys
                             this form does not show (alert actions, dispatch settings) are.
                         </Muted>
-                    </Toolbar>
+                    </Actions>
                     {!shown.length && <Muted>No searches match.</Muted>}
                     {shown.map((row) => (
                         <SearchEditor

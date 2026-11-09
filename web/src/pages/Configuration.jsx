@@ -17,7 +17,7 @@ import P from '@splunk/react-ui/Paragraph';
 import Switch from '@splunk/react-ui/Switch';
 
 import useLoader from '../useLoader';
-import { Mono, Muted, Note, PageHead, Panel, RelTime, Toolbar } from '../components/primitives';
+import { Actions, Mono, Muted, Note, PageHead, Panel, RelTime, Toolbar } from '../components/primitives';
 import { api, apiDownloadUrl } from '../api';
 import { useNotify } from '../Notifications';
 
@@ -146,13 +146,13 @@ export default function Configuration() {
                         Include my scenarios
                     </Switch>
                 </Toolbar>
-                <Toolbar>
+                <Actions>
                     <Button
                         appearance="primary"
                         label="Download config"
                         to={apiDownloadUrl(`/config/export?${query}`)}
                     />
-                </Toolbar>
+                </Actions>
                 <Note>
                     {secrets ? (
                         <>
@@ -189,13 +189,13 @@ export default function Configuration() {
                     style={{ display: 'none' }}
                     onChange={onFile}
                 />
-                <Toolbar>
+                <Actions>
                     <Button
                         label={busy ? 'Applying…' : 'Choose a config file…'}
                         disabled={busy}
                         onClick={() => fileInput.current && fileInput.current.click()}
                     />
-                </Toolbar>
+                </Actions>
                 {report && (
                     <div>
                         <P>
@@ -356,7 +356,7 @@ function SharedCopy({ copy, syncing, onSync }) {
                     deleted from it.
                 </Note>
             )}
-            <Toolbar>
+            <Actions>
                 <Button
                     label={syncing === 'pull' ? 'Pulling…' : 'Pull now'}
                     disabled={syncing !== null}
@@ -369,7 +369,7 @@ function SharedCopy({ copy, syncing, onSync }) {
                         onClick={() => onSync('push')}
                     />
                 )}
-            </Toolbar>
+            </Actions>
         </div>
     );
 }
