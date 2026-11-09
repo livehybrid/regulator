@@ -34,7 +34,7 @@ import itertools
 import logging
 import secrets
 import time
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Awaitable, Callable, Dict, List, Optional, Set, Tuple, TypeVar
 
 from ..config import Config
 from ..params import DrawContext, ParameterResolver, sid_prefix_for
@@ -62,6 +62,8 @@ from ..timepolicy import TimeWindow
 from .base import StepContext, TargetCapabilities
 
 log = logging.getLogger("regulator.engine.api")
+
+_T = TypeVar("_T")
 
 ADVICE = "advice: "
 
@@ -156,6 +158,90 @@ class ApiEngine:
         # None until splunkd has accepted one custom id. A target that refuses
         # them gets random ids for the rest of the run instead of failing.
         self._custom_sid: Optional[bool] = None
+        # perf_counter at dispatch, per live sid, so every later request about
+        # that job knows how long ago it was dispatched. That age is what
+        # decides whether a 404 means "not yet" or "gone": see
+        # Config.unknown_sid_grace_ms.
+        self._dispatched_at: Dict[str, float] = {}
+        # Deletes that met a member which had not heard of the job yet, retried
+        # in the background so the virtual user is not held up by housekeeping
+        # and the artefact is not left on the cluster for its whole TTL.
+        self._late_deletes: Set["asyncio.Task[None]"] = set()
+        self._unknown_sid_noted = False
+
+    # ------------------------------------------------------------------
+    # Search ids a search head cluster member has not heard of yet
+    # ------------------------------------------------------------------
+    def _grace_left_s(self, dispatched_at: float) -> float:
+        grace_s = max(0, self._config.unknown_sid_grace_ms) / 1000.0
+        return dispatched_at + grace_s - time.perf_counter()
+
+    def _note_unknown_sid(self, record: StepRecord) -> None:
+        record.unknown_sid_count += 1
+        if not self._unknown_sid_noted:
+            self._unknown_sid_noted = True
+            log.info(
+                "splunkd answered 404 for search id %s shortly after dispatching it. "
+                "Treating a 404 within %d ms of dispatch as a member that has not heard "
+                "of the job yet (a search head cluster behind a load balancer without "
+                "stickiness does this) and asking again; each one is counted on the "
+                "record as unknown_sid_count",
+                record.sid, self._config.unknown_sid_grace_ms,
+            )
+
+    def _sid_gone(self, exc: SplunkHttpError, record: StepRecord, dispatched_at: float) -> SplunkHttpError:
+        """The 404 that outlived the grace, worded so the record says why."""
+        age_s = time.perf_counter() - dispatched_at
+        context = f"job {record.sid}"
+        if record.unknown_sid_count:
+            context += (
+                f" still unknown {age_s:.1f}s after dispatch, after "
+                f"{record.unknown_sid_count} earlier 404(s)"
+            )
+        return SplunkHttpError(exc.status, exc.body, context=context)
+
+    async def _about_sid(
+        self, record: StepRecord, dispatched_at: float, call: Callable[[], Awaitable[_T]]
+    ) -> _T:
+        """One request about a dispatched job, asking again on a 404 inside the grace.
+
+        Asking again here is not the hidden retry the client refuses to do. A
+        status or results read adds no search work to the target, every 404
+        absorbed is counted on the record, and the wait is time the user of a
+        load-balanced cluster would wait too, so it stays in the latency.
+        """
+        delay_s = max(0.001, self._config.poll_initial_ms / 1000.0)
+        max_delay_s = max(delay_s, self._config.poll_max_ms / 1000.0)
+        while True:
+            try:
+                return await call()
+            except SplunkHttpError as exc:
+                if exc.status != 404:
+                    raise
+                left_s = self._grace_left_s(dispatched_at)
+                if left_s <= 0:
+                    raise self._sid_gone(exc, record, dispatched_at) from exc
+                self._note_unknown_sid(record)
+                await asyncio.sleep(min(delay_s, left_s))
+                delay_s = min(delay_s * 1.5, max_delay_s)
+
+    async def _late_delete(self, sid: str, dispatched_at: float) -> None:
+        delay_s = max(0.001, self._config.poll_initial_ms / 1000.0)
+        max_delay_s = max(delay_s, self._config.poll_max_ms / 1000.0)
+        try:
+            while True:
+                left_s = self._grace_left_s(dispatched_at)
+                if left_s <= 0:
+                    log.debug("delete of job %s: still unknown when the grace ran out", sid)
+                    return
+                await asyncio.sleep(min(delay_s, left_s))
+                delay_s = min(delay_s * 1.5, max_delay_s)
+                if await self._client.delete_job(sid):
+                    return
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001 - a leaked artefact never changes a result
+            log.debug("delete of job %s failed: %s", sid, exc)
 
     def _next_sid(self) -> Optional[str]:
         if self._custom_sid is False:
@@ -203,6 +289,11 @@ class ApiEngine:
         if self._closed:
             return
         self._closed = True
+        if self._late_deletes:
+            # Each is bounded by the grace, so this waits seconds at most, and
+            # it is the difference between tidying up and leaving artefacts on
+            # the cluster for their whole TTL.
+            await asyncio.gather(*list(self._late_deletes), return_exceptions=True)
         await self._client.close()
 
     # ------------------------------------------------------------------
@@ -628,6 +719,16 @@ class ApiEngine:
                         continue
                     try:
                         status = await self._client.job_status(sid)
+                    except SplunkHttpError as exc:
+                        if exc.status == 404 and self._grace_left_s(
+                            self._dispatched_at.get(sid, started)
+                        ) > 0:
+                            # Not heard of yet by the member asked; next round.
+                            continue
+                        log.debug("harvest: job %s unreadable: %s", sid, exc)
+                        results[sid] = (record, None, False)
+                        del pending[sid]
+                        continue
                     except Exception as exc:  # noqa: BLE001 - one lost job is not a failed harvest
                         log.debug("harvest: job %s unreadable: %s", sid, exc)
                         results[sid] = (record, None, False)
@@ -667,12 +768,19 @@ class ApiEngine:
         least afford it. A failed delete leaks one artefact and never changes
         the outcome of the measurement.
         """
-        if not record.sid or not self._config.delete_jobs:
+        if not record.sid:
+            return
+        dispatched_at = self._dispatched_at.pop(record.sid, None)
+        if not self._config.delete_jobs:
             return
         try:
-            await asyncio.shield(self._client.delete_job(record.sid))
+            found = await asyncio.shield(self._client.delete_job(record.sid))
         except Exception:  # noqa: BLE001
-            pass
+            return
+        if not found and dispatched_at is not None and self._grace_left_s(dispatched_at) > 0:
+            task = asyncio.ensure_future(self._late_delete(record.sid, dispatched_at))
+            self._late_deletes.add(task)
+            task.add_done_callback(self._late_deletes.discard)
 
     async def _execute_oneshot(self, ctx: StepContext, record: StepRecord) -> None:
         """The cheap path: one blocking call, no job artefact, no server half.
@@ -719,6 +827,8 @@ class ApiEngine:
         record.sid = sid
         record.dispatch_ms = dispatch_ms
         record.http_status = status
+        dispatched_at = time.perf_counter()
+        self._dispatched_at[sid] = dispatched_at
 
         interval_s = max(0.001, self._config.poll_initial_ms / 1000.0)
         max_interval_s = max(interval_s, self._config.poll_max_ms / 1000.0)
@@ -731,8 +841,21 @@ class ApiEngine:
             # costs the search head a round trip to tell us something we already
             # know, multiplied by every virtual user in the run.
             await asyncio.sleep(interval_s)
-            job = await self._client.job_status(sid)
             record.poll_count += 1
+            try:
+                job = await self._client.job_status(sid)
+            except SplunkHttpError as exc:
+                if exc.status != 404:
+                    raise
+                if self._grace_left_s(dispatched_at) <= 0:
+                    raise self._sid_gone(exc, record, dispatched_at) from exc
+                # The member this poll landed on has not heard of the job
+                # yet. Nothing is known about the interval just elapsed, so it
+                # is attributed to no state, and the poll backs off as usual.
+                self._note_unknown_sid(record)
+                last_observed = time.perf_counter()
+                interval_s = min(interval_s * 1.5, max_interval_s)
+                continue
             now = time.perf_counter()
 
             if job.dispatch_state == "QUEUED":
@@ -777,14 +900,15 @@ class ApiEngine:
 
                 if ctx.step.result_count > 0:
                     fetch_started = time.perf_counter()
-                    if ctx.step.want_preview:
-                        rows, byte_count = await self._client.fetch_preview(
-                            sid, ctx.step.result_count
-                        )
-                    else:
-                        rows, byte_count = await self._client.fetch_results(
-                            sid, ctx.step.result_count
-                        )
+                    fetch = (
+                        self._client.fetch_preview
+                        if ctx.step.want_preview
+                        else self._client.fetch_results
+                    )
+                    rows, byte_count = await self._about_sid(
+                        record, dispatched_at,
+                        lambda: fetch(sid, ctx.step.result_count),
+                    )
                     record.results_fetch_ms = (time.perf_counter() - fetch_started) * 1000.0
                     record.result_bytes = byte_count
                     if record.result_count is None:

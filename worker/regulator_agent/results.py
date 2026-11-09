@@ -89,6 +89,11 @@ class StepRecord:
     results_fetch_ms: Optional[float] = None
     result_bytes: Optional[int] = None
     poll_count: int = 0
+    # Requests about this job answered 404 inside the unknown-sid grace: a
+    # search head cluster member that had not yet heard of a job another
+    # member dispatched. Non-zero is normal behind a load balancer with no
+    # stickiness; a step whose every record carries it says so.
+    unknown_sid_count: int = 0
 
     # Timing, server half: taken from the job's own REST record.
     sid: Optional[str] = None
@@ -368,6 +373,10 @@ class RunStats:
         # denominator understates the queueing rate exactly when it matters.
         self.job_executions = 0
         self.partial = 0
+        # Searches that met a member which had not heard of their job yet, and
+        # how many 404s that cost in all. See StepRecord.unknown_sid_count.
+        self.unknown_sid_searches = 0
+        self.unknown_sid_responses = 0
         # Work that was still in flight when the run ended and had to be
         # abandoned by the drain. Not counted as executions or errors: a long
         # search that happened to start near the end did not fail, the run
@@ -439,6 +448,9 @@ class RunStats:
         self.executions += 1
         if record.partial:
             self.partial += 1
+        if record.unknown_sid_count:
+            self.unknown_sid_searches += 1
+            self.unknown_sid_responses += record.unknown_sid_count
         if record.ok and record.sid and record.step_type == "search":
             self.job_executions += 1
         if record.ok:
@@ -542,6 +554,10 @@ class RunStats:
             "error_rate_pct": round(self.error_rate_pct, 3),
             "errors_by_class": dict(self.errors_by_class),
             "partial": self.partial,
+            "unknown_sid": {
+                "searches": self.unknown_sid_searches,
+                "responses": self.unknown_sid_responses,
+            },
             "abandoned": self.abandoned,
             "unfinished": {
                 "count": self.abandoned,

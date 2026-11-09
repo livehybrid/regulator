@@ -619,6 +619,16 @@ async def _report_summary(
             "as partial: their latency is real but their work was less than asked",
             stats["partial"],
         )
+    unknown_sid = stats.get("unknown_sid") or {}
+    if unknown_sid.get("searches"):
+        log.warning(
+            "%d search(es) were answered 404 for their own search id shortly after "
+            "dispatch (%d response(s) in all) and were asked again inside the grace. "
+            "That is a search head cluster member that had not heard of a job "
+            "another member dispatched, which a load balancer without stickiness "
+            "produces; the waits are in the latency",
+            unknown_sid["searches"], unknown_sid.get("responses", 0),
+        )
     if stats.get("abandoned"):
         unfinished = stats.get("unfinished") or {}
         after = (unfinished.get("run_duration") or {})

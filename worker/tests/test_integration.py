@@ -15,6 +15,7 @@ seconds.
 from __future__ import annotations
 
 import sys
+import time
 from pathlib import Path
 
 import pytest
@@ -24,10 +25,16 @@ from regulator_agent.config import load_config
 from regulator_agent.engines.api import ApiEngine
 from regulator_agent.engines.base import StepContext
 from regulator_agent.params import ParameterResolver
-from regulator_agent.results import ERROR_AUTH, ERROR_SEARCH_FAILED, ERROR_SERVER
+from regulator_agent.results import ERROR_AUTH, ERROR_SEARCH_FAILED, ERROR_SERVER, StepRecord
 from regulator_agent.scenario import Step, parse_scenario
 from regulator_agent.scheduler import Scheduler
-from regulator_agent.splunk import SplunkAuthError, SplunkClient, SplunkLoginRejected
+from regulator_agent.splunk import (
+    JobStatus,
+    SplunkAuthError,
+    SplunkClient,
+    SplunkHttpError,
+    SplunkLoginRejected,
+)
 from regulator_agent.timepolicy import TimeWindow
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
@@ -672,3 +679,145 @@ def test_with_no_harvest_the_job_is_deleted_at_the_end_of_the_drain(env):
     assert s["abandoned"] == 1
     assert s["unfinished"]["finished_after_end"] == 0
     assert stats.jobs_deleted >= 1
+
+
+# ------------------------------------------- a cluster member that has not heard
+
+
+def test_a_sid_the_member_has_not_heard_of_yet_is_asked_again(env):
+    """A search head cluster behind a load balancer with no stickiness.
+
+    The poll for a job lands on a member that has not yet heard the job was
+    dispatched on another, and answers 404. A fast tstats is done inside that
+    window, so failing on the first 404 failed every one of them.
+    """
+
+    async def scenario():
+        server = FakeSplunk(port=0, base_latency_ms=5.0, jitter_ms=0.0, unknown_sid_ms=150.0, seed=3)
+        try:
+            engine = ApiEngine(make_config(server, env, REG_UNKNOWN_SID_GRACE_MS="5000"))
+            await engine.start()
+            try:
+                record = await engine.execute(context_for(search_step(result_count=5)))
+            finally:
+                await engine.close()
+            return record, server.stats.unknown_sid_answers, server.stats.jobs_deleted
+        finally:
+            server.close()
+
+    record, answered_404, deleted = run_async(scenario())
+    assert record.ok is True, record.error_detail
+    assert record.dispatch_state == "DONE"
+    assert record.result_bytes and record.result_bytes > 0
+    assert record.unknown_sid_count >= 1
+    assert record.unknown_sid_count == answered_404
+    assert deleted == 1
+
+
+def test_with_no_grace_the_first_404_fails_the_search(env):
+    async def scenario():
+        server = FakeSplunk(port=0, base_latency_ms=5.0, unknown_sid_ms=500.0, seed=3)
+        try:
+            engine = ApiEngine(make_config(server, env, REG_UNKNOWN_SID_GRACE_MS="0"))
+            await engine.start()
+            try:
+                return await engine.execute(context_for(search_step()))
+            finally:
+                await engine.close()
+        finally:
+            server.close()
+
+    record = run_async(scenario())
+    assert record.ok is False
+    assert record.http_status == 404
+    assert record.unknown_sid_count == 0
+
+
+def test_a_sid_still_unknown_after_the_grace_fails_and_says_why(env):
+    async def scenario():
+        server = FakeSplunk(port=0, base_latency_ms=5.0, unknown_sid_ms=60_000.0, seed=3)
+        try:
+            engine = ApiEngine(make_config(server, env, REG_UNKNOWN_SID_GRACE_MS="200"))
+            await engine.start()
+            try:
+                return await engine.execute(context_for(search_step()))
+            finally:
+                await engine.close()
+        finally:
+            server.close()
+
+    record = run_async(scenario())
+    assert record.ok is False
+    assert record.http_status == 404
+    assert record.unknown_sid_count >= 1
+    assert "still unknown" in (record.error_detail or "")
+
+
+def test_a_delete_that_meets_an_unaware_member_is_retried_in_the_background(env):
+    """Otherwise every fast search leaves its artefact for the dispatch TTL."""
+
+    async def scenario():
+        server = FakeSplunk(port=0, base_latency_ms=5.0, unknown_sid_ms=150.0, seed=3)
+        try:
+            engine = ApiEngine(make_config(server, env, REG_UNKNOWN_SID_GRACE_MS="5000"))
+            await engine.start()
+            sid, _, _ = await engine.client.create_job("search index=main | stats count", window())
+            engine._dispatched_at[sid] = time.perf_counter()
+            record = StepRecord(run_id="itest", slot=0, vu_id=1, iteration=0, persona="p", step_id="probe")
+            record.sid = sid
+            await engine._tidy(record)
+            deleted_at_once = server.stats.jobs_deleted
+            await engine.close()  # waits for the background delete
+            return deleted_at_once, server.stats.jobs_deleted
+        finally:
+            server.close()
+
+    at_once, after_close = run_async(scenario())
+    assert at_once == 0
+    assert after_close == 1
+
+
+def test_results_read_on_an_unaware_member_is_asked_again(env):
+    """The job is DONE on one member and the results read lands on another."""
+
+    class Client:
+        def __init__(self):
+            self.fetches = 0
+
+        async def start(self):
+            pass
+
+        async def close(self):
+            pass
+
+        async def create_job(self, *args, **kwargs):
+            return "sid-1", 1.0, 201
+
+        async def job_status(self, sid):
+            return JobStatus(sid=sid, dispatch_state="DONE", is_done=True, result_count=1)
+
+        async def fetch_results(self, sid, count):
+            self.fetches += 1
+            if self.fetches < 3:
+                raise SplunkHttpError(404, '{"messages":[{"type":"FATAL","text":"Unknown sid."}]}')
+            return [{"count": "1"}], 20
+
+        async def delete_job(self, sid):
+            return True
+
+    async def scenario():
+        client = Client()
+        config = load_config(env(
+            REG_TARGET_URL="https://splunk.invalid:8089",
+            REG_POLL_INITIAL_MS="10", REG_POLL_MAX_MS="20",
+            REG_UNKNOWN_SID_GRACE_MS="5000",
+        ))
+        engine = ApiEngine(config, client=client)
+        record = await engine.execute(context_for(search_step(result_count=1)))
+        return record, client.fetches
+
+    record, fetches = run_async(scenario())
+    assert record.ok is True, record.error_detail
+    assert fetches == 3
+    assert record.unknown_sid_count == 2
+    assert record.result_bytes == 20
