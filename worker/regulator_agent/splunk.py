@@ -825,22 +825,26 @@ class SplunkClient:
         """Preview results, which is what a real dashboard panel reads."""
         return await self._fetch(sid, count, "results_preview")
 
-    async def delete_job(self, sid: str) -> None:
-        """Delete a job artefact. A 404 is success, not failure.
+    async def delete_job(self, sid: str) -> bool:
+        """Delete a job artefact. A 404 is not a failure; returns False for one.
 
         The job may already have aged out on its own TTL, or another cleanup
         may have got there first. Treating that as an error would make the
-        tidy-up path noisier than the thing it is tidying.
+        tidy-up path noisier than the thing it is tidying. The return value
+        lets a caller tell "deleted" from "this member did not know the job",
+        which on a search head cluster behind a load balancer can mean the
+        member asked has simply not heard of it yet.
         """
         response = await self._request(
             "DELETE", f"{self._jobs_path}/{quote(sid, safe='')}", context=f"delete job {sid}"
         )
         if response.status_code == 404:
-            return
+            return False
         if response.status_code >= 400:
             raise SplunkHttpError(
                 response.status_code, response.text, context=f"delete job {sid}"
             )
+        return True
 
     async def oneshot(
         self, spl: str, window: TimeWindow, count: int = 100

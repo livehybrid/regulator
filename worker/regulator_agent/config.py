@@ -322,6 +322,15 @@ class Config:
     # floor. Their jobs are left running on the target for that long (never
     # past read_timeout_s). 0 cancels them at the end of the drain, as before.
     harvest_s: float = 240.0
+    # How long after a dispatch a 404 for that search id is taken to mean "this
+    # member has not heard of the job yet" rather than "the job is gone". A
+    # search head cluster behind a load balancer with no stickiness sends the
+    # polls for one job to whichever member is next, and a member asked about a
+    # job another member dispatched a moment ago can answer 404 until it learns
+    # of it. A fast search (a tstats over an accelerated model) is done inside
+    # that window, so without the grace every one of them fails. Each 404
+    # absorbed is counted on the step record; 0 restores the strict behaviour.
+    unknown_sid_grace_ms: int = 10000
     # The longest a run may stay paused, in total, before it is stopped. A
     # forgotten pause must not hold a run slot forever, nor resume load
     # unattended on a cluster somebody paused it to protect.
@@ -489,6 +498,7 @@ def load_config(env: Optional[Mapping[str, str]] = None) -> Config:
         delete_jobs=_boolean(env, "REG_DELETE_JOBS", True),
         poll_initial_ms=poll_initial,
         poll_max_ms=poll_max,
+        unknown_sid_grace_ms=_integer(env, "REG_UNKNOWN_SID_GRACE_MS", 10000, minimum=0),
         cache_bust=_boolean(env, "REG_CACHE_BUST", True),
         evict_cache=_boolean(env, "REG_EVICT_CACHE", False),
         evict_cache_indexes=tuple(
