@@ -493,21 +493,36 @@ async def read_residency(client: SplunkClient, fc: Forecast) -> Residency:
     answers differently, leaves the forecast as the cache manager reported it,
     with a note.
     """
-    result = Residency()
     if not fc.available or not fc.touched:
+        return Residency(reason="nothing to inspect")
+    return await inspect_buckets(
+        client, fc.touched, {index: entry.spans for index, entry in fc.per_index.items()}
+    )
+
+
+async def inspect_buckets(
+    client: SplunkClient, buckets: Dict[str, Bucket], spans_by_index: Dict[str, Sequence[Interval]]
+) -> Residency:
+    """dbinspect the named indexes over their spans and classify ``buckets``.
+
+    ``buckets`` is keyed by bucket id; ``spans_by_index`` says which indexes to
+    inspect and over what ranges. Never raises.
+    """
+    result = Residency()
+    if not buckets:
         result.reason = "nothing to inspect"
         return result
     local: Dict[str, float] = {}
     full: Dict[str, float] = {}
     try:
-        for index, entry in sorted(fc.per_index.items()):
+        for index, spans in sorted(spans_by_index.items()):
             window = TimeWindow(
-                earliest=min(lo for lo, _ in entry.spans) if entry.spans else 0.0,
-                latest=max(hi for _, hi in entry.spans) if entry.spans else time.time(),
+                earliest=min(lo for lo, _ in spans) if spans else 0.0,
+                latest=max(hi for _, hi in spans) if spans else time.time(),
             )
             for cached, into in ((False, local), (True, full)):
                 rows, _ = await client.oneshot(
-                    _dbinspect_spl(index, cached, entry.spans), window,
+                    _dbinspect_spl(index, cached, spans), window,
                     count=CACHEMAN_SEARCH_MAX_ROWS,
                 )
                 for row in rows:
@@ -527,7 +542,7 @@ async def read_residency(client: SplunkClient, fc: Forecast) -> Residency:
     if not local and not full:
         result.reason = "dbinspect returned no buckets for the indexes this run reads"
         return result
-    for bid, bucket in fc.touched.items():
+    for bid, bucket in buckets.items():
         if bid not in local:
             result.unmatched += 1
             continue

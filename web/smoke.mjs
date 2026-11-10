@@ -369,6 +369,42 @@ const ROUTES = {
     },
     '/targets/1/samples': SAMPLES,
     '/targets/1/cache': CACHE,
+    '/targets/1/buckets': {
+        available: true,
+        detail: 'disk',
+        states: ['remote', 'index_only', 'full'],
+        earliest: 1757000000,
+        latest: 1757000000 + 30 * 86400,
+        bin_s: 43200,
+        bins: 60,
+        notes: [],
+        indexes: [
+            {
+                index: 'cultivar_web',
+                buckets: 3,
+                bytes: 3000000000,
+                local_pct: 66.67,
+                undated: 0,
+                outside: 0,
+                by_state: {
+                    remote: { buckets: 1, bytes: 1000000000 },
+                    index_only: { buckets: 1, bytes: 1000000000 },
+                    full: { buckets: 1, bytes: 1000000000 },
+                },
+                cells: [
+                    { bin: 10, buckets: 1, bytes: { remote: 1000000000 } },
+                    { bin: 40, buckets: 2, bytes: { index_only: 600000000, full: 400000000 } },
+                    { bin: 59, buckets: 1, bytes: { full: 600000000 } },
+                ],
+            },
+        ],
+        overlay: {
+            scenario: 'web-dashboards',
+            duration_s: 600,
+            spans: [{ index: 'cultivar_web', earliest: 1757000000 + 29 * 86400, latest: 1757000000 + 30 * 86400, clipped: false }],
+            notes: [],
+        },
+    },
     '/targets/1/warm/suggest': {
         scenario: 'web-dashboards',
         duration_s: 600,
@@ -727,6 +763,16 @@ const go = async (hash) => {
 
     await go('#target/1');
     await check('target detail', 'SmartStore cache');
+
+    // The bucket map is read on demand, never on page load.
+    await check('bucket map: panel', 'Bucket map');
+    if ((window.document.body.textContent || '').includes('Index files only')) {
+        problems.push('bucket map: read the buckets without being asked');
+    }
+    clickByText('Load bucket map', 'load the bucket map');
+    await check('bucket map: legend', 'Index files only');
+    await check('bucket map: scenario overlay in the legend', 'Read by web-dashboards');
+    await check('bucket map: table view', '1 (953.7 MB)');
 
     // Warm-up: the suggestion fills an editable plan, and nothing is posted to
     // /warm until the operator confirms it.

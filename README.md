@@ -335,7 +335,8 @@ Add a target, and the buttons do the rest: **Test** probes it, **Report**
 describes the whole cluster and says which scenarios its data fits, **Cache**
 shows what SmartStore holds locally on every indexer, **Evict** drops it,
 **Warm cache** suggests the indexes and time ranges a scenario reads for you to
-edit and confirm, then warms exactly those,
+edit and confirm, then warms exactly those, the **bucket map** on a target's
+page shows which parts of which indexes are on local disk,
 **Saved searches** lists what the target already runs and turns it into a
 scenario, and **Run** launches a scenario with live latency, throughput and
 queueing while it goes. A finished run can be made a **baseline** and any run
@@ -795,6 +796,23 @@ dbinspect: 180 full, 220 index files only, 0 partial, 12 evicted to a stub;
 nothing. If the account may not run it, the forecast stands on the cache
 manager's status and says so. The size comparison is an inference from what the
 two `cached` modes examine; it is not documented, so check it on your release.
+
+**The bucket map.** A target's page draws its buckets by index (rows) and time
+(columns), coloured by how much of each is on local disk: not local, partial,
+index files only, full. It shows the shape behind the forecast's one line: which
+parts of which indexes are warm and where the cold stretches are. Choose a
+scenario and the ranges its searches read are drawn under each index, from the
+same reading of the searches as the forecast. Hovering a slice gives its bytes
+by state, and the table beneath carries the same totals per index.
+
+It is read on demand (**Load bucket map**), never on page load or on a timer,
+because listing every bucket is load on the target. By default it shows local or
+remote from the cache manager for the largest indexes. **On-disk detail** adds
+the `dbinspect` reading and needs 1 to 10 named indexes, since `dbinspect`
+examines every bucket of each index it is given. The same data is at
+`GET /api/targets/{id}/buckets` (`indexes`, `earliest`, `latest`, `bins`,
+`detail`, `scenario`), aggregated on the server so a large estate is a few
+thousand cells and not one row per bucket.
 
 **Warm from a plan you confirm.** Regulator never warms values it derived on its
 own. The forecast *suggests* a plan, a list of indexes each with an earliest and
