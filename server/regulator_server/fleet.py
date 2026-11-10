@@ -743,11 +743,14 @@ def merge_summaries(run_label: str, scenario: str, summaries: Sequence[Dict[str,
             entry = merged_steps.setdefault(
                 sid,
                 {"step_id": sid, "class": step.get("class", "unclassified"), "executions": 0, "successes": 0,
-                 "partial": 0, "unfinished": 0, "errors": 0, "errors_by_class": {}, "scan_count_total": 0,
+                 "partial": 0, "unfinished": 0, "errors": 0, "errors_by_class": {}, "queued": 0,
+                 "unknown_sid": {"searches": 0, "responses": 0}, "scan_count_total": 0,
                  "result_count_total": 0, "_run_duration_total_s": 0.0},
             )
-            for key in ("executions", "successes", "partial", "unfinished", "errors", "scan_count_total", "result_count_total"):
+            for key in ("executions", "successes", "partial", "unfinished", "errors", "queued", "scan_count_total", "result_count_total"):
                 entry[key] += int(step.get(key) or 0)
+            for key in ("searches", "responses"):
+                entry["unknown_sid"][key] += int((step.get("unknown_sid") or {}).get(key) or 0)
             for key, value in (step.get("errors_by_class") or {}).items():
                 entry["errors_by_class"][key] = entry["errors_by_class"].get(key, 0) + int(value or 0)
             # The per-search mean carries the duration total back out.
@@ -781,6 +784,8 @@ def merge_summaries(run_label: str, scenario: str, summaries: Sequence[Dict[str,
         entry["service_time"] = _hist([p.get("service_time") for p in parts]).summary()
         entry["dispatch"] = _hist([p.get("dispatch") for p in parts]).summary()
         entry["ttfr"] = _hist([p.get("ttfr") for p in parts]).summary()
+        step_queued = _hist([p.get("queued") for p in parts])
+        entry["queued_p95_ms"] = step_queued.percentile_ms(95) if len(step_queued) else None
         entry["error_rate_pct"] = round(100.0 * entry["errors"] / entry["executions"], 3) if entry["executions"] else 0.0
         entry["scan_count_per_search"] = (
             round(entry["scan_count_total"] / entry["successes"], 1) if entry["successes"] else None

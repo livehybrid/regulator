@@ -214,6 +214,13 @@ class StepStats:
     # Still in flight when the run ended. Not an execution and not an error:
     # see RunStats.record.
     unfinished: int = 0
+    # Waited in QUEUED before running, and the unknown-sid 404s absorbed
+    # inside the grace window. The run totals say how many; these say which
+    # step, which is the first thing asked once the total is not zero.
+    queued: int = 0
+    queued_ms: LatencyHistogram = field(default_factory=LatencyHistogram)
+    unknown_sid_searches: int = 0
+    unknown_sid_responses: int = 0
     # When the run cycles its cache, the same step's latency inside the cold
     # window after an eviction and outside it, kept apart: that split is the
     # question a cold-versus-warm run is asked.
@@ -227,6 +234,12 @@ class StepStats:
         self.executions += 1
         if record.partial:
             self.partial += 1
+        if record.queued_ms:
+            self.queued += 1
+            self.queued_ms.record_ms(record.queued_ms)
+        if record.unknown_sid_count:
+            self.unknown_sid_searches += 1
+            self.unknown_sid_responses += record.unknown_sid_count
         if record.ok and phase == "cold":
             self.latency_cold.record_ms(record.latency_ms)
         elif record.ok and phase == "warm":
@@ -284,6 +297,7 @@ class StepStats:
             "failure_latency": self.failure_latency.to_dict(),
             "latency_cold": self.latency_cold.to_dict(),
             "latency_warm": self.latency_warm.to_dict(),
+            "queued": self.queued_ms.to_dict(),
         }
 
     def summary(self) -> Dict[str, Any]:
@@ -297,6 +311,12 @@ class StepStats:
             "errors": self.errors,
             "error_rate_pct": round(100.0 * self.errors / self.executions, 3) if self.executions else 0.0,
             "errors_by_class": dict(self.errors_by_class),
+            "queued": self.queued,
+            "queued_p95_ms": self.queued_ms.percentile_ms(95) if len(self.queued_ms) else None,
+            "unknown_sid": {
+                "searches": self.unknown_sid_searches,
+                "responses": self.unknown_sid_responses,
+            },
             "latency": self.latency.summary(),
             "cold": self.latency_cold.summary() if len(self.latency_cold) else None,
             "warm": self.latency_warm.summary() if len(self.latency_warm) else None,

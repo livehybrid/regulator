@@ -142,3 +142,24 @@ def test_drift_is_tracked_for_the_generator_health_check():
     stats.record(record(late_by_ms=400.0))
     assert stats.max_drift_ms == 400.0
     assert stats.snapshot()["generator"]["max_drift_ms"] == 400.0
+
+
+def test_queueing_and_unknown_sids_are_counted_on_the_step_they_happened_to():
+    """The run totals say how many; the step says where."""
+    stats = RunStats(run_id="r")
+    stats.record(record(step_id="busy", queued_ms=120.0, unknown_sid_count=2))
+    stats.record(record(step_id="busy", queued_ms=80.0))
+    stats.record(record(step_id="busy"))
+    stats.record(record(step_id="quiet"))
+    steps = {s["step_id"]: s for s in stats.snapshot()["steps"]}
+
+    assert steps["busy"]["queued"] == 2
+    assert steps["busy"]["queued_p95_ms"] == pytest.approx(120.0, rel=0.05)
+    assert steps["busy"]["unknown_sid"] == {"searches": 1, "responses": 2}
+    assert steps["quiet"]["queued"] == 0 and steps["quiet"]["queued_p95_ms"] is None
+    assert steps["quiet"]["unknown_sid"] == {"searches": 0, "responses": 0}
+    # The per-step counts add up to the run's.
+    assert sum(s["queued"] for s in steps.values()) == stats.snapshot()["queueing"]["searches_queued"]
+    assert sum(s["unknown_sid"]["responses"] for s in steps.values()) == stats.snapshot()["unknown_sid"]["responses"]
+    # And the queued histogram travels, so a fleet's p95 is over the merged whole.
+    assert "queued" in stats.steps["busy"].histograms()
