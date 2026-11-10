@@ -404,6 +404,15 @@ const ROUTES = {
             ...RUN.summary,
             cache: {
                 ...RUN.summary.cache,
+                forecast: {
+                    available: true,
+                    buckets: 12,
+                    local: 12,
+                    local_pct: 100,
+                    bytes_total: 9000000000,
+                    bytes_remote: 0,
+                    residency: { available: true, counts: { full: 0, index_only: 12, partial: 0, stub: 0 } },
+                },
                 warm: {
                     mode: 'tsidx',
                     searches: 7,
@@ -1000,6 +1009,8 @@ const go = async (hash) => {
     // was written, unconfirmed: nothing is launched until it is ticked again.
     await go('#run/9');
     await check('warm run: the run page says what the warm-up did', 'Warmed before the run from a confirmed plan');
+    await check('warm run: the forecast at the start', 'Forecast at the start: this run reads 12 bucket(s)');
+    await check('warm run: the forecast says what is on disk', '12 index files only');
     clickByText('Run again', 'open run again for the warm run');
     await check('warm run: run again shows the warm-up', 'You decide what gets warmed');
     await waitFor('warm run: the plan comes back as written', () =>

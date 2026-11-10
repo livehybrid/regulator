@@ -305,13 +305,22 @@ export default function RunDetail({ runId, navigate, onLaunch }) {
         );
     }
     const warmed = cache.warm;
-    if (warmed && (warmed.failed > 0 || warmed.not_started > 0)) {
+    if (warmed && (warmed.error || warmed.failed > 0 || warmed.not_started > 0)) {
         banners.push(
             <Message appearance="fill" type="warning" key="warm-incomplete">
                 <Message.Title>The warm-up before this run did not finish</Message.Title>
-                {fmtInt(warmed.failed)} of {fmtInt(warmed.searches)} warm-up search(es) failed and{' '}
-                {fmtInt(warmed.not_started)} were not started within the time budget, so part of
-                the confirmed plan was still remote when the load began.
+                {warmed.error ? (
+                    <>
+                        It failed before warming anything: <Mono>{warmed.error}</Mono>.
+                    </>
+                ) : (
+                    <>
+                        {fmtInt(warmed.failed)} of {fmtInt(warmed.searches)} warm-up search(es)
+                        failed and {fmtInt(warmed.not_started)} were not started within the time
+                        budget, so part of the confirmed plan was still remote when the load began.
+                    </>
+                )}{' '}
+                The run went ahead; the forecast below says what state it really started in.
             </Message>
         );
     }
@@ -343,13 +352,34 @@ export default function RunDetail({ runId, navigate, onLaunch }) {
     }
 
     const quiet = [];
-    if (warmed) {
+    if (warmed && !warmed.error) {
         quiet.push(
             <Note key="warmed">
                 Warmed before the run from a confirmed plan ({warmed.mode}): {fmtInt(warmed.searches)}{' '}
                 search(es) in {fmtNum(warmed.seconds, 1)} s; the plan&apos;s buckets went from{' '}
                 {fmtPct((warmed.before || {}).local_pct, 0)} to {fmtPct((warmed.after || {}).local_pct, 0)}{' '}
                 local. The run&apos;s own cache figures start after the warm-up.
+            </Note>
+        );
+    }
+    // What the run was about to read, taken as its load started: after any
+    // warm-up or eviction, so it is the state the numbers were measured in.
+    const { forecast } = cache;
+    if (forecast && forecast.available) {
+        const residency = forecast.residency && forecast.residency.available ? forecast.residency : null;
+        const counts = (residency && residency.counts) || {};
+        quiet.push(
+            <Note key="forecast">
+                Forecast at the start: this run reads {fmtInt(forecast.buckets)} bucket(s),{' '}
+                {fmtBytes(forecast.bytes_total)}; {fmtPct(forecast.local_pct, 0)} local,{' '}
+                {fmtBytes(forecast.bytes_remote)} to download.
+                {residency
+                    ? ` On disk: ${fmtInt(counts.full)} full, ${fmtInt(
+                          counts.index_only
+                      )} index files only, ${fmtInt(counts.partial)} partial, ${fmtInt(
+                          counts.stub
+                      )} evicted.`
+                    : ''}
             </Note>
         );
     }

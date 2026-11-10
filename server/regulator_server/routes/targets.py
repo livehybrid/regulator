@@ -525,7 +525,7 @@ async def target_bucket_map(
             state, indexes=names or None, earliest=lo, latest=hi, bins=bins, residency=residency, now=now
         )
         if chosen is not None and document["available"]:
-            duration = float(duration_s or _scenario_duration(chosen))
+            duration = float(duration_s or warmup.scenario_duration(chosen))
             fc = cachewarm.forecast(chosen, state, now, duration)
             document["overlay"] = {
                 "scenario": chosen.name,
@@ -553,15 +553,6 @@ async def target_bucket_map(
 _warm_jobs: Dict[int, Dict[str, Any]] = {}
 
 
-def _scenario_duration(scenario: Any) -> float:
-    from regulator_agent.scheduler import Ramp
-
-    if scenario.load.duration_s:
-        return float(scenario.load.duration_s)
-    base = float(scenario.load.virtual_users) if scenario.load.model == "closed" else float(scenario.load.arrival_rate_per_min)
-    return Ramp(scenario.load.ramp, base).duration_s or 3600.0
-
-
 @router.post("/{target_id}/warm/suggest")
 async def suggest_warm_plan(
     target_id: int, body: WarmSuggestRequest, session: Session = Depends(get_session)
@@ -577,7 +568,7 @@ async def suggest_warm_plan(
         scenario = load_named_scenario(body.scenario)
     except (FileNotFoundError, ValueError) as exc:
         raise HTTPException(status_code=404, detail=str(exc))
-    duration = float(body.duration_s or _scenario_duration(scenario))
+    duration = float(body.duration_s or warmup.scenario_duration(scenario))
     extra = _cache_kwargs(target)
 
     async def suggest(client: SplunkClient) -> Dict[str, Any]:

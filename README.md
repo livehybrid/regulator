@@ -865,9 +865,17 @@ refused with a 409.
   before the warm-up starts. **Run again** brings the plan back as written and
   unticked: relative times have moved, so it has to be checked again before
   anything is warmed.
-- A warm-up search that fails, or is not started within the time budget, does
-  not stop the run; the run page says the warm-up did not finish and by how
-  much. A stop pressed during the warm-up ends it early.
+- A warm-up never stops the run. A search that fails, or is not started within
+  the time budget, is counted; a warm-up that fails outright (the target could
+  not be read at all) is recorded under `cache.warm.error`. Either way the run
+  goes ahead, the run page says the warm-up did not finish, and the forecast
+  says what state the load really started in. A stop pressed during the
+  warm-up ends it early.
+- Every console run, warmed or not, records `cache.forecast` as the standalone
+  worker does: what the run is about to read and how much of it is local,
+  taken from the same cache reading the run calls "before", so after any
+  warm-up or eviction. The run page states it. It costs the target two
+  `dbinspect` searches per index the run reads, at the start of the run.
 
 Over the API, `POST /api/runs` takes `warm_cache`, `warm_plan` (the lines),
 `warm_mode`, `warm_concurrency`, `warm_budget_s` and `warm_confirmed`, which

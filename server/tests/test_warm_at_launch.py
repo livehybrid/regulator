@@ -150,6 +150,55 @@ def test_a_run_without_a_warm_up_is_unchanged(client, cold, scenario):  # noqa: 
     assert not any(row["action"] == "cache_warmed" for row in audit_rows(client))
 
 
+def test_every_run_carries_a_forecast_of_what_it_was_about_to_read(client, cold, scenario):  # noqa: F811
+    """With or without a warm-up, and taken after it: the state the load started in."""
+    target = make_target(client, cold)
+    plain = client.post(
+        "/api/runs",
+        json={"target_id": target["id"], "scenario": scenario, "virtual_users": 1, "duration_s": 2},
+    )
+    cache = wait_for_terminal(client, plain.json()["id"])["summary"]["cache"]
+    assert cache["forecast"]["available"] is True
+    assert cache["forecast"]["buckets"] > 0 and cache["forecast"]["local"] == 0
+
+    # Warm everything the scenario reads (its subsearch reaches back three
+    # hours), and the next run's forecast finds it local.
+    warmed = launch(client, target, scenario, warm_mode="full",
+                    warm_plan=[{"index": "main", "earliest": "-4h", "latest": "now"}])
+    assert warmed.status_code == 201, warmed.text
+    cache = wait_for_terminal(client, warmed.json()["id"])["summary"]["cache"]
+    assert cache["warm"]["failed"] == 0
+    assert cache["forecast"]["local"] == cache["forecast"]["buckets"] > 0
+
+
+def test_a_warm_up_that_fails_outright_is_recorded_and_the_run_goes_ahead(client, cold, scenario, monkeypatch):  # noqa: F811
+    from regulator_server import warmup
+
+    async def broken(*args, **kwargs):
+        raise RuntimeError("search head unavailable")
+
+    monkeypatch.setattr(warmup, "warm_confirmed_plan", broken)
+    target = make_target(client, cold)
+    response = launch(client, target, scenario)
+    assert response.status_code == 201, response.text
+    run_id = response.json()["id"]
+    finished = wait_for_terminal(client, run_id)
+
+    # The run happened, and says it did not start warm.
+    assert finished["state"] == "completed", finished.get("error")
+    assert finished["stats"]["executions"] > 0
+    warm = finished["summary"]["cache"]["warm"]
+    assert "search head unavailable" in warm["error"]
+    assert warm["plan"] == PLAN and "searches" not in warm
+    assert finished["summary"]["cache"]["forecast"]["local"] == 0
+    # So its searches paid for the cold path themselves, and the run says so.
+    assert finished["summary"]["cache"]["delta"]["provenance"] != "warm"
+
+    failed = next(row for row in audit_rows(client) if row["action"] == "cache_warm_failed")
+    assert f"run {run_id}" in failed["detail"] and "went ahead" in failed["detail"]
+    assert not any(row["action"] == "cache_warmed" for row in audit_rows(client))
+
+
 def test_a_stop_during_the_warm_up_starts_no_more_searches(cold):  # noqa: F811
     """The run's warm-up polls for a stop, and a stopped run fetches nothing more."""
     from regulator_agent.config import load_config

@@ -14,12 +14,15 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import logging
 import time
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 from regulator_agent import cachewarm
 from regulator_agent.smartstore import CacheState, cache_state
 from regulator_agent.splunk import SplunkClient
+
+log = logging.getLogger("regulator.server.warmup")
 
 DEFAULT_CHUNK_S = 86400.0
 
@@ -86,14 +89,19 @@ async def warm_before_run(
     where: Dict[str, Any],
     lock: asyncio.Lock,
     should_stop: Optional[Callable[[], bool]] = None,
-) -> Tuple[Dict[str, Any], CacheState]:
-    """A run's warm-up, once, before any load is generated.
+) -> Tuple[Dict[str, Any], Optional[CacheState]]:
+    """A run's warm-up, once, before any load is generated. Never raises.
 
     Holds the target's cache lock, as the button does. ``should_stop`` is
     polled so a run stopped while it warms does not spend the rest of its
     budget fetching buckets for a test nobody is waiting for.
+
+    A warm-up that fails outright is recorded on the run, under ``error``,
+    and the run goes ahead: its forecast and its provenance then say what
+    state it really started in, which is more use than a run that never
+    happened. The cache reading is None in that case.
     """
-    plan = run_plan(spec)
+    started = time.time()
     abort = asyncio.Event()
 
     async def watch() -> None:
@@ -104,8 +112,9 @@ async def warm_before_run(
             await asyncio.sleep(0.5)
 
     watcher = asyncio.create_task(watch())
-    _warming[int(run_id)] = time.time()
+    _warming[int(run_id)] = started
     try:
+        plan = run_plan(spec)
         async with lock:
             return await warm_confirmed_plan(
                 client, plan,
@@ -114,6 +123,17 @@ async def warm_before_run(
                 budget_s=float(spec.get("budget_s") or 1800.0),
                 where=where, abort=abort,
             )
+    except Exception as exc:  # noqa: BLE001 - recorded on the run, never fatal to it
+        log.warning("the warm-up before run %s failed: %s", run_id, exc)
+        return (
+            {
+                "mode": str(spec.get("mode") or "tsidx"),
+                "plan": list(spec.get("plan") or []),
+                "error": f"{type(exc).__name__}: {exc}"[:500],
+                "seconds": round(time.time() - started, 2),
+            },
+            None,
+        )
     finally:
         _warming.pop(int(run_id), None)
         abort.set()
@@ -122,7 +142,40 @@ async def warm_before_run(
             await watcher
 
 
-def record_run_warm(run_id: int, result: Dict[str, Any], state_after: CacheState) -> None:
+def scenario_duration(scenario: Any) -> float:
+    """How long a scenario runs when the launch names no duration.
+
+    A ramp-only scenario declares none; its ramp says, and an hour stands in
+    when even that does not.
+    """
+    from regulator_agent.scheduler import Ramp
+
+    if scenario.load.duration_s:
+        return float(scenario.load.duration_s)
+    base = float(scenario.load.virtual_users) if scenario.load.model == "closed" else float(scenario.load.arrival_rate_per_min)
+    return Ramp(scenario.load.ramp, base).duration_s or 3600.0
+
+
+async def forecast_for_run(
+    client: SplunkClient, scenario: Any, state: CacheState, duration_s: float
+) -> Optional[Dict[str, Any]]:
+    """What the run will read and how much of it is local, or None. Never raises.
+
+    Taken from the cache reading the run calls "before", so after any warm-up
+    or eviction: it describes the state the load really started in. It costs
+    the target two dbinspect searches per index the run reads.
+    """
+    if not state.available or duration_s <= 0:
+        return None
+    try:
+        fc = await cachewarm.forecast_on_disk(client, scenario, state, time.time(), duration_s)
+    except Exception:  # noqa: BLE001 - a nicety, never fatal to a run
+        log.debug("the cache forecast failed", exc_info=True)
+        return None
+    return fc.to_dict()
+
+
+def record_run_warm(run_id: int, result: Dict[str, Any], state_after: Optional[CacheState]) -> None:
     """What a run's warm-up did, where the button's is recorded too.
 
     A point on the target's cache history, a lifecycle event, and an audit row
@@ -146,10 +199,21 @@ def record_run_warm(run_id: int, result: Dict[str, Any], state_after: CacheState
             if run.started_at is not None:
                 run.started_at = time.time()
                 session.add(run)
-            store_cache_sample(
-                session, target_id, run_id, "warm", state_after.to_dict(),
-                {"warm": {k: v for k, v in result.items() if k not in ("before", "after")}},
+            if state_after is not None:
+                store_cache_sample(
+                    session, target_id, run_id, "warm", state_after.to_dict(),
+                    {"warm": {k: v for k, v in result.items() if k not in ("before", "after")}},
+                )
+        if result.get("error"):
+            telemetry.lifecycle(
+                "cache_warm_failed", run, target_name, target=target_name,
+                mode=result.get("mode"), error=result.get("error"),
             )
+            audit_record(
+                "cache_warm_failed", target_id=target_id,
+                detail=f"run {run_id} on {target_name}: {result.get('error')}; the run went ahead",
+            )
+            return
         telemetry.lifecycle(
             "cache_warmed", run, target_name, target=target_name, mode=result.get("mode"),
             searches=result.get("searches"), failed=result.get("failed"), seconds=result.get("seconds"),
@@ -159,11 +223,7 @@ def record_run_warm(run_id: int, result: Dict[str, Any], state_after: CacheState
             detail=f"run {run_id} on {target_name}: {summary_line(result)}",
         )
     except Exception:  # noqa: BLE001 - the record of a warm-up never fails the run
-        import logging
-
-        logging.getLogger("regulator.server.warmup").warning(
-            "could not record the warm-up of run %s", run_id, exc_info=True
-        )
+        log.warning("could not record the warm-up of run %s", run_id, exc_info=True)
 
 
 def summary_line(result: Dict[str, Any]) -> str:

@@ -39,7 +39,6 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 import yaml
 from sqlalchemy import select
 
-from regulator_agent import cachewarm
 from regulator_agent.catrust import CA_BUNDLE_PEM_ENV, read_pem as read_ca_pem
 from regulator_agent.histogram import LatencyHistogram, merge_dicts
 from regulator_agent.results import merge_intervals
@@ -1046,9 +1045,11 @@ class FleetRun(threading.Thread):
             corpus_index = None
             duration = float(run.duration_s or 0)
             label = f"r{run.id}" + (f"-{run.label}" if run.label else "")
+        scenario_loaded = None
         try:
             directory, _ = scenario_path(self._scenario_name())
             scenario = load_scenario(directory)
+            scenario_loaded = scenario
             corpus_index = scenario.corpus.index
             if not duration:
                 duration = float(scenario.load.duration_s or 0)
@@ -1059,6 +1060,7 @@ class FleetRun(threading.Thread):
         await client.start()
         eviction = None
         warmed = None
+        cache_forecast = None
         before = None
         # A ramp-only scenario has no declared duration; the deadlines then
         # cover the longest run this control plane allows rather than
@@ -1067,12 +1069,20 @@ class FleetRun(threading.Thread):
         try:
             # The confirmed warm-up, once, here: before a worker exists, so
             # none of them is held ready while it runs and none of them warms.
-            if warm_spec:
+            if warm_spec and not self.stop_requested:
                 warmed = await self._warm_before(client, warm_spec, where, target_id)
             if evict:
                 indexes = None if "*" in evict_indexes else (evict_indexes or ([corpus_index] if corpus_index else None))
                 eviction = await evict_all(client, indexes=indexes, **where)
             before = await cache_state(client, **where)
+            # What the run is about to read and how much of it is local, from
+            # that same reading: the state the load really starts in.
+            if scenario_loaded is not None:
+                from . import warmup as _warmup
+
+                cache_forecast = await _warmup.forecast_for_run(
+                    client, scenario_loaded, before, duration or _warmup.scenario_duration(scenario_loaded),
+                )
             with session_scope() as session:
                 run = session.get(Run, self.run_id)
                 store_cache_sample(session, target_id, self.run_id, "before", before.to_dict())
@@ -1166,8 +1176,11 @@ class FleetRun(threading.Thread):
                 telemetry.lifecycle("cache_after", run, self._target_name, **_cache_facts(after.to_dict()), delta=merged["cache"]["delta"])
             elif before is not None:
                 merged["cache"] = {"available": False, "reason": before.reason}
-            if warmed is not None and isinstance(merged.get("cache"), dict):
-                merged["cache"]["warm"] = warmed
+            if isinstance(merged.get("cache"), dict):
+                if cache_forecast is not None:
+                    merged["cache"]["forecast"] = cache_forecast
+                if warmed is not None:
+                    merged["cache"]["warm"] = warmed
             if merged.get("started_at") and merged.get("ended_at") and summaries:
                 try:
                     merged["sut"] = await correlate(
@@ -1215,13 +1228,10 @@ class FleetRun(threading.Thread):
         from . import warmup
         from .cachelock import evict_lock
 
-        try:
-            result, state_after = await warmup.warm_before_run(
-                self.run_id, client, spec, where=where, lock=evict_lock(target_id),
-                should_stop=lambda: self.stop_requested,
-            )
-        except cachewarm.PlanError as exc:
-            raise FleetError(f"the warm-up plan cannot be warmed as written: {exc}") from exc
+        result, state_after = await warmup.warm_before_run(
+            self.run_id, client, spec, where=where, lock=evict_lock(target_id),
+            should_stop=lambda: self.stop_requested,
+        )
         warmup.record_run_warm(self.run_id, result, state_after)
         return result
 
