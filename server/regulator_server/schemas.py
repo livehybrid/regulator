@@ -471,6 +471,16 @@ class RunCreate(BaseModel):
     # cold_window_s of an eviction are its cold part (default: half of N).
     evict_every_s: Optional[float] = Field(default=None, ge=10, le=86400, allow_inf_nan=False)
     cold_window_s: Optional[float] = Field(default=None, gt=0, le=86400, allow_inf_nan=False)
+    # Warm a confirmed plan before the run. The control plane does it once,
+    # before any worker is released; workers never warm. The same contract as
+    # the Warm cache button: nothing is warmed that the operator has not
+    # checked, so warm_confirmed must be set, and it is never set for them.
+    warm_cache: bool = False
+    warm_plan: List[WarmLine] = Field(default_factory=list, max_length=100)
+    warm_mode: str = Field(default="tsidx", pattern="^(tsidx|full)$")
+    warm_concurrency: int = Field(default=4, ge=1, le=16)
+    warm_budget_s: float = Field(default=1800.0, ge=10, le=4 * 3600, allow_inf_nan=False)
+    warm_confirmed: bool = False
     # Where the load is generated: inprocess (this control plane), swarm or
     # k8s (worker containers). Blank means the configured default.
     fleet: Optional[str] = None
@@ -530,6 +540,23 @@ class RunCreate(BaseModel):
                 raise ValueError("cold_window_s cannot be longer than evict_every_s")
         elif self.cold_window_s:
             raise ValueError("cold_window_s only makes sense with evict_every_s")
+        if self.warm_cache:
+            if self.evict_cache or self.evict_every_s:
+                raise ValueError(
+                    "warm_cache and eviction are mutually exclusive for one run: a run "
+                    "that warms and evicts the same cache measures neither path"
+                )
+            if not self.warm_plan:
+                raise ValueError(
+                    "warm_cache needs a plan: the indexes and time ranges to warm. Ask for "
+                    "a suggestion from the scenario, then check and edit it"
+                )
+            if not self.warm_confirmed:
+                raise ValueError(
+                    "confirm the plan first: check that these are the indexes and time "
+                    "ranges you want warmed. Warming is load on the target and the "
+                    "suggestion is only a reading of the scenario's search strings"
+                )
 
 
 class RunOut(BaseModel):

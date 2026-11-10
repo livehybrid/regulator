@@ -38,7 +38,7 @@ EXPORT_VERSION = 1
 RUN_FIELDS = (
     "label", "scenario", "state", "virtual_users", "duration_s",
     "arrival_rate_per_min", "pacing_s", "evict_cache", "evict_cache_indexes",
-    "evict_every_s", "cold_window_s", "seed", "scenario_digest", "fleet",
+    "evict_every_s", "cold_window_s", "warm_cache", "seed", "scenario_digest", "fleet",
     "workers", "fleet_state", "created_at", "started_at", "ended_at", "t0", "error",
     "note", "paused_s", "load_override",
 )
@@ -162,6 +162,7 @@ def import_document(session: Session, document: Dict[str, Any], uid: Optional[st
     run.stats_json = row.get("stats")
     run.summary_json = row.get("summary")
     run.controls_json = row.get("controls") or None
+    run.warm_plan_json = row.get("warm_plan") or None
     session.add(run)
     session.flush()
 

@@ -387,6 +387,45 @@ const ROUTES = {
         note: 'held while indexer 3 restarts',
         summary: null,
     },
+    // A run that warmed a confirmed plan before its load, for the run page's
+    // note and for "Run again", which must show the plan and not re-confirm it.
+    '/runs/9': {
+        ...RUN,
+        id: 9,
+        label: 'warm start',
+        warm_cache: true,
+        warm_plan: {
+            plan: [{ index: 'cultivar_web', earliest: '-7d@d', latest: 'now' }],
+            mode: 'tsidx',
+            concurrency: 4,
+            budget_s: 1800,
+        },
+        summary: {
+            ...RUN.summary,
+            cache: {
+                ...RUN.summary.cache,
+                forecast: {
+                    available: true,
+                    buckets: 12,
+                    local: 12,
+                    local_pct: 100,
+                    bytes_total: 9000000000,
+                    bytes_remote: 0,
+                    residency: { available: true, counts: { full: 0, index_only: 12, partial: 0, stub: 0 } },
+                },
+                warm: {
+                    mode: 'tsidx',
+                    searches: 7,
+                    failed: 0,
+                    not_started: 0,
+                    skipped_local: 1,
+                    seconds: 12.4,
+                    before: { available: true, buckets: 12, local: 3, local_pct: 25 },
+                    after: { available: true, buckets: 12, local: 12, local_pct: 100 },
+                },
+            },
+        },
+    },
     '/runs/7/samples': SAMPLES,
     '/targets/1': { id: 1, name: 'lab', mgmt_url: 'https://splunk.lab:8089', health: 'unknown' },
     '/targets/1/test': {
@@ -960,6 +999,50 @@ const go = async (hash) => {
             clickByText('Launch', 'press Launch');
             await waitFor('launch dialog: posts the typed user count', () =>
                 posted.some((p) => p.url.endsWith('/runs') && p.body && p.body.virtual_users === 25)
+            );
+        }
+    }
+
+    await settle(200);
+
+    // A run that warmed says so, and "Run again" brings its plan back as it
+    // was written, unconfirmed: nothing is launched until it is ticked again.
+    await go('#run/9');
+    await check('warm run: the run page says what the warm-up did', 'Warmed before the run from a confirmed plan');
+    await check('warm run: the forecast at the start', 'Forecast at the start: this run reads 12 bucket(s)');
+    await check('warm run: the forecast says what is on disk', '12 index files only');
+    clickByText('Run again', 'open run again for the warm run');
+    await check('warm run: run again shows the warm-up', 'You decide what gets warmed');
+    await waitFor('warm run: the plan comes back as written', () =>
+        Array.from(window.document.querySelectorAll('input')).some((i) => i.value === '-7d@d')
+    );
+    await check('warm run: the plan must be checked again', 'check it again');
+    {
+        const warmRuns = () => posted.filter((x) => x.url.endsWith('/runs') && x.body && x.body.warm_cache);
+        clickByText('Launch', 'launch before confirming the plan');
+        await settle(300);
+        if (warmRuns().length) {
+            problems.push('launch dialog: launched a warm run before the plan was confirmed');
+        } else {
+            process.stdout.write('  ok  launch dialog: no warm run launched unconfirmed\n');
+        }
+        const tick = window.document.querySelector('[data-test="checkbox"][data-test-value="warm-confirmed"]');
+        const toggle = tick && (tick.querySelector('[data-test="toggle"]') || tick.querySelector('button'));
+        if (!toggle) {
+            problems.push('launch dialog: no warm-up confirmation checkbox');
+        } else {
+            toggle.dispatchEvent(new window.MouseEvent('click', { bubbles: true, cancelable: true }));
+            await settle(100);
+            clickByText('Launch', 'launch the confirmed warm run');
+            await waitFor('launch dialog: posts the confirmed plan as written', () =>
+                warmRuns().some(
+                    (x) =>
+                        x.body.warm_confirmed === true &&
+                        x.body.warm_plan.length === 1 &&
+                        x.body.warm_plan[0].index === 'cultivar_web' &&
+                        x.body.warm_plan[0].earliest === '-7d@d' &&
+                        !x.body.evict_cache
+                )
             );
         }
     }

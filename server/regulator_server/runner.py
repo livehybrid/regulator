@@ -415,6 +415,16 @@ class RunManager:
                 "indexer_username": config.indexer_username,
                 "indexer_password": config.indexer_password,
             }
+            # A confirmed warm-up comes first and is this process's job: it is
+            # done once, here, before a single search of the run is sent.
+            warmed = None
+            with session_scope() as session:
+                row = session.get(Run, run_id)
+                warm_spec = dict(row.warm_plan_json or {}) if row is not None and row.warm_cache else None
+                warm_target_id = row.target_id if row is not None else None
+            if warm_spec and not entry.stop_requested:
+                warmed = await self._warm_before(run_id, engine.client, warm_spec, where, warm_target_id, entry)
+
             eviction = None
             if config.evict_cache:
                 if "*" in config.evict_cache_indexes:
@@ -430,6 +440,15 @@ class RunManager:
                 self._lifecycle(run_id, "cache_evicted", **{k: v for k, v in eviction.to_dict().items() if k != "errors"})
             self._cache_sample(run_id, "before", before.to_dict())
             self._lifecycle(run_id, "cache_before", **_cache_facts(before.to_dict()))
+            # What the run is about to read and how much of it is local, from
+            # that same reading: after any warm-up or eviction, so it is the
+            # state the load really starts in.
+            from . import warmup as _warmup
+
+            cache_forecast = await _warmup.forecast_for_run(
+                engine.client, scenario, before,
+                float(config.duration_s or _warmup.scenario_duration(scenario)),
+            )
 
             scheduler = Scheduler(
                 scenario=scenario,
@@ -480,6 +499,11 @@ class RunManager:
             summary.scenario_digest = scenario_digest(scenario)
 
             summary.cache = await self._cache_provenance(engine.client, before, eviction, where)
+            if isinstance(summary.cache, dict):
+                if cache_forecast is not None:
+                    summary.cache["forecast"] = cache_forecast
+                if warmed is not None:
+                    summary.cache["warm"] = warmed
             if isinstance(summary.cache, dict) and summary.cache.get("after"):
                 self._cache_sample(run_id, "after", summary.cache["after"], {"delta": summary.cache.get("delta")})
                 self._lifecycle(run_id, "cache_after", **_cache_facts(summary.cache["after"]), delta=summary.cache.get("delta"))
@@ -522,6 +546,23 @@ class RunManager:
                 await engine.close()
             except Exception:  # noqa: BLE001 - closing must not mask the result
                 log.warning("closing the engine failed", exc_info=True)
+
+    async def _warm_before(self, run_id: int, client, spec: Dict[str, Any], where: Dict[str, Any], target_id: Optional[int], entry: ActiveRun) -> Dict[str, Any]:
+        """Warm the plan the operator confirmed at launch, and nothing else.
+
+        The cache reading the run calls "before" is taken after this, so the
+        run's own delta is what its searches downloaded, not what the warm-up
+        did; the warm-up is reported beside it under ``cache.warm``.
+        """
+        from . import warmup
+        from .cachelock import evict_lock
+
+        result, state_after = await warmup.warm_before_run(
+            run_id, client, spec, where=where, lock=evict_lock(target_id or 0),
+            should_stop=lambda: entry.stop_requested,
+        )
+        warmup.record_run_warm(run_id, result, state_after)
+        return result
 
     async def _cache_provenance(self, client, before, eviction, where) -> Optional[Dict[str, Any]]:
         if not before.available:

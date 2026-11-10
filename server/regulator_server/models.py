@@ -119,6 +119,13 @@ class Run(Base):
     # as evict_cache_indexes) and how long after each one counts as cold.
     evict_every_s: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
     cold_window_s: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    # Warm a plan the operator confirmed, once, before any load is generated.
+    # The plan is kept as they wrote it ({"plan": [{index, earliest, latest}],
+    # "mode", "concurrency", "budget_s"}): relative times are resolved when
+    # the warm-up starts, and "Run again" shows the same lines to be checked
+    # again rather than yesterday's epochs.
+    warm_cache: Mapped[bool] = mapped_column(Boolean, default=False)
+    warm_plan_json: Mapped[Optional[Dict[str, Any]]] = mapped_column(JSON, nullable=True)
 
     created_at: Mapped[float] = mapped_column(Float, default=time.time)
     started_at: Mapped[Optional[float]] = mapped_column(Float, nullable=True)

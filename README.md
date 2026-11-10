@@ -843,6 +843,44 @@ The warm-up runs in the background; the audit trail records the confirmed plan,
 who started it, where the suggestion came from, and what it did, and the
 target's cache chart marks it.
 
+**Warm as part of a run.** The **Launch** dialog offers "Warm the cache before
+this run": **Suggest a plan** reads the scenario and duration chosen in the
+dialog against the chosen target, you edit and tick the plan exactly as on the
+target page, and **Launch** stays disabled until you have. The warm-up is then
+done once, by the control plane, before any load is generated, for an
+in-process run and a fleet run alike: a fleet's workers are not started until
+it has finished and are told not to warm (`REG_WARM_CACHE=0`), so a fleet of N
+is one warm-up and not N. It holds the same per-target lock as eviction and the
+Warm cache button; a run asking to warm while one of those is under way is
+refused with a 409.
+
+- The run records the plan as resolved, the forecast of that plan before and
+  after, and what the warm-up did, under `cache.warm`, as the standalone worker
+  does. The run's own `cache.before` is read after the warm-up, so the warm-up's
+  downloads are never counted as the run's, and the run's clock starts when its
+  load does.
+- A run warms or evicts, never both: `warm_cache` with `evict_cache` or
+  `evict_every_s` is refused.
+- The plan is kept on the run as you wrote it, so `-7d@d` means seven days
+  before the warm-up starts. **Run again** brings the plan back as written and
+  unticked: relative times have moved, so it has to be checked again before
+  anything is warmed.
+- A warm-up never stops the run. A search that fails, or is not started within
+  the time budget, is counted; a warm-up that fails outright (the target could
+  not be read at all) is recorded under `cache.warm.error`. Either way the run
+  goes ahead, the run page says the warm-up did not finish, and the forecast
+  says what state the load really started in. A stop pressed during the
+  warm-up ends it early.
+- Every console run, warmed or not, records `cache.forecast` as the standalone
+  worker does: what the run is about to read and how much of it is local,
+  taken from the same cache reading the run calls "before", so after any
+  warm-up or eviction. The run page states it. It costs the target two
+  `dbinspect` searches per index the run reads, at the start of the run.
+
+Over the API, `POST /api/runs` takes `warm_cache`, `warm_plan` (the lines),
+`warm_mode`, `warm_concurrency`, `warm_budget_s` and `warm_confirmed`, which
+must be true and is never set for you.
+
 From the command line, the same in two steps:
 
 ```bash
@@ -1314,6 +1352,7 @@ engine with no Splunk anywhere.
 | `savedsearches.py` | Splunk's conf grammar, relative time modifiers, cron, side-effect detection and a conservative class guess |
 | `managed.py` | A fleet member: claim, ready, heartbeat, final |
 | `server/…/fleet.py`, `drivers/` | Planning shares, the lease protocol, merging, and the Swarm, Kubernetes and fake drivers |
+| `server/…/warmup.py` | Warming a confirmed plan: the one implementation behind the Warm cache button and a run's warm-up before its load |
 | `smartstore.py` | Cache state and eviction per indexer, discovered from the search peers, with evictions confirmed rather than assumed |
 | `sut.py` | The fourteen correlation probes against the cluster's own indexes |
 | `compare.py` | Baselines, per-step deltas and the gate language |
