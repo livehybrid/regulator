@@ -26,7 +26,7 @@ import WaitSpinner from '@splunk/react-ui/WaitSpinner';
 
 import BusyButton from '../components/BusyButton';
 import Dialog from '../components/Dialog';
-import { Grid2, Mono, Muted, Note, SectionHeading } from '../components/primitives';
+import { Actions, Grid2, Mono, Muted, Note, SectionHeading } from '../components/primitives';
 import { api, isAuthError } from '../api';
 import { fmtBytes, fmtInt, fmtPct } from '../format';
 import { useNotify } from '../Notifications';
@@ -307,9 +307,9 @@ export default function WarmModal({ targetId, onClose, onDone }) {
                     ))}
                 </Table.Body>
             </Table>
-            <P>
+            <Actions>
                 <Button label="Add a line" onClick={() => edit([...rows, emptyRow()])} />
-            </P>
+            </Actions>
 
             <Grid2>
                 <ControlGroup label="Searches at once" labelPosition="top">

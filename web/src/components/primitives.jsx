@@ -53,6 +53,19 @@ export const Toolbar = styled.div`
 `;
 
 /**
+ * A form's or panel's row of buttons, as a part of it in its own right.
+ *
+ * One vertical rhythm for forms: spacingMedium between the parts (fields,
+ * actions, results), spacingSmall inside a part. A Toolbar has no margin of
+ * its own because a page head or a card footer already spaces it; a button
+ * row in the flow of a form has nothing doing that, and without this it sits
+ * hard against the control above it.
+ */
+export const Actions = styled(Toolbar)`
+    margin: ${variables.spacingMedium} 0;
+`;
+
+/**
  * The two-plus column form grid used by every dialog with more than a couple
  * of fields. auto-fit rather than a fixed count, so a narrow window collapses
  * to one column instead of scrolling sideways.

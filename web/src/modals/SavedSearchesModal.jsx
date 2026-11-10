@@ -16,14 +16,22 @@ import P from '@splunk/react-ui/Paragraph';
 import Switch from '@splunk/react-ui/Switch';
 import Text from '@splunk/react-ui/Text';
 import WaitSpinner from '@splunk/react-ui/WaitSpinner';
+import styled from 'styled-components';
+import { variables } from '@splunk/themes';
 
 import BusyButton from '../components/BusyButton';
 import Dialog from '../components/Dialog';
 import SavedSearchTable, { rowKey } from '../components/SavedSearchTable';
-import { Muted, Note, Toolbar } from '../components/primitives';
+import { Actions, Muted, Note, Toolbar } from '../components/primitives';
 import { api, apiText } from '../api';
 
 const ALL_APPS = 'All apps';
+
+// The filter belongs to the table it filters: one part, so spacingSmall
+// between them rather than the spacingMedium that separates parts.
+const FilterRow = styled(Toolbar)`
+    margin-bottom: ${variables.spacingSmall};
+`;
 
 export default function SavedSearchesModal({ target, onClose, onImport }) {
     // The target's own app is the likely one, and loading every search on
@@ -146,7 +154,7 @@ export default function SavedSearchesModal({ target, onClose, onImport }) {
                 savedsearches.conf, and a search that writes anywhere is left out unless you say
                 otherwise.
             </Note>
-            <Toolbar>
+            <Actions>
                 <ComboBox
                     value={app}
                     placeholder={apps && !apps.length ? 'app name (blank for all)' : 'Search apps'}
@@ -170,10 +178,10 @@ export default function SavedSearchesModal({ target, onClose, onImport }) {
                     disabled={!picked.length}
                     openInNewContext
                 />
-            </Toolbar>
+            </Actions>
 
             {rows !== null && rows.length > 0 && (
-                <Toolbar>
+                <FilterRow>
                     <Text
                         value={filter}
                         placeholder="Filter by name or SPL"
@@ -198,7 +206,7 @@ export default function SavedSearchesModal({ target, onClose, onImport }) {
                         {picked.length} of {rows.length} selected
                         {visible.length !== rows.length ? `, ${visible.length} shown` : ''}
                     </Muted>
-                </Toolbar>
+                </FilterRow>
             )}
 
             {loading && (

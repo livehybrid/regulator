@@ -26,6 +26,7 @@ import ReportModal from '../modals/ReportModal';
 import SavedSearchesModal from '../modals/SavedSearchesModal';
 import useLoader from '../useLoader';
 import {
+    Actions,
     Grid2,
     HealthPill,
     Mono,
@@ -811,14 +812,14 @@ function TargetForm({ target, onCancel, onSaved }) {
                 Verify TLS certificates
             </Checkbox>
 
-            <Toolbar>
+            <Actions>
                 <BusyButton
                     appearance="primary"
                     label={editing ? 'Save changes' : 'Create target'}
                     onClick={save}
                 />
                 <Button appearance="secondary" label="Cancel" onClick={onCancel} />
-            </Toolbar>
+            </Actions>
         </Panel>
     );
 }
