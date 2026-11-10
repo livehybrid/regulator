@@ -17,7 +17,7 @@ import P from '@splunk/react-ui/Paragraph';
 import Switch from '@splunk/react-ui/Switch';
 
 import useLoader from '../useLoader';
-import { Actions, Mono, Muted, Note, PageHead, Panel, RelTime, Toolbar } from '../components/primitives';
+import { Actions, Mono, Muted, Note, PageHead, Panel, RelTime } from '../components/primitives';
 import { api, apiDownloadUrl } from '../api';
 import { useNotify } from '../Notifications';
 
@@ -128,7 +128,7 @@ export default function Configuration() {
                         if that run is there too, which the shared copy below arranges.
                     </Muted>
                 </P>
-                <Toolbar>
+                <Actions>
                     <Switch
                         value="secrets"
                         selected={secrets}
@@ -145,7 +145,7 @@ export default function Configuration() {
                     >
                         Include my scenarios
                     </Switch>
-                </Toolbar>
+                </Actions>
                 <Actions>
                     <Button
                         appearance="primary"

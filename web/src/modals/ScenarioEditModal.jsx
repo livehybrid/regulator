@@ -28,7 +28,12 @@ import { Actions, Grid2, Muted, Note, Toolbar } from '../components/primitives';
 import { api } from '../api';
 import { useNotify } from '../Notifications';
 
+// A card's rows (name and switches, SPL, time range and cron) are one part,
+// so they sit spacingSmall apart rather than touching.
 const SearchCard = styled.div`
+    display: flex;
+    flex-direction: column;
+    gap: ${variables.spacingSmall};
     border: 1px solid ${variables.borderColor};
     border-radius: 4px;
     padding: ${variables.spacingSmall} ${variables.spacingMedium};
