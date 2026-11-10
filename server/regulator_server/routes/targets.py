@@ -25,6 +25,7 @@ from regulator_agent.report import target_report
 from regulator_agent.smartstore import cache_state, evict_all
 from regulator_agent.splunk import SplunkClient
 
+from .. import warmup
 from ..adapters import (
     indexer_settings,
     list_scenarios,
@@ -637,7 +638,7 @@ async def warm_target_cache(
         )
     extra = _cache_kwargs(target)
     lines = [t.to_dict() for t in plan]
-    plan_text = "; ".join(f"{l['index']} {l['earliest_iso']}..{l['latest_iso']}" for l in lines)
+    plan_text = warmup.plan_text(lines)
     job: Dict[str, Any] = {
         "state": "running",
         "plan": lines,
@@ -663,17 +664,11 @@ async def warm_target_cache(
     who = {"actor": actor_of(request), "client": request.client.host if request.client else None}
 
     async def do_warm(client: SplunkClient) -> Dict[str, Any]:
-        before = await cachewarm.plan_on_disk(client, plan, await cache_state(client, **extra))
-        planned, skipped = cachewarm.plan_searches(plan, before, body.mode, body.chunk_s)
-        result = await cachewarm.warm(
-            client, planned, mode=body.mode, concurrency=body.concurrency,
-            budget_s=body.budget_s, skipped_local=skipped,
+        result, state_after = await warmup.warm_confirmed_plan(
+            client, plan, mode=body.mode, concurrency=body.concurrency,
+            budget_s=body.budget_s, chunk_s=body.chunk_s, where=extra,
         )
-        result.plan = lines
-        state_after = await cache_state(client, **extra)
-        after = await cachewarm.plan_on_disk(client, plan, state_after)
-        result.before, result.after = before.to_dict(), after.to_dict()
-        return {"result": result.to_dict(), "cache_after": state_after.to_dict()}
+        return {"result": result, "cache_after": state_after.to_dict()}
 
     async def run_in_background() -> None:
         from ..db import session_scope
@@ -694,14 +689,9 @@ async def warm_target_cache(
             return
         result = outcome["result"]
         job.update(state="done", result=result, finished_at=_time.time())
-        before, after = result.get("before") or {}, result.get("after") or {}
         audit_record(
             "cache_warmed", target_id=target_pk, **who,
-            detail=(
-                f"{target_name}: {body.mode}: {result['searches']} search(es) in {result['seconds']}s, "
-                f"{result['failed']} failed, {result['not_started']} not started; plan buckets local "
-                f"{before.get('local_pct', 0)}% -> {after.get('local_pct', 0)}%"
-            ),
+            detail=f"{target_name}: {warmup.summary_line(result)}",
         )
         with session_scope() as scoped:
             store_cache_sample(scoped, target_pk, None, "warm", outcome["cache_after"], {"warm": {k: v for k, v in result.items() if k not in ("before", "after")}})

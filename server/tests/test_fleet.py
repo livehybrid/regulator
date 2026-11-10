@@ -690,3 +690,45 @@ def test_merging_adds_up_searches_unfinished_at_the_end():
     assert stats["unfinished"]["run_duration"]["max_ms"] == pytest.approx(90_000.0, rel=0.05)
     assert stats["steps"][0]["unfinished"] == 3
     assert stats["errors"] == 0
+
+
+def test_a_fleet_run_warms_its_confirmed_plan_once_before_any_worker_exists(client, fake_driver):
+    """The control plane warms; the workers are told not to and never do."""
+    cold = FakeSplunk(
+        port=0, base_latency_ms=2.0, jitter_ms=0.0, dispatch_latency_ms=1.0,
+        smartstore_buckets=40, smartstore_local_pct=0, smartstore_bucket_span_s=3600.0,
+    )
+    try:
+        run_id = _launch(
+            client, cold, fake_driver,
+            warm_cache=True, warm_confirmed=True,
+            warm_plan=[{"index": "main", "earliest": "-2h", "latest": "now"}],
+        )
+        headers = _bearer(run_id)
+        deadline = time.time() + 15
+        while time.time() < deadline and not fake_driver.created_groups():
+            time.sleep(0.1)
+        assert fake_driver.created_groups(), client.get(f"/api/runs/{run_id}").json().get("error")
+        # By the time a worker group exists the plan is already local.
+        warmed = cold.stats.buckets_localised
+        assert warmed > 0
+
+        claims = [
+            client.post(f"/api/agent/runs/{run_id}/claim", json={"holder": holder}, headers=headers).json()
+            for holder in ("w-a", "w-b")
+        ]
+        assert all(doc["env"]["REG_WARM_CACHE"] == "0" for doc in claims)
+        for doc in claims:
+            assert client.post(f"/api/agent/runs/{run_id}/ready", json={"slot": doc["slot"], "lease_id": doc["lease_id"]}, headers=headers).status_code == 200
+        for doc in claims:
+            summary = _summary(doc["slot"], [20.0, 30.0], 2)
+            assert client.post(f"/api/agent/runs/{run_id}/final", json={"slot": doc["slot"], "lease_id": doc["lease_id"], "summary": summary}, headers=headers).status_code == 200
+        run = _wait_terminal(client, run_id)
+        assert run["state"] == "completed", run.get("error")
+
+        warm = run["summary"]["cache"]["warm"]
+        assert warm["failed"] == 0 and warm["searches"] >= 1
+        assert warm["after"]["local"] == warm["after"]["buckets"] == warmed
+        assert run["warm_plan"]["plan"] == [{"index": "main", "earliest": "-2h", "latest": "now"}]
+    finally:
+        cold.close()

@@ -39,6 +39,7 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 import yaml
 from sqlalchemy import select
 
+from regulator_agent import cachewarm
 from regulator_agent.catrust import CA_BUNDLE_PEM_ENV, read_pem as read_ca_pem
 from regulator_agent.histogram import LatencyHistogram, merge_dicts
 from regulator_agent.results import merge_intervals
@@ -361,8 +362,10 @@ def _claim_env(run: Run, target: Target, settings: ServerConfig, share: Dict[str
         "REG_TARGET_OWNER": cfg.owner,
         "REG_TARGET_API_VERSION": cfg.api_version,
         "REG_LINT_STRICT": "1",
-        # The control plane evicts and reads the cache; workers never touch it.
+        # The control plane evicts, warms and reads the cache; workers never
+        # touch it. A fleet of workers each warming would be N warm-ups.
         "REG_EVICT_CACHE": "0",
+        "REG_WARM_CACHE": "0",
     }
     # The CA bundle travels as PEM TEXT, not as a path. A worker is its own
     # container, so the control plane's path means nothing there, and asking the
@@ -1034,6 +1037,7 @@ class FleetRun(threading.Thread):
             evict_indexes = (run.evict_cache_indexes or "").split(",") if run.evict_cache_indexes else []
             evict = bool(run.evict_cache)
             run_evict_every = float(run.evict_every_s or 0)
+            warm_spec = dict(run.warm_plan_json or {}) if run.warm_cache else None
             corpus_index = None
             duration = float(run.duration_s or 0)
             label = f"r{run.id}" + (f"-{run.label}" if run.label else "")
@@ -1049,12 +1053,17 @@ class FleetRun(threading.Thread):
         client = SplunkClient(cfg)
         await client.start()
         eviction = None
+        warmed = None
         before = None
         # A ramp-only scenario has no declared duration; the deadlines then
         # cover the longest run this control plane allows rather than
         # cutting a healthy fleet off after five minutes.
         deadline_basis = duration or float(settings.max_run_duration_s)
         try:
+            # The confirmed warm-up, once, here: before a worker exists, so
+            # none of them is held ready while it runs and none of them warms.
+            if warm_spec:
+                warmed = await self._warm_before(client, warm_spec, where, target_id)
             if evict:
                 indexes = None if "*" in evict_indexes else (evict_indexes or ([corpus_index] if corpus_index else None))
                 eviction = await evict_all(client, indexes=indexes, **where)
@@ -1152,6 +1161,8 @@ class FleetRun(threading.Thread):
                 telemetry.lifecycle("cache_after", run, self._target_name, **_cache_facts(after.to_dict()), delta=merged["cache"]["delta"])
             elif before is not None:
                 merged["cache"] = {"available": False, "reason": before.reason}
+            if warmed is not None and isinstance(merged.get("cache"), dict):
+                merged["cache"]["warm"] = warmed
             if merged.get("started_at") and merged.get("ended_at") and summaries:
                 try:
                     merged["sut"] = await correlate(
@@ -1193,6 +1204,21 @@ class FleetRun(threading.Thread):
             telemetry.run_final(run, merged, scope="fleet", target_name=self._target_name)
         finally:
             await client.close()
+
+    async def _warm_before(self, client: SplunkClient, spec: Dict[str, Any], where: Dict[str, Any], target_id: int) -> Dict[str, Any]:
+        """Warm the plan the operator confirmed at launch, and nothing else."""
+        from . import warmup
+        from .cachelock import evict_lock
+
+        try:
+            result, state_after = await warmup.warm_before_run(
+                self.run_id, client, spec, where=where, lock=evict_lock(target_id),
+                should_stop=lambda: self.stop_requested,
+            )
+        except cachewarm.PlanError as exc:
+            raise FleetError(f"the warm-up plan cannot be warmed as written: {exc}") from exc
+        warmup.record_run_warm(self.run_id, result, state_after)
+        return result
 
     async def _evict_loop(self, client: SplunkClient, where: Dict[str, Any], indexes, every_s: float, target_id: int) -> None:
         """The fleet's periodic eviction: the clock starts at T0, and every

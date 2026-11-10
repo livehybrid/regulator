@@ -27,6 +27,7 @@ import time
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 
+from regulator_agent import cachewarm
 from regulator_agent.engines import BrowserUnavailable, get_engine
 from regulator_agent.hec import HecEmitter
 from regulator_agent.params import ParameterResolver, sanitise_marker_part, sid_prefix_for
@@ -415,6 +416,16 @@ class RunManager:
                 "indexer_username": config.indexer_username,
                 "indexer_password": config.indexer_password,
             }
+            # A confirmed warm-up comes first and is this process's job: it is
+            # done once, here, before a single search of the run is sent.
+            warmed = None
+            with session_scope() as session:
+                row = session.get(Run, run_id)
+                warm_spec = dict(row.warm_plan_json or {}) if row is not None and row.warm_cache else None
+                warm_target_id = row.target_id if row is not None else None
+            if warm_spec:
+                warmed = await self._warm_before(run_id, engine.client, warm_spec, where, warm_target_id, entry)
+
             eviction = None
             if config.evict_cache:
                 if "*" in config.evict_cache_indexes:
@@ -480,6 +491,8 @@ class RunManager:
             summary.scenario_digest = scenario_digest(scenario)
 
             summary.cache = await self._cache_provenance(engine.client, before, eviction, where)
+            if warmed is not None and isinstance(summary.cache, dict):
+                summary.cache["warm"] = warmed
             if isinstance(summary.cache, dict) and summary.cache.get("after"):
                 self._cache_sample(run_id, "after", summary.cache["after"], {"delta": summary.cache.get("delta")})
                 self._lifecycle(run_id, "cache_after", **_cache_facts(summary.cache["after"]), delta=summary.cache.get("delta"))
@@ -522,6 +535,26 @@ class RunManager:
                 await engine.close()
             except Exception:  # noqa: BLE001 - closing must not mask the result
                 log.warning("closing the engine failed", exc_info=True)
+
+    async def _warm_before(self, run_id: int, client, spec: Dict[str, Any], where: Dict[str, Any], target_id: Optional[int], entry: ActiveRun) -> Dict[str, Any]:
+        """Warm the plan the operator confirmed at launch, and nothing else.
+
+        The cache reading the run calls "before" is taken after this, so the
+        run's own delta is what its searches downloaded, not what the warm-up
+        did; the warm-up is reported beside it under ``cache.warm``.
+        """
+        from . import warmup
+        from .cachelock import evict_lock
+
+        try:
+            result, state_after = await warmup.warm_before_run(
+                run_id, client, spec, where=where, lock=evict_lock(target_id or 0),
+                should_stop=lambda: entry.stop_requested,
+            )
+        except cachewarm.PlanError as exc:
+            raise RunRejected(f"the warm-up plan cannot be warmed as written: {exc}")
+        warmup.record_run_warm(run_id, result, state_after)
+        return result
 
     async def _cache_provenance(self, client, before, eviction, where) -> Optional[Dict[str, Any]]:
         if not before.available:

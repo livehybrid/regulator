@@ -290,6 +290,30 @@ export default function RunDetail({ runId, navigate, onLaunch }) {
             </Message>
         );
     }
+    // The warm-up before the run: said while it is happening, because until
+    // it ends the run has sent nothing and its clock has not started.
+    if (run.warming_since && live) {
+        const lines = ((run.warm_plan || {}).plan || []).length;
+        banners.push(
+            <Message appearance="fill" type="info" key="warming">
+                <Message.Title>Warming the cache before the run</Message.Title>
+                The confirmed plan ({fmtInt(lines)} line(s), {(run.warm_plan || {}).mode || 'tsidx'}{' '}
+                mode) is being warmed, started <RelTime value={run.warming_since} />. No load has
+                been sent yet: the run&apos;s clock starts when the warm-up ends.
+            </Message>
+        );
+    }
+    const warmed = cache.warm;
+    if (warmed && (warmed.failed > 0 || warmed.not_started > 0)) {
+        banners.push(
+            <Message appearance="fill" type="warning" key="warm-incomplete">
+                <Message.Title>The warm-up before this run did not finish</Message.Title>
+                {fmtInt(warmed.failed)} of {fmtInt(warmed.searches)} warm-up search(es) failed and{' '}
+                {fmtInt(warmed.not_started)} were not started within the time budget, so part of
+                the confirmed plan was still remote when the load began.
+            </Message>
+        );
+    }
     if (delta.provenance && delta.provenance !== 'warm') {
         banners.push(
             <Message appearance="fill" type="warning" key="cache">
@@ -318,6 +342,16 @@ export default function RunDetail({ runId, navigate, onLaunch }) {
     }
 
     const quiet = [];
+    if (warmed) {
+        quiet.push(
+            <Note key="warmed">
+                Warmed before the run from a confirmed plan ({warmed.mode}): {fmtInt(warmed.searches)}{' '}
+                search(es) in {fmtNum(warmed.seconds, 1)} s; the plan&apos;s buckets went from{' '}
+                {fmtPct((warmed.before || {}).local_pct, 0)} to {fmtPct((warmed.after || {}).local_pct, 0)}{' '}
+                local. The run&apos;s own cache figures start after the warm-up.
+            </Note>
+        );
+    }
     if (delta.provenance === 'warm') {
         quiet.push(
             <Note key="warm">

@@ -6,6 +6,11 @@
  * path through this dialog is to change nothing. Given an earlier run
  * (``initial``) it opens filled in with what that run was launched with, seed
  * included, so "Run again" repeats the same test unless something is changed.
+ *
+ * The one thing "Run again" does not repeat unasked is a warm-up. The earlier
+ * run's plan is shown, as it was written, but it has to be checked and
+ * confirmed again: its relative times have moved since, and warming is load
+ * on somebody's cluster that only a person may decide on.
  */
 import React, { useEffect, useState } from 'react';
 import PropTypes from 'prop-types';
@@ -22,7 +27,16 @@ import WaitSpinner from '@splunk/react-ui/WaitSpinner';
 
 import BusyButton from '../components/BusyButton';
 import Dialog from '../components/Dialog';
-import { Grid2, Mono, Muted, Note, SectionHeading } from '../components/primitives';
+import {
+    ForecastSummary,
+    SuggestionNotes,
+    WarmPlanTable,
+    planLines,
+    planValid,
+    rowsFromStored,
+    rowsFromSuggestion,
+} from '../components/WarmPlan';
+import { Actions, Grid2, Mono, Muted, Note, SectionHeading } from '../components/primitives';
 import { api, isAuthError } from '../api';
 import { useNotify } from '../Notifications';
 
@@ -55,6 +69,18 @@ export default function LaunchModal({ scenario, initial, onClose, onLaunched }) 
     const [evictIndexes, setEvictIndexes] = useState(fromIndexes);
     const [evictAll, setEvictAll] = useState((from.evict_cache_indexes || '').split(',').includes('*'));
     const [cacheIndexes, setCacheIndexes] = useState(null);
+    // The warm-up before the run. An earlier run's plan comes back as it was
+    // written and unconfirmed: see the note at the top of this file.
+    const fromWarm = (from.warm_cache && from.warm_plan) || null;
+    const [warm, setWarm] = useState(Boolean(fromWarm));
+    const [warmRows, setWarmRows] = useState(() => rowsFromStored(fromWarm && fromWarm.plan));
+    const [warmMode, setWarmMode] = useState((fromWarm && fromWarm.mode) || 'tsidx');
+    const [warmConcurrency, setWarmConcurrency] = useState((fromWarm && fromWarm.concurrency) || 4);
+    const [warmBudgetMin, setWarmBudgetMin] = useState(
+        fromWarm && fromWarm.budget_s ? Math.round(fromWarm.budget_s / 60) : 30
+    );
+    const [warmConfirmed, setWarmConfirmed] = useState(false);
+    const [suggestion, setSuggestion] = useState(null);
     const notify = useNotify();
 
     useEffect(() => {
@@ -133,8 +159,41 @@ export default function LaunchModal({ scenario, initial, onClose, onLaunched }) 
         };
     }, [evict, form.target_id]);
 
+    // A plan is checked against one target and one scenario. Change either
+    // and what was confirmed is no longer what would be warmed.
+    useEffect(() => {
+        setWarmConfirmed(false);
+        setSuggestion(null);
+    }, [form.target_id, form.scenario]);
+
     const set = (k) => (e, data) => setForm((f) => ({ ...f, [k]: data.value }));
     const chosenScenario = scenarios.find((s) => s.name === form.scenario);
+
+    // Any edit to the plan withdraws the confirmation: what was checked is
+    // what gets warmed, not something edited afterwards.
+    const editWarm = (next) => {
+        setWarmRows(next);
+        setWarmConfirmed(false);
+    };
+    const warmValid = planValid(warmRows);
+    const warmReady = !warm || (warmValid && warmConfirmed);
+
+    const suggestWarm = async () => {
+        const body = { scenario: form.scenario, mode: warmMode };
+        const duration = numOrUndefined(form.duration_s);
+        if (duration !== undefined && !Number.isNaN(duration)) {
+            body.duration_s = duration;
+        }
+        const r = await api(`/targets/${encodeURIComponent(form.target_id)}/warm/suggest`, {
+            method: 'POST',
+            body,
+        });
+        setSuggestion(r);
+        editWarm(rowsFromSuggestion(r.plan));
+        if (!(r.plan || []).length) {
+            notify('Nothing to suggest: what this scenario reads is already local, or not SmartStore', 'info');
+        }
+    };
 
     const launch = async () => {
         const body = {
@@ -161,6 +220,28 @@ export default function LaunchModal({ scenario, initial, onClose, onLaunched }) 
         }
         if (form.label.trim()) {
             body.label = form.label.trim();
+        }
+        // One run measures the warm path or the cold one. The server refuses
+        // both as well; saying so here keeps the plan the operator typed.
+        if (warm && (evict || body.evict_every_s)) {
+            notify(
+                'A run warms the cache or evicts it, not both: clear the eviction settings or turn the warm-up off',
+                'warning'
+            );
+            return;
+        }
+        if (warm) {
+            if (!warmReady) {
+                notify('Check the warm-up plan and tick the confirmation before launching', 'warning');
+                return;
+            }
+            body.warm_cache = true;
+            body.warm_plan = planLines(warmRows);
+            body.warm_mode = warmMode;
+            body.warm_concurrency = Number(warmConcurrency) || 4;
+            body.warm_budget_s = (Number(warmBudgetMin) || 30) * 60;
+            // Only ever set from the tick box: nothing confirms a plan for the operator.
+            body.warm_confirmed = true;
         }
         // A periodic eviction needs a scope, and the eviction list is what
         // decides it: asking for one without the other would evict nothing.
@@ -191,7 +272,9 @@ export default function LaunchModal({ scenario, initial, onClose, onLaunched }) 
             closeLabel="Cancel"
             footer={
                 !loading &&
-                !blocked && <BusyButton appearance="primary" label="Launch" onClick={launch} />
+                !blocked && (
+                    <BusyButton appearance="primary" label="Launch" disabled={!warmReady} onClick={launch} />
+                )
             }
         >
             {loading ? (
@@ -311,7 +394,95 @@ export default function LaunchModal({ scenario, initial, onClose, onLaunched }) 
                     </Note>
 
                     <SectionHeading>SmartStore cache</SectionHeading>
-                    <Checkbox checked={evict} onChange={() => setEvict((v) => !v)}>
+                    <Checkbox checked={warm} disabled={evict} onChange={() => setWarm((v) => !v)} value="warm">
+                        Warm the cache before this run, from a plan you have checked (measures the
+                        warm path)
+                    </Checkbox>
+
+                    {warm && (
+                        <>
+                            <Message appearance="fill" type="info">
+                                <Message.Title>You decide what gets warmed</Message.Title>
+                                Regulator can suggest indexes and time ranges from what this
+                                scenario&apos;s searches would read, but that is a reading of the
+                                search strings: a macro, an eventtype, a tag or a token can hide
+                                what a search really reads. Check and edit every line. The warm-up
+                                runs once, before any load, and only the lines below, as you leave
+                                them, are warmed.
+                            </Message>
+                            {fromWarm && (
+                                <Note>
+                                    This is the plan run {from.id} was launched with, as it was
+                                    written. Relative times have moved since, so check it again.
+                                </Note>
+                            )}
+                            <Grid2>
+                                <ControlGroup
+                                    label="Mode"
+                                    labelPosition="top"
+                                    help="tsidx warms index files (cheap, enough for tstats); full also reads raw events."
+                                >
+                                    <Select
+                                        value={warmMode}
+                                        onChange={(e, { value }) => {
+                                            setWarmMode(value);
+                                            setWarmConfirmed(false);
+                                        }}
+                                    >
+                                        <Select.Option value="tsidx" label="tsidx: index files only" />
+                                        <Select.Option value="full" label="full: index files and raw data" />
+                                    </Select>
+                                </ControlGroup>
+                                <ControlGroup label="Searches at once" labelPosition="top">
+                                    <NumberInput
+                                        value={warmConcurrency}
+                                        min={1}
+                                        max={16}
+                                        onChange={(e, { value }) => setWarmConcurrency(value)}
+                                    />
+                                </ControlGroup>
+                                <ControlGroup
+                                    label="Time budget in minutes"
+                                    labelPosition="top"
+                                    help="Searches not started by then are reported, not run."
+                                >
+                                    <NumberInput
+                                        value={warmBudgetMin}
+                                        min={1}
+                                        max={240}
+                                        onChange={(e, { value }) => setWarmBudgetMin(value)}
+                                    />
+                                </ControlGroup>
+                            </Grid2>
+                            <Actions>
+                                <BusyButton
+                                    label="Suggest a plan"
+                                    disabled={!form.scenario || !form.target_id}
+                                    onClick={suggestWarm}
+                                />
+                                <Muted $small>
+                                    From the scenario and duration chosen above, read against this
+                                    target&apos;s cache.
+                                </Muted>
+                            </Actions>
+                            {suggestion && (
+                                <ForecastSummary forecast={suggestion.forecast} label="What the run reads" />
+                            )}
+                            <SuggestionNotes suggestion={suggestion} />
+                            <WarmPlanTable rows={warmRows} onChange={editWarm} />
+                            <Checkbox
+                                checked={warmConfirmed}
+                                disabled={!warmValid}
+                                onChange={() => setWarmConfirmed((v) => !v)}
+                                value="warm-confirmed"
+                            >
+                                I have checked these indexes and time ranges, and want them warmed
+                                before this run
+                            </Checkbox>
+                        </>
+                    )}
+
+                    <Checkbox checked={evict} disabled={warm} onChange={() => setEvict((v) => !v)}>
                         Evict the SmartStore cache first (measures the cold path)
                     </Checkbox>
 
@@ -400,6 +571,9 @@ LaunchModal.propTypes = {
         evict_cache_indexes: PropTypes.string,
         evict_every_s: PropTypes.number,
         cold_window_s: PropTypes.number,
+        warm_cache: PropTypes.bool,
+        // The earlier run's plan as it was written: { plan, mode, concurrency, budget_s }.
+        warm_plan: PropTypes.object,
     }),
     onClose: PropTypes.func.isRequired,
     onLaunched: PropTypes.func.isRequired,

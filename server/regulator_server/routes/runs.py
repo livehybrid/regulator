@@ -16,7 +16,11 @@ from sqlalchemy.orm import Session
 
 from fastapi import Request
 
+from regulator_agent import cachewarm
+
+from .. import warmup
 from ..adapters import load_named_scenario
+from ..cachelock import evict_lock
 from ..audit import record as audit_record
 from ..config import get_settings
 from ..db import get_session
@@ -140,6 +144,11 @@ def _serialise(
         "evict_cache_indexes": run.evict_cache_indexes,
         "evict_every_s": run.evict_every_s,
         "cold_window_s": run.cold_window_s,
+        "warm_cache": bool(run.warm_cache),
+        # The plan as the operator wrote it, for the run page and "Run again".
+        "warm_plan": run.warm_plan_json,
+        # Set only while the warm-up before the run is in flight.
+        "warming_since": warmup.warming_since(run.id),
         "seed": run.seed,
         "scenario_digest": run.scenario_digest,
         "fleet": run.fleet or "inprocess",
@@ -326,6 +335,25 @@ def create_run(
                 ),
             )
 
+    warm_spec = None
+    if body.warm_cache:
+        lines = [line.model_dump() for line in body.warm_plan]
+        try:
+            resolved = cachewarm.parse_plan(lines)
+        except cachewarm.PlanError as exc:
+            raise HTTPException(status_code=422, detail=f"warm_plan: {exc}")
+        if evict_lock(target.id).locked():
+            raise HTTPException(
+                status_code=409,
+                detail="a warm-up or an eviction is already running on this target; wait for it",
+            )
+        warm_spec = {
+            "plan": lines,
+            "mode": body.warm_mode,
+            "concurrency": body.warm_concurrency,
+            "budget_s": body.warm_budget_s,
+        }
+
     run = Run(
         label=body.label,
         target_id=body.target_id,
@@ -345,6 +373,8 @@ def create_run(
         ),
         evict_every_s=body.evict_every_s,
         cold_window_s=(body.cold_window_s or (body.evict_every_s / 2.0 if body.evict_every_s else None)),
+        warm_cache=bool(warm_spec),
+        warm_plan_json=warm_spec,
         state="pending",
     )
     session.add(run)
@@ -356,7 +386,13 @@ def create_run(
         request=request,
         target_id=body.target_id,
         detail=f"run {run_id}: {body.scenario}" + (f" ({body.label})" if body.label else "")
-        + (" with cache eviction" if body.evict_cache else ""),
+        + (" with cache eviction" if body.evict_cache else "")
+        + (
+            f" with a {body.warm_mode} warm-up of a confirmed plan: "
+            f"{warmup.plan_text([t.to_dict() for t in resolved])}"
+            if warm_spec
+            else ""
+        ),
     )
 
     from ..telemetry import telemetry
