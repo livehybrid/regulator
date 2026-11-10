@@ -334,6 +334,8 @@ docker run --rm -p 8080:8080 -v regulator-data:/data \
 Add a target, and the buttons do the rest: **Test** probes it, **Report**
 describes the whole cluster and says which scenarios its data fits, **Cache**
 shows what SmartStore holds locally on every indexer, **Evict** drops it,
+**Warm cache** suggests the indexes and time ranges a scenario reads for you to
+edit and confirm, then warms exactly those,
 **Saved searches** lists what the target already runs and turns it into a
 scenario, and **Run** launches a scenario with live latency, throughput and
 queueing while it goes. A finished run can be made a **baseline** and any run
@@ -735,10 +737,126 @@ rather than a fault). Without `--index` or `--all-indexes` it refuses: there is
 no undo beyond waiting for everything to re-download, and on a shared cluster
 most of that cache belongs to other people's dashboards.
 
+**Forecast before a run.** Every window a run dispatches is a deterministic
+function of the step's time policy, the start and the duration, so the whole
+range each step can search is known before anything is dispatched. Each
+indexer's cache manager lists every bucket it holds, local or remote, with the
+time range it covers, read through the search head with
+`| rest splunk_server=* /services/admin/cacheman`. Nothing needs listing in S3
+and `dbinspect` is not needed. Intersect the two per index and the answer is
+"this run reads 412 buckets, 61% local, 38.2 GB to download, and the working set
+is 74% of the cache". Every run logs that line and records it in the summary
+under `cache.forecast`; `--cache-forecast` prints it as JSON and exits without
+running anything.
+
+```bash
+python -m regulator_agent --cache-forecast
+```
+
+Each search is read for every part that selects events, each with its own
+indexes and time range:
+
+- `index=`, `index::` and `index IN (...)` in the base search, a later
+  `| search`, and the `where` clause of `tstats` and `mstats`;
+- inline `earliest=` and `latest=` (relative, epoch, or `%m/%d/%Y:%H:%M:%S`),
+  which override the dispatch window for that part. A relative bound moves with
+  the run, so its range is taken from the first dispatch to the last;
+- parenthesised groups joined by `OR`, each with its own index and bounds:
+  `(index=a earliest=-1h) OR (index=b earliest=-7d)` reads an hour of `a` and a
+  week of `b`. Splunk binds `OR` tighter than the implicit `AND`, so in
+  `index=web (A earliest=-1h) OR (B earliest=-2h)` both groups are in `web`;
+- every subsearch (`append`, `appendcols`, `join`, `union`, `multisearch`, a
+  `[search ...]` filter, nested ones) and `map search="..."`, each read on its
+  own terms and inheriting the dispatch window where it sets no bound.
+
+Field assignments that look like bounds (`eval earliest=...`, `stats
+earliest(_time)`, text inside quotes) are not read as bounds. Generating commands
+that read no buckets (`inputlookup`, `makeresults`, `rest` and the like) add
+nothing. What cannot be seen from the search string is noted rather than guessed:
+a macro, an eventtype or a tag hides its index, a `$token$` hides a bound (the
+dispatch window is used), and absolute dates are read as UTC. A part that names
+no index falls back to the scenario's corpus index.
+
+A bucket counts as local when any indexer holding a copy has it local, which is
+an upper bound where replicas differ. A working set larger than the cache is
+called out: it cannot all be local at once.
+
+**Full or partial, from `dbinspect`.** The cache manager reports a bucket as
+`local` as soon as any of its files are, and it fetches files as a search needs
+them: Splunk's documentation says tstats and `metadata` searches do not need the
+rawdata journal, and that eviction keeps small files such as the bloomfilter.
+So the forecast also runs `| dbinspect cached=false` (the indexer's local copy)
+and `cached=true` (the remote manifest) for each index the run reads, and
+compares the sizes per bucket: `full`, `index_only` (everything but roughly the
+journal, using the cache manager's `journal_size`), `partial`, or `stub` (what
+eviction leaves). The forecast line then reads, for example, "On disk per
+dbinspect: 180 full, 220 index files only, 0 partial, 12 evicted to a stub;
+94.1 GB not yet local". `dbinspect` reads no bucket content, so asking downloads
+nothing. If the account may not run it, the forecast stands on the cache
+manager's status and says so. The size comparison is an inference from what the
+two `cached` modes examine; it is not documented, so check it on your release.
+
+**Warm from a plan you confirm.** Regulator never warms values it derived on its
+own. The forecast *suggests* a plan, a list of indexes each with an earliest and
+latest time; you check it, edit it, and only the plan as you left it is warmed.
+Reading a search string is a best effort (see above), and warming the wrong range
+is real load on somebody's cluster, so the tool proposes and the operator decides.
+
+In the console, **Warm cache** on a target opens the dialog: pick a scenario,
+**Suggest a plan** fills an editable table (index, earliest, latest) alongside
+what the forecast could not be sure of, you edit or add lines, tick that you
+have checked them, and **Warm**. Editing a line after ticking clears the tick.
+The warm-up runs in the background; the audit trail records the confirmed plan,
+who started it, where the suggestion came from, and what it did, and the
+target's cache chart marks it.
+
+From the command line, the same in two steps:
+
+```bash
+python -m regulator_agent --cache-forecast --plan-out plan.json   # a suggestion: review and edit it
+python -m regulator_agent --warm-cache --warm-plan plan.json       # warm exactly that, then exit
+REG_WARM_CACHE=1 REG_WARM_CACHE_PLAN=plan.json python -m regulator_agent   # or warm, then run
+```
+
+`plan.json` is a list of `{"index", "earliest", "latest"}` (the file `--plan-out`
+writes also carries a note and the scenario it came from). Times take ISO 8601
+(UTC unless a zone is given), an epoch, `%m/%d/%Y:%H:%M:%S`, or a Splunk modifier
+such as `-7d@d`, resolved when the warm-up starts. `--warm-plan` also takes the
+JSON inline. A plan is refused outright for a bare `*` index, a latest not after
+its earliest, or a time it cannot read; `REG_WARM_CACHE=1` without a plan, and
+`--warm-cache` without `--warm-plan`, refuse to start and say how to get one.
+
+Every warm-up search stays inside a confirmed line: its index is the line's
+index and its window a chunk of the line's range. Chunks whose buckets are
+already as local as the mode would make them are skipped. Warming uses ordinary
+oneshot searches, never the cache manager's undocumented `_localize` action,
+which community reports say stops the indexer evicting normally until it
+restarts. Which bucket files a search downloads depends on the search, hence
+two modes:
+
+| `REG_WARM_CACHE_MODE` | Search | Warms |
+|---|---|---|
+| `tsidx` (default) | `\| tstats count where index=X by _time` | Index files of every bucket in range, no raw data. Cheap. Enough for tstats and accelerated searches; raw searches still fetch the journal |
+| `full` | reads `_raw` for every event in range | Everything, at the cost of reading all the data once |
+
+There is deliberately no mode that replays the scenario's own searches: their
+inline `earliest`/`latest` could read outside the ranges you confirmed. Warming
+uses the residency where it was read: a `tsidx` warm-up skips buckets whose index
+files are already local, and `full` skips only buckets that are fully local.
+
+The warm-up is load on the target and is reported as such. It is opt-in and
+cannot be combined with `REG_EVICT_CACHE`.
+
 | Variable | Default | Notes |
 |---|---|---|
 | `REG_EVICT_CACHE` | `0` | Evict before the run, so it measures the cold path. Opt-in and never a default |
 | `REG_EVICT_CACHE_INDEXES` | the scenario's corpus index | Comma-separated. Also supplies the default index list for `--evict-cache` |
+| `REG_WARM_CACHE` | `0` | Warm a confirmed plan before the run starts. Opt-in; needs `REG_WARM_CACHE_PLAN`; not with `REG_EVICT_CACHE` |
+| `REG_WARM_CACHE_PLAN` | none | The plan to warm: a path to a JSON file, or the JSON itself. Also the default for `--warm-cache` |
+| `REG_WARM_CACHE_MODE` | `tsidx` | `tsidx` or `full`, as above |
+| `REG_WARM_CACHE_CONCURRENCY` | `4` | Warm-up searches at once |
+| `REG_WARM_CACHE_BUDGET_S` | `1800` | Stop starting warm-up searches after this long; the rest are reported as not started |
+| `REG_WARM_CACHE_CHUNK_S` | `86400` | Each warm-up search covers at most this much time, so none outlives the read timeout |
 | `REG_INDEXER_URLS` | the search peers | The cache lives on the indexers, and on a distributed target the search head has none. Empty means discover the search peers and reuse the target's credential on each; set it to name them outright |
 | `REG_INDEXER_TOKEN`, or `REG_INDEXER_USERNAME` and `REG_INDEXER_PASSWORD` | the target's | A credential valid on the indexers when the search head's is not |
 

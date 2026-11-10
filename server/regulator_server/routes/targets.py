@@ -11,12 +11,13 @@ import asyncio
 import logging
 from typing import Any, Dict, List, Optional
 
-from fastapi import APIRouter, Depends, HTTPException, Query, Request
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query, Request
 from fastapi.responses import PlainTextResponse
 from sqlalchemy import select, func
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
+from regulator_agent import cachewarm
 from regulator_agent import savedsearches as ss
 from regulator_agent.ceilings import search_ceilings
 from regulator_agent.engines.api import ApiEngine
@@ -24,7 +25,14 @@ from regulator_agent.report import target_report
 from regulator_agent.smartstore import cache_state, evict_all
 from regulator_agent.splunk import SplunkClient
 
-from ..adapters import indexer_settings, list_scenarios, scenario_summary, target_config, worker_config
+from ..adapters import (
+    indexer_settings,
+    list_scenarios,
+    load_named_scenario,
+    scenario_summary,
+    target_config,
+    worker_config,
+)
 from ..audit import record as audit_record
 from ..crypto import DecryptionError, encrypt
 from ..db import get_session
@@ -38,6 +46,8 @@ from ..schemas import (
     TargetOut,
     TargetTestResult,
     TargetUpdate,
+    WarmRequest,
+    WarmSuggestRequest,
 )
 
 log = logging.getLogger("regulator.server.targets")
@@ -442,6 +452,180 @@ async def evict_target_cache(
     for run_id in in_flight:
         manager.mark_cache_epoch(run_id, eviction)
     return outcome
+
+
+# --------------------------------------------------------------- warm-up
+#
+# The tool suggests, the operator decides. /warm/suggest reads a scenario's
+# searches and proposes indexes and time ranges; the operator edits them; /warm
+# warms exactly the edited plan, and only with confirmed set. The audit trail
+# records the plan as confirmed, by whom, and what it did.
+
+# The last warm-up per target, for GET /warm. In memory: a warm-up belongs to
+# the process running it, and a restart ends it.
+_warm_jobs: Dict[int, Dict[str, Any]] = {}
+
+
+def _scenario_duration(scenario: Any) -> float:
+    from regulator_agent.scheduler import Ramp
+
+    if scenario.load.duration_s:
+        return float(scenario.load.duration_s)
+    base = float(scenario.load.virtual_users) if scenario.load.model == "closed" else float(scenario.load.arrival_rate_per_min)
+    return Ramp(scenario.load.ramp, base).duration_s or 3600.0
+
+
+@router.post("/{target_id}/warm/suggest")
+async def suggest_warm_plan(
+    target_id: int, body: WarmSuggestRequest, session: Session = Depends(get_session)
+) -> Dict[str, Any]:
+    """A suggested warm-up plan from what a scenario's run would read.
+
+    A suggestion only. It is read from the search strings, which can hide what
+    they read (a macro, an eventtype, a token), so the operator is expected to
+    check and edit it before anything is warmed.
+    """
+    target = _get_target(session, target_id)
+    try:
+        scenario = load_named_scenario(body.scenario)
+    except (FileNotFoundError, ValueError) as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
+    duration = float(body.duration_s or _scenario_duration(scenario))
+    extra = _cache_kwargs(target)
+
+    async def suggest(client: SplunkClient) -> Dict[str, Any]:
+        import time as _time
+
+        state = await cache_state(client, **extra)
+        fc = await cachewarm.forecast_on_disk(client, scenario, state, _time.time(), duration)
+        plan = cachewarm.suggest_plan(fc, body.mode) if fc.available else []
+        return {
+            "scenario": scenario.name,
+            "duration_s": duration,
+            "mode": body.mode,
+            "plan": [t.to_dict() for t in plan],
+            "forecast": fc.to_dict(),
+        }
+
+    return await _with_client(target, suggest, ACTION_TIMEOUT_S * 2)
+
+
+@router.get("/{target_id}/warm")
+def warm_status(target_id: int, session: Session = Depends(get_session)) -> Dict[str, Any]:
+    """The last warm-up on this target: running, done or failed, and its result."""
+    target = _get_target(session, target_id)
+    return _warm_jobs.get(target.id) or {"state": "idle"}
+
+
+@router.post("/{target_id}/warm", status_code=202)
+async def warm_target_cache(
+    target_id: int,
+    body: WarmRequest,
+    request: Request,
+    background: BackgroundTasks,
+    session: Session = Depends(get_session),
+) -> Dict[str, Any]:
+    """Warm exactly the confirmed plan, in the background. Poll GET /warm."""
+    import time as _time
+
+    if not body.confirmed:
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                "confirm the plan first: check that these are the indexes and time ranges you "
+                "want warmed. Warming is load on the target and the suggestion is only a "
+                "reading of the scenario's search strings"
+            ),
+        )
+    target = _get_target(session, target_id)
+    try:
+        plan = cachewarm.parse_plan([line.model_dump() for line in body.plan])
+    except cachewarm.PlanError as exc:
+        raise HTTPException(status_code=422, detail=str(exc))
+    lock = evict_lock(target.id)
+    current = _warm_jobs.get(target.id) or {}
+    if lock.locked() or current.get("state") == "running":
+        raise HTTPException(
+            status_code=409,
+            detail="a warm-up or an eviction is already running on this target; wait for it",
+        )
+    extra = _cache_kwargs(target)
+    lines = [t.to_dict() for t in plan]
+    plan_text = "; ".join(f"{l['index']} {l['earliest_iso']}..{l['latest_iso']}" for l in lines)
+    job: Dict[str, Any] = {
+        "state": "running",
+        "plan": lines,
+        "mode": body.mode,
+        "scenario": body.scenario,
+        "started_at": _time.time(),
+        "finished_at": None,
+        "result": None,
+        "error": None,
+    }
+    _warm_jobs[target.id] = job
+    audit_record(
+        "cache_warm_started", request=request, target_id=target.id,
+        detail=f"{target.name}: {body.mode} warm-up of a confirmed plan: {plan_text}"
+        + (f" (suggested from scenario {body.scenario})" if body.scenario else ""),
+    )
+    target_name = target.name
+    target_pk = target.id
+    # The completion rows are written after the response, with no request:
+    # carry who started it so the audit trail still says.
+    from ..audit import actor_of
+
+    who = {"actor": actor_of(request), "client": request.client.host if request.client else None}
+
+    async def do_warm(client: SplunkClient) -> Dict[str, Any]:
+        before = await cachewarm.plan_on_disk(client, plan, await cache_state(client, **extra))
+        planned, skipped = cachewarm.plan_searches(plan, before, body.mode, body.chunk_s)
+        result = await cachewarm.warm(
+            client, planned, mode=body.mode, concurrency=body.concurrency,
+            budget_s=body.budget_s, skipped_local=skipped,
+        )
+        result.plan = lines
+        state_after = await cache_state(client, **extra)
+        after = await cachewarm.plan_on_disk(client, plan, state_after)
+        result.before, result.after = before.to_dict(), after.to_dict()
+        return {"result": result.to_dict(), "cache_after": state_after.to_dict()}
+
+    async def run_in_background() -> None:
+        from ..db import session_scope
+        from ..samples import store_cache_sample
+        from ..telemetry import telemetry
+
+        try:
+            async with lock:
+                outcome = await _with_client(target, do_warm, body.budget_s + EVICT_TIMEOUT_S)
+        except HTTPException as exc:
+            job.update(state="failed", error=str(exc.detail), finished_at=_time.time())
+            audit_record("cache_warm_failed", target_id=target_pk, **who, detail=f"{target_name}: {exc.detail}")
+            return
+        except Exception as exc:  # noqa: BLE001 - a failed warm-up is reported, not raised
+            log.exception("warm-up on target %s failed", target_pk)
+            job.update(state="failed", error=f"{type(exc).__name__}: {exc}", finished_at=_time.time())
+            audit_record("cache_warm_failed", target_id=target_pk, **who, detail=f"{target_name}: {exc}")
+            return
+        result = outcome["result"]
+        job.update(state="done", result=result, finished_at=_time.time())
+        before, after = result.get("before") or {}, result.get("after") or {}
+        audit_record(
+            "cache_warmed", target_id=target_pk, **who,
+            detail=(
+                f"{target_name}: {body.mode}: {result['searches']} search(es) in {result['seconds']}s, "
+                f"{result['failed']} failed, {result['not_started']} not started; plan buckets local "
+                f"{before.get('local_pct', 0)}% -> {after.get('local_pct', 0)}%"
+            ),
+        )
+        with session_scope() as scoped:
+            store_cache_sample(scoped, target_pk, None, "warm", outcome["cache_after"], {"warm": {k: v for k, v in result.items() if k not in ("before", "after")}})
+        telemetry.lifecycle(
+            "cache_warmed", None, target_name, target=target_name, mode=body.mode,
+            searches=result["searches"], failed=result["failed"], seconds=result["seconds"],
+        )
+
+    background.add_task(run_in_background)
+    return job
 
 
 # --------------------------------------------------------------- saved searches

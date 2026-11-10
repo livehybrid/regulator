@@ -38,6 +38,7 @@ import time
 from pathlib import Path
 from typing import Any, List, Optional
 
+from . import cachewarm
 from .compare import GateError, compare_runs
 from .config import Config, ConfigError, load_config, load_managed_boot
 from .engines import BrowserUnavailable, get_engine
@@ -328,6 +329,9 @@ async def _run(config: Config, args: argparse.Namespace) -> int:
     if args.evict_cache:
         return await _do_evict(config, args)
 
+    if args.warm_cache:
+        return await _do_warm(config, args)
+
     if args.target_report:
         return await _describe_target(config)
 
@@ -430,6 +434,9 @@ async def _run(config: Config, args: argparse.Namespace) -> int:
             capabilities=capabilities,
         )
 
+        if args.cache_forecast:
+            return await _forecast(config, args, scenario, engine, scheduler.duration_s)
+
         loop = asyncio.get_running_loop()
         for sig in (signal.SIGINT, signal.SIGTERM):
             with contextlib.suppress(NotImplementedError):
@@ -463,9 +470,23 @@ async def _run(config: Config, args: argparse.Namespace) -> int:
         else:
             eviction = None
 
+        warmed = None
+        if config.warm_cache:
+            try:
+                plan = _load_plan(config.warm_cache_plan or "")
+            except cachewarm.PlanError as exc:
+                log.error("REG_WARM_CACHE_PLAN: %s", exc)
+                return EXIT_FAILED
+            warmed = await _warm_plan(config, engine.client, plan)
+
         cache_before = await cache_state(engine.client, **_indexer_kwargs(config))
+        cache_forecast = None
         if cache_before.available:
             log.info(render_cache(cache_before).splitlines()[0])
+            cache_forecast = await cachewarm.forecast_on_disk(
+                engine.client, scenario, cache_before, time.time(), scheduler.duration_s
+            )
+            _log_forecast(cache_forecast)
 
         progress_task = asyncio.create_task(_progress(stats, stop_progress), name="progress")
         summary = await scheduler.run()
@@ -474,6 +495,10 @@ async def _run(config: Config, args: argparse.Namespace) -> int:
         summary.cache = await _cache_provenance(
             engine.client, cache_before, eviction, _indexer_kwargs(config)
         )
+        if summary.cache is not None and cache_forecast is not None:
+            summary.cache["forecast"] = cache_forecast.to_dict()
+        if summary.cache is not None and warmed is not None:
+            summary.cache["warm"] = warmed.to_dict()
         summary.scenario_digest = scenario_digest(scenario)
 
         # Ask the cluster its own opinion of what just happened. Best effort:
@@ -527,6 +552,152 @@ async def _run(config: Config, args: argparse.Namespace) -> int:
                     close()
         with contextlib.suppress(Exception):
             await engine.close()
+
+
+def _log_forecast(fc: "cachewarm.Forecast") -> None:
+    log.info(fc.summary_line())
+    for name, entry in sorted(fc.per_index.items()):
+        log.info(
+            "  %-24s %5d bucket(s), %5d local (%3.0f%%), %.1f GB to download",
+            name, entry.buckets, entry.local, entry.local_pct, entry.bytes_remote / 1e9,
+        )
+    for note in fc.notes:
+        log.warning("cache forecast: %s", note)
+
+
+def _load_plan(source: str) -> List["cachewarm.WarmTarget"]:
+    """A warm-up plan from a JSON file, or from the JSON itself."""
+    text = source.strip()
+    if not text:
+        raise cachewarm.PlanError("no plan given")
+    if not text.startswith(("[", "{")):
+        try:
+            text = Path(text).read_text(encoding="utf-8")
+        except OSError as exc:
+            raise cachewarm.PlanError(f"cannot read {source}: {exc}") from None
+    try:
+        raw = json.loads(text)
+    except ValueError as exc:
+        raise cachewarm.PlanError(f"not JSON: {exc}") from None
+    return cachewarm.parse_plan(raw)
+
+
+def _log_plan(plan: List["cachewarm.WarmTarget"], heading: str) -> None:
+    log.info(heading)
+    for target in plan:
+        line = target.to_dict()
+        log.info("  index=%-24s earliest=%s  latest=%s", line["index"], line["earliest_iso"], line["latest_iso"])
+
+
+async def _warm_plan(
+    config: Config, client: Any, plan: List["cachewarm.WarmTarget"]
+) -> Optional["cachewarm.WarmResult"]:
+    """Warm exactly the confirmed plan, with a forecast of it either side."""
+    if client is None:
+        log.warning("cache warm-up skipped: this engine has no REST client")
+        return None
+    where = _indexer_kwargs(config)
+    _log_plan(plan, f"cache warm-up ({config.warm_cache_mode}) of the confirmed plan:")
+    before = await cachewarm.plan_on_disk(client, plan, await cache_state(client, **where))
+    if before.available:
+        _log_forecast(before)
+    else:
+        log.warning("cache warm-up: the cache could not be read (%s); warming the plan as written", before.reason)
+    planned, skipped = cachewarm.plan_searches(plan, before, config.warm_cache_mode, config.warm_cache_chunk_s)
+    result = cachewarm.WarmResult(
+        mode=config.warm_cache_mode, plan=[t.to_dict() for t in plan], skipped_local=skipped
+    )
+    if planned:
+        log.warning(
+            "cache warm-up: %d search(es), at most %d at once within %.0fs. This is load on "
+            "the target, run before the measurement",
+            len(planned), config.warm_cache_concurrency, config.warm_cache_budget_s,
+        )
+        ran = await cachewarm.warm(
+            client, planned, mode=config.warm_cache_mode,
+            concurrency=config.warm_cache_concurrency, budget_s=config.warm_cache_budget_s,
+            skipped_local=skipped,
+        )
+        ran.plan = result.plan
+        result = ran
+    else:
+        log.info("cache warm-up: nothing to do, the plan's buckets are already local")
+    after = await cachewarm.plan_on_disk(client, plan, await cache_state(client, **where))
+    result.before, result.after = before.to_dict(), after.to_dict()
+    log.warning(
+        "cache warm-up: %d search(es) in %.0fs (%d failed, %d not started within the budget); "
+        "local %.0f%% -> %.0f%% of the plan's buckets",
+        result.searches, result.seconds, result.failed, result.not_started,
+        before.local_pct, after.local_pct,
+    )
+    for error in result.errors:
+        log.warning("cache warm-up: %s", error)
+    return result
+
+
+async def _do_warm(config: Config, args: argparse.Namespace) -> int:
+    """``--warm-cache``: warm a confirmed plan now and exit. Needs no scenario."""
+    source = args.warm_plan or config.warm_cache_plan
+    if not source:
+        log.error(
+            "--warm-cache needs a plan you have checked: --warm-plan plan.json (or "
+            "REG_WARM_CACHE_PLAN). Get a suggestion from the scenario with "
+            "`--cache-forecast --plan-out plan.json`, review and edit it, then warm it"
+        )
+        return EXIT_FAILED
+    try:
+        plan = _load_plan(source)
+    except cachewarm.PlanError as exc:
+        log.error("warm-up plan: %s", exc)
+        return EXIT_FAILED
+    engine = get_engine("api", config)
+    try:
+        await engine.start()
+        result = await _warm_plan(config, engine.client, plan)
+    finally:
+        with contextlib.suppress(Exception):
+            await engine.close()
+    if result is None:
+        return EXIT_FAILED
+    print(json.dumps(result.to_dict(), indent=2, default=str))
+    return EXIT_OK if not result.failed else EXIT_FAILED
+
+
+async def _forecast(
+    config: Config, args: argparse.Namespace, scenario: Any, engine: Any, duration_s: float,
+) -> int:
+    """``--cache-forecast``: the forecast and a suggested warm-up plan, as JSON."""
+    client = getattr(engine, "client", None)
+    if client is None:
+        log.error("the %s engine has no REST client to read the cache with", engine.name)
+        return EXIT_FAILED
+    state = await cache_state(client, **_indexer_kwargs(config))
+    fc = await cachewarm.forecast_on_disk(client, scenario, state, time.time(), duration_s)
+    _log_forecast(fc)
+    plan = cachewarm.suggest_plan(fc, config.warm_cache_mode) if fc.available else []
+    if plan:
+        _log_plan(plan, "suggested warm-up plan (check it: it is read from the search strings):")
+    payload = {**fc.to_dict(), "mode": config.warm_cache_mode, "suggested_plan": [t.to_dict() for t in plan]}
+    if args.plan_out:
+        document = {
+            "_note": (
+                "A SUGGESTION read from the scenario's searches. Check every index and time "
+                "range before warming: a macro, eventtype, tag or token can hide what a "
+                "search reads. earliest/latest take epochs, ISO 8601 (UTC unless a zone is "
+                "given) or Splunk modifiers such as -7d@d."
+            ),
+            "scenario": scenario.name,
+            "mode": config.warm_cache_mode,
+            # ISO times rather than epochs, so a person can read what they are confirming.
+            "plan": [
+                {"index": line["index"], "earliest": line["earliest_iso"], "latest": line["latest_iso"]}
+                for line in (t.to_dict() for t in plan)
+            ],
+        }
+        Path(args.plan_out).write_text(json.dumps(document, indent=2) + "\n", encoding="utf-8")
+        log.info("suggested plan written to %s: review it, then --warm-cache --warm-plan %s", args.plan_out, args.plan_out)
+    print(json.dumps(payload, indent=2, default=str))
+    return EXIT_OK if fc.available else EXIT_FAILED
 
 
 async def _cache_provenance(client, before: CacheState, eviction, where: dict) -> Optional[dict]:
@@ -733,6 +904,32 @@ def main(argv: Optional[List[str]] = None) -> int:
         ),
     )
     parser.add_argument(
+        "--cache-forecast",
+        action="store_true",
+        help=(
+            "say how many of the SmartStore buckets this scenario's run would read are "
+            "already local, as JSON, without running it"
+        ),
+    )
+    parser.add_argument(
+        "--plan-out",
+        metavar="PATH",
+        help="with --cache-forecast, write the suggested warm-up plan here for you to review and edit",
+    )
+    parser.add_argument(
+        "--warm-cache",
+        action="store_true",
+        help=(
+            "warm the SmartStore buckets in a plan you have checked (--warm-plan), then "
+            "exit. REG_WARM_CACHE_MODE picks tsidx or full"
+        ),
+    )
+    parser.add_argument(
+        "--warm-plan",
+        metavar="PATH_OR_JSON",
+        help="the warm-up plan: a JSON list of {index, earliest, latest}, as --plan-out writes",
+    )
+    parser.add_argument(
         "--target-report",
         action="store_true",
         help=(
@@ -774,7 +971,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         log.info("finished in %.1fs with exit code %d", time.time() - started, code)
         return code
 
-    if (args.target_report or args.probe_only or args.evict_cache) and not env.get(
+    if (args.target_report or args.probe_only or args.evict_cache or args.warm_cache) and not env.get(
         "REG_SCENARIO"
     ):
         # Both modes exit before a scenario is used, so requiring one would be

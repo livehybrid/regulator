@@ -234,6 +234,39 @@ class EvictRequest(BaseModel):
             )
 
 
+class WarmSuggestRequest(BaseModel):
+    """Ask what a scenario's run would read, to suggest a warm-up plan."""
+
+    scenario: str = Field(min_length=1, max_length=200)
+    duration_s: Optional[float] = Field(default=None, gt=0, le=7 * 86400)
+    mode: str = Field(default="tsidx", pattern="^(tsidx|full)$")
+
+
+class WarmLine(BaseModel):
+    """One confirmed line: an index and a range, as the operator left it.
+
+    Times are epochs, ISO 8601 or Splunk modifiers (``-7d@d``); they are
+    resolved when the warm-up starts.
+    """
+
+    index: str = Field(min_length=1, max_length=256)
+    earliest: Any
+    latest: Any = "now"
+
+
+class WarmRequest(BaseModel):
+    plan: List[WarmLine] = Field(min_length=1, max_length=100)
+    mode: str = Field(default="tsidx", pattern="^(tsidx|full)$")
+    concurrency: int = Field(default=4, ge=1, le=16)
+    budget_s: float = Field(default=1800.0, ge=10, le=4 * 3600)
+    chunk_s: float = Field(default=86400.0, ge=60, le=30 * 86400)
+    # The operator ticked "I have checked these indexes and time ranges". The
+    # plan is theirs; the suggestion it may have started from was only that.
+    confirmed: bool = False
+    # Where the suggestion came from, for the audit trail. Informational.
+    scenario: Optional[str] = Field(default=None, max_length=200)
+
+
 class ScenarioOut(BaseModel):
     name: str
     description: str

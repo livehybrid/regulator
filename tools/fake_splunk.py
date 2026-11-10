@@ -35,6 +35,7 @@ Deliberate deviations from real splunkd, all of them to keep the double useful:
 from __future__ import annotations
 
 import argparse
+import fnmatch
 import re
 import json
 import random
@@ -113,6 +114,13 @@ class FakeSplunkConfig:
     smartstore_local_pct: int = 50
     smartstore_bucket_bytes: int = 750 * 1024 * 1024
     smartstore_max_cache_size_mb: int = 76800
+    # Each index's buckets tile time backwards from start-up, newest first,
+    # this many seconds each. A search over an index pulls every remote bucket
+    # its window overlaps into the cache, which is what SmartStore does.
+    smartstore_bucket_span_s: float = 86400.0
+    # The rawdata journal's share of a bucket. A tstats downloads the rest
+    # (the index files) and not the journal, as the real cache manager does.
+    smartstore_journal_pct: int = 70
     # Indexes that /services/data/indexes/<name> reports as existing. Anything
     # else 404s, so a scenario naming an index that is not there is caught by
     # the online lint exactly as it would be against a real cluster.
@@ -174,6 +182,7 @@ class _Stats:
     oneshots: int = 0
     saved_dispatches: int = 0
     buckets_evicted: int = 0
+    buckets_localised: int = 0
     unknown_sid_answers: int = 0
     requests_by_path: Dict[str, int] = field(default_factory=dict)
     searches: List[str] = field(default_factory=list)
@@ -228,6 +237,7 @@ class FakeSplunk:
         self._jobs: Dict[str, _Job] = {}
         # bucket id -> "local" | "remote"
         self._buckets: Dict[str, str] = {}
+        self._bucket_ranges: Dict[str, Tuple[float, float]] = {}
         self._build_buckets()
         self._active: List[_Job] = []
         self._pending: List[_Job] = []
@@ -425,6 +435,7 @@ class FakeSplunk:
                 internal=internal,
             )
             self._jobs[sid] = job
+            self._localise(spl, form)
             if not internal:
                 self.stats.jobs_created += 1
                 self.stats.searches.append(spl)
@@ -682,10 +693,79 @@ class FakeSplunk:
             return
         indexes = [i for i in self.config.indexes if not i.startswith("_")] or ["main"]
         local_share = max(0, min(100, int(self.config.smartstore_local_pct)))
+        span = max(1.0, float(self.config.smartstore_bucket_span_s))
+        now = time.time()
         for n in range(total):
             index = indexes[n % len(indexes)]
             bid = f"bid|{index}~{n}~26563E6C-B883-490C-B3D1-3F65A8911B59|"
+            # Low n is local, and low n is the newest data: a cache holds what
+            # was read most recently, which is usually the most recent data.
             self._buckets[bid] = "local" if (n * 100) // total < local_share else "remote"
+            age = n // len(indexes)
+            self._bucket_ranges[bid] = (now - (age + 1) * span, now - age * span)
+
+    def _localise(self, spl: str, form: Dict[str, List[str]]) -> None:
+        """Pull the remote buckets a search reads into the cache."""
+        if not self._buckets:
+            return
+        names = {m.lower() for m in re.findall(r'index\s*=\s*"?([A-Za-z0-9_\-\*]+)', spl)}
+        if not names:
+            # Default-index searches are not modelled, and neither the cache
+            # manager reading (| rest) nor a makeresults reads a bucket.
+            return
+        if re.match(r"\s*\|\s*(dbinspect|rest|metadata|eventcount)\b", spl):
+            return  # these read no bucket content
+        index_only = bool(re.match(r"\s*\|\s*tstats\b", spl))
+        try:
+            earliest = float(_first(form, "earliest_time", "0") or 0)
+            latest = float(_first(form, "latest_time", "") or time.time())
+        except ValueError:
+            return
+        for bid, status in self._buckets.items():
+            if status == "local" or (status == "tsidx" and index_only):
+                continue
+            index = bid.split("|", 1)[1].split("~", 1)[0].lower()
+            if not any(fnmatch.fnmatchcase(index, n) for n in names):
+                continue
+            lo, hi = self._bucket_ranges.get(bid, (0.0, 0.0))
+            if lo <= latest and hi >= earliest:
+                if status == "remote":
+                    self.stats.buckets_localised += 1
+                self._buckets[bid] = "tsidx" if index_only else "local"
+
+    def _journal_bytes(self) -> int:
+        pct = max(0, min(100, int(self.config.smartstore_journal_pct)))
+        return self.config.smartstore_bucket_bytes * pct // 100
+
+    def _dbinspect(self, spl: str) -> Tuple[int, Any]:
+        """Bucket sizes on local disk (cached=false) or in the manifest (true)."""
+        names = {m.lower() for m in re.findall(r'index\s*=\s*"?([A-Za-z0-9_\-\*]+)', spl)}
+        manifest = bool(re.search(r"cached\s*=\s*(true|t|1)\b", spl, re.IGNORECASE))
+        full = self.config.smartstore_bucket_bytes
+        rows = []
+        with self._lock:
+            for bid, status in sorted(self._buckets.items()):
+                inner = bid.split("|", 1)[1].rstrip("|")
+                index = inner.split("~", 1)[0].lower()
+                if names and not any(fnmatch.fnmatchcase(index, n) for n in names):
+                    continue
+                if manifest or status == "local":
+                    size = full
+                elif status == "tsidx":
+                    size = full - self._journal_bytes()
+                else:
+                    size = 512 * 1024  # what eviction leaves: bloomfilter, metadata
+                lo, hi = self._bucket_ranges.get(bid, (0.0, 0.0))
+                rows.append({
+                    "splunk_server": "fake-idx",
+                    "bucketId": inner,
+                    "index": index,
+                    "bytes": str(size),
+                    "sizeOnDiskMB": f"{size / 1048576:.3f}",
+                    "startEpoch": str(int(lo)),
+                    "endEpoch": str(int(hi)),
+                })
+        return 200, {"messages": [], "fields": list(rows[0]) if rows else [], "results": rows}
 
     def _cacheman_list(self) -> Tuple[int, Any]:
         entries = []
@@ -695,16 +775,18 @@ class FakeSplunk:
                     "name": bid,
                     "content": {
                         "cm:bucket": {
-                            "status": status,
+                            # Any files local reads as local, as on a real
+                            # indexer: only dbinspect shows how much.
+                            "status": "remote" if status == "remote" else "local",
                             "estimated_size": self.config.smartstore_bucket_bytes,
-                            "journal_size": self.config.smartstore_bucket_bytes,
+                            "journal_size": self._journal_bytes(),
                             "cache_priority": 0,
                             "ref_count": 0,
                             "stable": True,
                             "download_status": "idle",
                             "upload_status": "idle",
-                            "earliest_time": 1600000000,
-                            "latest_time": 1700000000,
+                            "earliest_time": int(self._bucket_ranges.get(bid, (1600000000, 0))[0]),
+                            "latest_time": int(self._bucket_ranges.get(bid, (0, 1700000000))[1]),
                         },
                         "disabled": False,
                     },
@@ -804,6 +886,8 @@ class FakeSplunk:
         _sleep_ms(self.config.dispatch_latency_ms)
 
         exec_mode = _first(form, "exec_mode", "normal")
+        if exec_mode == "oneshot" and re.match(r"\s*\|\s*dbinspect\b", spl):
+            return self._dbinspect(spl)
         if exec_mode == "oneshot":
             return self._oneshot(spl, form, api_version)
 

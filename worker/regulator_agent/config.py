@@ -322,6 +322,17 @@ class Config:
     # floor. Their jobs are left running on the target for that long (never
     # past read_timeout_s). 0 cancels them at the end of the drain, as before.
     harvest_s: float = 240.0
+    # SmartStore warm-up before the measured run, from a plan the operator
+    # confirmed (indexes with earliest and latest times): a path to a JSON
+    # file, or the JSON itself. Never derived and warmed unseen: the forecast
+    # suggests a plan, a person checks it. Opt-in, like eviction, and the two
+    # are mutually exclusive. See cachewarm.py.
+    warm_cache: bool = False
+    warm_cache_plan: Optional[str] = None
+    warm_cache_mode: str = "tsidx"
+    warm_cache_budget_s: float = 1800.0
+    warm_cache_concurrency: int = 4
+    warm_cache_chunk_s: float = 86400.0
     # How long after a dispatch a 404 for that search id is taken to mean "this
     # member has not heard of the job yet" rather than "the job is gone". A
     # search head cluster behind a load balancer with no stickiness sends the
@@ -463,6 +474,24 @@ def load_config(env: Optional[Mapping[str, str]] = None) -> Config:
             f"REG_POLL_MAX_MS ({poll_max}) must be >= REG_POLL_INITIAL_MS ({poll_initial})"
         )
 
+    warm_mode = (_get(env, "REG_WARM_CACHE_MODE", "tsidx") or "tsidx").strip().lower()
+    if warm_mode not in ("tsidx", "full"):
+        raise ConfigError(
+            f"REG_WARM_CACHE_MODE must be tsidx or full, got {warm_mode!r}"
+        )
+    warm_plan = (_get(env, "REG_WARM_CACHE_PLAN") or "").strip() or None
+    if _boolean(env, "REG_WARM_CACHE", False) and not warm_plan:
+        raise ConfigError(
+            "REG_WARM_CACHE needs REG_WARM_CACHE_PLAN: the indexes and time ranges to warm, "
+            "checked by you. Get a suggested plan with "
+            "`python -m regulator_agent --cache-forecast --plan-out plan.json`, review and "
+            "edit it, then set REG_WARM_CACHE_PLAN=plan.json"
+        )
+    if _boolean(env, "REG_WARM_CACHE", False) and _boolean(env, "REG_EVICT_CACHE", False):
+        raise ConfigError(
+            "set REG_WARM_CACHE (start warm) or REG_EVICT_CACHE (start cold), not both"
+        )
+
     log_level = (_get(env, "REG_LOG_LEVEL", "INFO") or "INFO").upper()
     if log_level not in ("DEBUG", "INFO", "WARNING", "ERROR"):
         raise ConfigError(
@@ -501,6 +530,12 @@ def load_config(env: Optional[Mapping[str, str]] = None) -> Config:
         unknown_sid_grace_ms=_integer(env, "REG_UNKNOWN_SID_GRACE_MS", 10000, minimum=0),
         cache_bust=_boolean(env, "REG_CACHE_BUST", True),
         evict_cache=_boolean(env, "REG_EVICT_CACHE", False),
+        warm_cache=_boolean(env, "REG_WARM_CACHE", False),
+        warm_cache_plan=warm_plan,
+        warm_cache_mode=warm_mode,
+        warm_cache_budget_s=_number(env, "REG_WARM_CACHE_BUDGET_S", 1800.0, minimum=0.0),
+        warm_cache_concurrency=_integer(env, "REG_WARM_CACHE_CONCURRENCY", 4, minimum=1),
+        warm_cache_chunk_s=_number(env, "REG_WARM_CACHE_CHUNK_S", 86400.0, minimum=60.0),
         evict_cache_indexes=tuple(
             part.strip()
             for part in (_get(env, "REG_EVICT_CACHE_INDEXES", "") or "").split(",")
