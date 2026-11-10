@@ -356,3 +356,55 @@ def test_a_failed_access_check_runs_every_probe():
     # And an aggregate over nothing is "no matching events", not zeros.
     assert result["probes"]["our_searches"]["rows"] == []
     assert any("none of this run's searches yet" in f for f in result["findings"])
+
+
+# ------------------------------------------------- attribution by step (#18)
+
+
+def test_the_per_step_probe_reads_the_step_from_the_run_marker():
+    """The marker is the only place a dispatched search says which step it is."""
+    import re
+
+    from regulator_agent.params import cache_bust_marker
+    from regulator_agent.sut import UNATTRIBUTED_STEP
+
+    probes = {p.name: p for p in build_probes(marker_prefix_for("r7-v1.2"), "reg_r7_v1_2_")}
+    spl = probes["our_searches_by_step"].spl
+    assert spl.startswith("search index=_audit action=search info=completed")
+    # The same selection as our_searches, so the two agree on what "ours" is.
+    assert '(search_id="*reg_r7_v1_2_*" OR "reg:r7-v1.2:")' in spl
+    assert " by step " in spl and "cold_path_pct" in spl and "eliminated_buckets" in spl
+    # A record whose search string lost the marker is counted, not dropped.
+    assert UNATTRIBUTED_STEP in spl
+
+    pattern = re.search(r'rex field=search "([^"]+)"', spl).group(1)
+    assert "\\\\" not in pattern  # nothing SPL's own unescaping could change
+    extract = re.compile(pattern.replace("(?<step>", "(?P<step>"))
+    audited = "search index=main error | stats count ```" + cache_bust_marker("r7-v1.2", 3, 12, "triage.overview") + "```"
+    assert extract.search(audited).group("step") == "triage.overview"
+    # A run whose label differs only where this one has a dot is not ours.
+    other = "search index=main ```" + cache_bust_marker("r7-v1x2", 3, 12, "triage.overview") + "```"
+    assert extract.search(other) is None
+
+
+def test_findings_name_the_step_the_cold_path_cost_most():
+    from regulator_agent.sut import UNATTRIBUTED_STEP, _findings
+
+    findings = _findings(_correlation(our_searches_by_step=[
+        {"step": "triage.overview", "searches": "600", "run_time_s": "300", "cold_path_s": "123", "cache_misses": "212"},
+        {"step": "triage.detail", "searches": "600", "run_time_s": "200", "cold_path_s": "4", "cache_misses": "9"},
+        # More waiting than any step, but no step to blame it on.
+        {"step": UNATTRIBUTED_STEP, "searches": "5", "run_time_s": "900", "cold_path_s": "800", "cache_misses": "999"},
+    ]))
+    line = next(f for f in findings if f.startswith("step "))
+    assert "step triage.overview spent 41% of its run time waiting on 212 bucket-cache miss(es)" in line
+    assert "123.0s of 300.0s" in line
+
+
+def test_a_warm_run_names_no_costly_step():
+    from regulator_agent.sut import _findings
+
+    findings = _findings(_correlation(our_searches_by_step=[
+        {"step": "triage.overview", "searches": "600", "run_time_s": "300", "cold_path_s": "0", "cache_misses": "0"},
+    ]))
+    assert not any(f.startswith("step ") for f in findings)

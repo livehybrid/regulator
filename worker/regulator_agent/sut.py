@@ -114,6 +114,23 @@ class Probe:
         }
 
 
+# The row an audit record lands in when its search string does not carry the
+# run marker, so the step it belongs to cannot be read.
+UNATTRIBUTED_STEP = "(step not in the audited search)"
+
+
+def _marker_regex(marker_prefix: str) -> str:
+    """The run's marker stem as a regular expression.
+
+    The stem is already limited to letters, digits and ``_.:-`` (see
+    ``sanitise_marker_part``), so the dot is the only character that means
+    something else in a regex. A character class rather than a backslash,
+    because the pattern sits inside a double-quoted SPL string and a class
+    reads the same before and after SPL's own unescaping.
+    """
+    return marker_prefix.replace(".", "[.]")
+
+
 def build_probes(marker_prefix: str, sid_prefix: str = "") -> List[Probe]:
     """The questions.
 
@@ -171,6 +188,42 @@ def build_probes(marker_prefix: str, sid_prefix: str = "") -> List[Probe]:
                 "coalesce(rawdata_cache_hits, 0) + coalesce(rawdata_cache_misses, 0), "
                 "cache_miss_pct=if(cache_lookups > 0, round(100 * (coalesce(index_cache_misses, 0) + "
                 "coalesce(rawdata_cache_misses, 0)) / cache_lookups, 2), null())"
+            ),
+        ),
+        Probe(
+            name="our_searches_by_step",
+            description=(
+                "the same audit records split by the step each search belongs to: buckets "
+                "searched and eliminated, bucket-cache hits and misses, and the seconds each "
+                "step's searches spent waiting on misses beside their run time"
+            ),
+            # The step is read from the run marker, which is the only place a
+            # dispatched search says which step it is: the search id names the
+            # run and the worker, not the step. A record whose audited search
+            # string does not carry the marker is still counted, under a row
+            # that says so, rather than dropped: the totals then still add up
+            # to our_searches. Sorted by what the cold path cost, because
+            # oneshot returns the first 50 rows and those are the ones to keep.
+            # NOT yet confirmed on a live cluster that the comment survives
+            # into _audit's search field on every version.
+            spl=(
+                f"search index=_audit action=search info=completed {ours} "
+                f'| rex field=search "{_marker_regex(marker_prefix)}vu\\d+:i\\d+:(?<step>[A-Za-z0-9_.:-]+)" '
+                f'| eval step=coalesce(step, "{UNATTRIBUTED_STEP}") '
+                "| stats count as searches, sum(total_run_time) as run_time_s, "
+                "sum(searched_buckets) as searched_buckets, sum(eliminated_buckets) as eliminated_buckets, "
+                "sum(invocations_command_search_index_bucketcache_hit) as index_cache_hits, "
+                "sum(invocations_command_search_index_bucketcache_miss) as index_cache_misses, "
+                "sum(duration_command_search_index_bucketcache_miss) as index_miss_s, "
+                "sum(invocations_command_search_rawdata_bucketcache_hit) as rawdata_cache_hits, "
+                "sum(invocations_command_search_rawdata_bucketcache_miss) as rawdata_cache_misses, "
+                "sum(duration_command_search_rawdata_bucketcache_miss) as rawdata_miss_s by step "
+                "| eval cold_path_s=coalesce(index_miss_s, 0) + coalesce(rawdata_miss_s, 0), "
+                "cache_hits=coalesce(index_cache_hits, 0) + coalesce(rawdata_cache_hits, 0), "
+                "cache_misses=coalesce(index_cache_misses, 0) + coalesce(rawdata_cache_misses, 0), "
+                "cache_miss_pct=if(cache_hits + cache_misses > 0, round(100 * cache_misses / (cache_hits + cache_misses), 2), null()), "
+                "cold_path_pct=if(run_time_s > 0, round(100 * cold_path_s / run_time_s, 1), null()) "
+                "| sort - cold_path_s, - run_time_s"
             ),
         ),
         Probe(
@@ -583,6 +636,27 @@ def _findings(correlation: Dict[str, Any]) -> List[str]:
             )
         else:
             findings.append("every bucket-cache lookup this run's searches made was a hit: a warm run by the cluster's own account")
+
+    # And where that price was paid: the step whose searches waited longest on
+    # misses, as a share of its own run time.
+    by_step = probes.get("our_searches_by_step") or {}
+    costly = None
+    for row in (by_step.get("rows") or []) if by_step.get("available") else []:
+        try:
+            waited = float(row.get("cold_path_s") or 0)
+            run_time = float(row.get("run_time_s") or 0)
+            misses = int(float(row.get("cache_misses") or 0))
+        except (TypeError, ValueError):
+            continue
+        if waited > 0 and row.get("step") != UNATTRIBUTED_STEP and (costly is None or waited > costly[1]):
+            costly = (str(row.get("step")), waited, run_time, misses)
+    if costly is not None:
+        step, waited, run_time, misses = costly
+        share = f"{100 * waited / run_time:.0f}% of its run time" if run_time > 0 else f"{waited:.1f}s"
+        findings.append(
+            f"step {step} spent {share} waiting on {misses} bucket-cache miss(es) "
+            f"({waited:.1f}s of {run_time:.1f}s): the step the cold path cost most"
+        )
 
     queueing = first_row("queueing")
     if queueing.get("enqueued") not in (None, "", "0", 0):

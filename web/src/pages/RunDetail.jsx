@@ -31,6 +31,7 @@ import FleetLogsModal from '../modals/FleetLogsModal';
 import PromoteBaselineModal from '../modals/PromoteBaselineModal';
 import PurgeModal from '../modals/PurgeModal';
 import RunCharts from '../components/RunCharts';
+import SearchIssues from '../components/SearchIssues';
 import SutSection from '../components/SutSection';
 import WorkersSection from '../components/WorkersSection';
 import { loadText } from './Runs';
@@ -664,6 +665,8 @@ export default function RunDetail({ runId, navigate, onLaunch }) {
             )}
 
             <ComparisonPanel comparison={comparison} />
+
+            <SearchIssues stats={stats} sut={summary.sut} />
 
             <SutSection sut={summary.sut} />
 
