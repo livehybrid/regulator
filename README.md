@@ -52,13 +52,14 @@ cluster its own opinion, because the difference between "p95 went from 4 s to
 scheduled searches were skipped" is the difference between a load test and a
 benchmark.
 
-Thirteen questions, each one search against Splunk's own internal indexes
+Fourteen questions, each one search against Splunk's own internal indexes
 (the later ones follow the shape of the search-performance dashboards in
 silkyrich/cluster_health_tools, re-derived and confirmed on a live 10.4):
 
 | Probe | What it answers |
 |---|---|
 | `_audit`, this run | The cluster's own account of the searches we dispatched, matched by the marker each one carries: run times, scan counts, **startup time, bucket elimination, and the bucket-cache hits and misses with the seconds each miss cost**, which turns cache provenance into a price per search |
+| `_audit`, this run, by step | The same audit records split by the step each search names in its run marker: buckets searched and eliminated, cache hits and misses, and the seconds each step's searches waited on misses beside their run time. "The run was partly cold" becomes "this step spent 41% of its run time waiting on 212 bucket downloads" |
 | `_audit`, everything | All searches in the window, so other traffic on a shared cluster is visible rather than silently mixed in |
 | `search_telemetry` | Where the time went by phase. Indexer-side elapsed time separates a busy search head from busy indexers, which no client-side timing can |
 | Queueing, and why | The search head's own count of searches it queued, how deep and how long, and the dispatcher's reasons, which tell the instance's ceiling from a per-role quota (the client sees the same wait for both) |
@@ -73,6 +74,20 @@ records keep arriving for a minute or two after a run and correlation happens
 immediately, so reason with the aggregate probes. And **these searches are
 themselves load**: they run on the cluster under test, after the run rather than
 during it, and the run record says so rather than pretending otherwise.
+
+The run page gathers these into two panels. **Search issues** answers "what went
+wrong, and where?": per step, partial results, searches that waited in QUEUED
+with the p95 of that wait, unknown-sid responses absorbed inside the grace
+window, and errors by class (timeout, quota, auth, server, parse, other), with a
+row for the whole run and the scheduled searches the target skipped or deferred
+meanwhile. **Bucket attribution by step** is the per-step audit probe as a
+table. Its split depends on the run marker surviving into the audited search
+string, which has not been confirmed on every version: a record without it is
+counted under "(step not in the audited search)" rather than dropped, so the
+rows still add up to the run's. Waiting is added up across indexers, so a
+step's share of its run time can pass 100%. Neither panel is split by search
+head cluster member yet: which member served a request behind a load balancer
+is not something the run can tell.
 
 Everything degrades. A load-test account frequently cannot read `_audit` or
 `_introspection`, and a benchmark that refused to report because it could not
@@ -1272,7 +1287,8 @@ on a wide cluster), `ttfr_ms` (time to first result, which is what a user
 perceives), `queued_ms` (detects crossing the concurrency ceiling),
 `results_fetch_ms`, `result_bytes`, `poll_count`, `unknown_sid_count` (404s for
 the job's own sid absorbed inside `REG_UNKNOWN_SID_GRACE_MS`; the run summary
-totals them under `unknown_sid`).
+totals them under `unknown_sid`, and each step carries its own `unknown_sid`,
+`queued` and `queued_p95_ms`).
 
 **Server side, from the job's own REST record.** `run_duration_s`, `scan_count`,
 `event_count`, `result_count`, `dispatch_state`, `is_finalized`, and the derived
@@ -1330,7 +1346,7 @@ engine with no Splunk anywhere.
 | `server/…/fleet.py`, `drivers/` | Planning shares, the lease protocol, merging, and the Swarm, Kubernetes and fake drivers |
 | `server/…/warmup.py` | Warming a confirmed plan: the one implementation behind the Warm cache button and a run's warm-up before its load |
 | `smartstore.py` | Cache state and eviction per indexer, discovered from the search peers, with evictions confirmed rather than assumed |
-| `sut.py` | The thirteen correlation probes against the cluster's own indexes |
+| `sut.py` | The fourteen correlation probes against the cluster's own indexes |
 | `compare.py` | Baselines, per-step deltas and the gate language |
 
 ---

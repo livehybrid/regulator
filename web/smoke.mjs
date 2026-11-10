@@ -76,6 +76,8 @@ const RUN = {
     stats: {
         executions: 1200,
         errors: 3,
+        errors_by_class: { timeout: 2, server: 1 },
+        unknown_sid: { searches: 3, responses: 5 },
         error_rate_pct: 0.25,
         throughput_per_s: 4.2,
         elapsed_s: 285,
@@ -106,6 +108,11 @@ const RUN = {
                 executions: 600,
                 errors: 2,
                 error_rate_pct: 0.33,
+                errors_by_class: { timeout: 1 },
+                partial: 1,
+                queued: 12,
+                queued_p95_ms: 90,
+                unknown_sid: { searches: 3, responses: 5 },
                 latency: { p50_ms: 300, p95_ms: 1500 },
                 dispatch: { p95_ms: 40 },
                 ttfr: { p95_ms: 800 },
@@ -150,6 +157,29 @@ const RUN = {
                     rows: [{ savedsearch_name: 'nightly rollup', reason: 'max concurrent' }],
                 },
                 unavailable_probe: { available: false, reason: 'no access to _internal' },
+                scheduler: {
+                    available: true,
+                    description: 'Scheduled searches skipped or deferred during the run',
+                    rows: [{ status: 'skipped', reason: 'maxconcurrent', count: '340' }],
+                },
+                our_searches_by_step: {
+                    available: true,
+                    description: 'The audit records split by step',
+                    rows: [
+                        {
+                            step: 'triage.overview',
+                            searches: '600',
+                            run_time_s: '300',
+                            searched_buckets: '4100',
+                            eliminated_buckets: '9800',
+                            cache_hits: '3888',
+                            cache_misses: '212',
+                            cache_miss_pct: '5.17',
+                            cold_path_s: '123',
+                            cold_path_pct: '41',
+                        },
+                    ],
+                },
             },
         },
     },
@@ -732,6 +762,20 @@ const go = async (hash) => {
     await check('run: workers', 'pod-a');
     await check('run: epochs', 'Cache epochs');
     await check('run: what the cluster said', 'What the cluster said');
+    // The roll-up: what went wrong and on which step, and what it cost others.
+    await check('run: search issues panel', 'Search issues');
+    await check('run: unknown sids on their step', '3 / 5');
+    await check('run: queueing on its step', '12 p95 90 ms');
+    // Two errors on the step, one with a class: the other is not lost.
+    await waitFor('run: an error with no class recorded is still counted', () =>
+        Array.from(window.document.querySelectorAll('tr')).some((tr) => {
+            const cells = Array.from(tr.querySelectorAll('td')).map((td) => (td.textContent || '').trim());
+            return cells[0] === 'triage.overview' && cells.length === 11 && cells[5] === '1' && cells[10] === '1';
+        })
+    );
+    await check('run: skipped scheduled searches', '340 skipped: maxconcurrent');
+    await check('run: bucket attribution by step', 'Bucket attribution by step');
+    await check('run: the share of run time spent waiting', '41%');
     /*
      * The charts are Splunk Line components, loaded as a dynamic chunk. This
      * first check is the one with a long deadline: it covers fetching that

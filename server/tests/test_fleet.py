@@ -732,3 +732,26 @@ def test_a_fleet_run_warms_its_confirmed_plan_once_before_any_worker_exists(clie
         assert run["warm_plan"]["plan"] == [{"index": "main", "earliest": "-2h", "latest": "now"}]
     finally:
         cold.close()
+
+
+def test_merging_keeps_queueing_and_unknown_sids_on_their_step():
+    """A fleet's per-step counts are sums, and its queued p95 is over the merged buckets."""
+    docs = []
+    for slot, waits in ((0, [100.0, 110.0]), (1, [900.0])):
+        doc = _summary(slot, [20.0, 30.0], 3)
+        queued = LatencyHistogram()
+        for value in waits:
+            queued.record_ms(value)
+        step = doc["stats"]["steps"][0]
+        step["queued"] = len(waits)
+        step["unknown_sid"] = {"searches": 1, "responses": 2 + slot}
+        doc["stats"]["histograms"]["steps"]["one"]["queued"] = queued.to_dict()
+        docs.append(doc)
+    # A worker on an older build ships neither: it must merge as zeros.
+    docs.append(_summary(2, [25.0], 1))
+
+    merged = fleet.merge_summaries("r1", "s", docs, [])
+    step = merged["stats"]["steps"][0]
+    assert step["queued"] == 3
+    assert step["unknown_sid"] == {"searches": 2, "responses": 5}
+    assert step["queued_p95_ms"] == pytest.approx(900.0, rel=0.05)
