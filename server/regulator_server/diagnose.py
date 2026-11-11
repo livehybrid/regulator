@@ -50,7 +50,7 @@ LEAD_S = 60.0
 # Anything else is left out of the lookup rather than escaped.
 _SID_OK = re.compile(r"^[A-Za-z0-9_.\-]{4,200}$")
 
-PROBLEM_OUTCOMES = ("failed", "unfinished", "finished_after_end", "still_running", "partial")
+PROBLEM_OUTCOMES = ("failed", "unfinished", "finished_after_end", "still_running", "failed_after_end", "partial")
 
 
 def ledger_of(stats: Optional[Dict[str, Any]]) -> Dict[str, Any]:
@@ -104,7 +104,10 @@ def own_findings(
     stats = stats or {}
     unfinished = stats.get("unfinished") or {}
     cut = int(unfinished.get("count") or 0)
-    cut_entries = [e for e in problems if e.get("outcome") in ("unfinished", "finished_after_end", "still_running")]
+    cut_entries = [
+        e for e in problems
+        if e.get("outcome") in ("unfinished", "finished_after_end", "still_running", "failed_after_end")
+    ]
 
     if cut:
         ages = [s for s in (_seconds(e.get("service_time_ms")) for e in cut_entries) if s is not None]

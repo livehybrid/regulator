@@ -379,6 +379,7 @@ OUTCOME_FAILED = "failed"
 OUTCOME_UNFINISHED = "unfinished"
 OUTCOME_FINISHED_AFTER_END = "finished_after_end"
 OUTCOME_STILL_RUNNING = "still_running"
+OUTCOME_FAILED_AFTER_END = "failed_after_end"
 OUTCOME_PARTIAL = "partial"
 OUTCOME_SLOW = "slow"
 
@@ -531,7 +532,14 @@ class SearchLedger:
         entry = self._open.pop(id(record), None) if record is not None else None
         if entry is None:
             return
-        entry["outcome"] = OUTCOME_FINISHED_AFTER_END if finished else OUTCOME_STILL_RUNNING
+        if finished:
+            entry["outcome"] = OUTCOME_FINISHED_AFTER_END
+        elif record.dispatch_state == "FAILED":
+            # Followed to its end, and the end was a failure on the target:
+            # not the same thing as a search Regulator deleted mid-flight.
+            entry["outcome"] = OUTCOME_FAILED_AFTER_END
+        else:
+            entry["outcome"] = OUTCOME_STILL_RUNNING
         follow: Dict[str, Any] = {"finished": bool(finished), "run_duration_s": run_duration_s}
         for key, value in (
             ("dispatch_state", record.dispatch_state),

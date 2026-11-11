@@ -226,6 +226,17 @@ def test_a_followed_search_is_updated_with_how_it_ended():
     assert stats.finished_after_end == 1 and stats.still_running_at_end == 1
 
 
+def test_a_followed_search_that_failed_on_the_target_is_not_called_still_running():
+    stats = RunStats(run_id="r")
+    died = record(ok=False, error_class="cancelled", sid="s-died")
+    stats.record(died)
+    died.dispatch_state, died.messages = "FAILED", ["FATAL: search process did not exit cleanly"]
+    stats.record_after_end(None, False, record=died)
+    entry = stats.ledger.to_dict()["problems"][0]
+    assert entry["outcome"] == "failed_after_end"
+    assert entry["messages"] == ["FATAL: search process did not exit cleanly"]
+
+
 def test_a_jobs_performance_table_is_cut_down_and_kept_out_of_the_record():
     from regulator_agent.results import LEDGER_PHASES, compact_performance, ledger_entry
 
