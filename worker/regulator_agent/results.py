@@ -24,11 +24,12 @@ Three destinations, and the split matters:
 
 from __future__ import annotations
 
+import heapq
 import json
 import sys
 import time
 from dataclasses import asdict, dataclass, field
-from typing import Any, Dict, Iterable, List, Optional, TextIO
+from typing import Any, Dict, Iterable, List, Optional, Sequence, TextIO, Tuple
 
 from .histogram import LatencyHistogram
 
@@ -130,6 +131,12 @@ class StepRecord:
     # it did less, so they are flagged rather than filed as clean successes.
     partial: bool = False
     messages: Optional[List[str]] = None
+    # How far through the job was when it was last read (0..1), and the job's
+    # own performance table, as the Job Inspector shows it. Both come free
+    # with the status poll that was made anyway. Kept for the search ledger
+    # only: the table is not written to the per-search record (see to_dict).
+    done_progress: Optional[float] = None
+    performance: Optional[Dict[str, Any]] = None
 
     # Browser half, populated by the Phase 2 engine and left null by the API
     # engine. Declared here rather than in a subclass so one record shape
@@ -157,7 +164,15 @@ class StepRecord:
         return self.scan_count / self.run_duration_s
 
     def to_dict(self) -> Dict[str, Any]:
-        record = asdict(self)
+        # The performance table stays out of the per-search record: it is a
+        # few kilobytes a search, and the ledger keeps it for the searches
+        # worth opening.
+        performance, self.performance = self.performance, None
+        try:
+            record = asdict(self)
+        finally:
+            self.performance = performance
+        record.pop("performance", None)
         eps = self.events_per_s
         if eps is not None:
             record["events_per_s"] = round(eps, 2)
@@ -340,6 +355,237 @@ class StepStats:
         }
 
 
+# ---------------------------------------------------------------------------
+# The search ledger
+# ---------------------------------------------------------------------------
+#
+# A run's aggregate says how many searches failed. It cannot say which, and
+# "which" is where a diagnosis starts: a search id to look up in the target's
+# own logs. Keeping every record is not an option (a long run makes hundreds
+# of thousands), so the ledger keeps the ones somebody will want to open:
+# every search that failed, was cut off by the end of the run or came back
+# partial, up to a cap per kind, and the slowest that succeeded.
+
+# Sized so the ledger of a run that went badly stays in the low hundreds of
+# kilobytes: it travels in a fleet worker's final report and is stored with
+# the run.
+LEDGER_PER_KIND = 40
+LEDGER_PROBLEMS = 120
+LEDGER_SLOWEST = 20
+LEDGER_PHASES = 10
+LEDGER_PEERS = 16
+
+OUTCOME_FAILED = "failed"
+OUTCOME_UNFINISHED = "unfinished"
+OUTCOME_FINISHED_AFTER_END = "finished_after_end"
+OUTCOME_STILL_RUNNING = "still_running"
+OUTCOME_PARTIAL = "partial"
+OUTCOME_SLOW = "slow"
+
+_REMOTE_PREFIX = "dispatch.stream.remote."
+
+
+def compact_performance(performance: Any) -> Optional[Dict[str, Any]]:
+    """A job's performance table, cut down to what explains a slow search.
+
+    splunkd reports a component per command and per phase, each with the
+    seconds it took, how often it ran and what went in and out. The costliest
+    few are kept, and the per-indexer components (``dispatch.stream.remote.
+    <peer>``) are separated out, because "which indexer was slow" is a
+    different question from "which phase was slow".
+    """
+    if not isinstance(performance, dict) or not performance:
+        return None
+
+    def number(value: Any) -> Optional[float]:
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return None
+
+    phases: List[Dict[str, Any]] = []
+    peers: List[Dict[str, Any]] = []
+    for name, detail in performance.items():
+        if not isinstance(detail, dict):
+            continue
+        seconds = number(detail.get("duration_secs"))
+        row: Dict[str, Any] = {"name": str(name), "seconds": round(seconds, 3) if seconds is not None else None}
+        for key, source in (("invocations", "invocations"), ("input", "input_count"), ("output", "output_count")):
+            value = number(detail.get(source))
+            if value is not None:
+                row[key] = int(value)
+        if str(name).startswith(_REMOTE_PREFIX):
+            row["name"] = str(name)[len(_REMOTE_PREFIX):]
+            peers.append(row)
+        else:
+            phases.append(row)
+    phases.sort(key=lambda r: -(r["seconds"] or 0.0))
+    peers.sort(key=lambda r: -(r["seconds"] or 0.0))
+    if not phases and not peers:
+        return None
+    out: Dict[str, Any] = {"phases": phases[:LEDGER_PHASES]}
+    if len(phases) > LEDGER_PHASES:
+        out["phases_dropped"] = len(phases) - LEDGER_PHASES
+    if peers:
+        out["indexers"] = peers[:LEDGER_PEERS]
+        if len(peers) > LEDGER_PEERS:
+            out["indexers_dropped"] = len(peers) - LEDGER_PEERS
+    return out
+
+
+def _outcome(record: StepRecord) -> str:
+    if record.error_class == ERROR_CANCELLED:
+        return OUTCOME_UNFINISHED
+    if not record.ok:
+        return OUTCOME_FAILED
+    if record.partial:
+        return OUTCOME_PARTIAL
+    return OUTCOME_SLOW
+
+
+def ledger_entry(record: StepRecord, outcome: Optional[str] = None) -> Dict[str, Any]:
+    """One search as the ledger keeps it: identity, timing, counts and why."""
+
+    def ms(value: Optional[float]) -> Optional[float]:
+        return None if value is None else round(float(value), 1)
+
+    entry: Dict[str, Any] = {
+        "outcome": outcome or _outcome(record),
+        "sid": record.sid,
+        "sids": list(record.sids) if record.sids else None,
+        "step": record.step_id,
+        "persona": record.persona,
+        "engine": record.engine,
+        "slot": record.slot,
+        "vu": record.vu_id,
+        "iteration": record.iteration,
+        "started_at": round(record.started_at, 3) if record.started_at else None,
+        "service_time_ms": ms(record.service_time_ms),
+        "latency_ms": ms(record.latency_ms),
+        "dispatch_ms": ms(record.dispatch_ms),
+        "queued_ms": ms(record.queued_ms),
+        "ttfr_ms": ms(record.ttfr_ms),
+        "run_duration_s": record.run_duration_s,
+        "scan_count": record.scan_count,
+        "event_count": record.event_count,
+        "result_count": record.result_count,
+        "dispatch_state": record.dispatch_state,
+        "done_progress": record.done_progress,
+        "is_finalized": record.is_finalized or None,
+        "earliest": record.earliest,
+        "latest": record.latest,
+        "http_status": record.http_status,
+        "error_class": record.error_class,
+        "error_detail": (record.error_detail or "")[:500] or None,
+        "partial": record.partial or None,
+        "messages": [str(m)[:300] for m in (record.messages or [])[:6]] or None,
+        "unknown_sid_count": record.unknown_sid_count or None,
+        "marker": record.marker,
+        "performance": compact_performance(record.performance),
+    }
+    return {key: value for key, value in entry.items() if value is not None}
+
+
+class SearchLedger:
+    """The searches of a run worth opening one at a time. Bounded."""
+
+    def __init__(self) -> None:
+        self.problems: List[Dict[str, Any]] = []
+        self.dropped: Dict[str, int] = {}
+        self._kept: Dict[str, int] = {}
+        # (service time, tie-break, entry): a min-heap of the slowest so far.
+        self._slow: List[Tuple[float, int, Dict[str, Any]]] = []
+        self._seq = 0
+        # Unfinished entries by the record they came from, so the follow-up
+        # after the run can say how each one ended.
+        self._open: Dict[int, Dict[str, Any]] = {}
+
+    def add(self, record: StepRecord) -> None:
+        outcome = _outcome(record)
+        if outcome == OUTCOME_SLOW:
+            self._add_slow(record)
+            return
+        kind = outcome if outcome != OUTCOME_FAILED else f"failed:{record.error_class or 'other'}"
+        if self._kept.get(kind, 0) >= LEDGER_PER_KIND or len(self.problems) >= LEDGER_PROBLEMS:
+            self.dropped[kind] = self.dropped.get(kind, 0) + 1
+            return
+        self._kept[kind] = self._kept.get(kind, 0) + 1
+        entry = ledger_entry(record, outcome)
+        self.problems.append(entry)
+        if outcome == OUTCOME_UNFINISHED:
+            self._open[id(record)] = entry
+
+    def _add_slow(self, record: StepRecord) -> None:
+        took = float(record.service_time_ms or 0.0)
+        if len(self._slow) >= LEDGER_SLOWEST and took <= self._slow[0][0]:
+            return
+        self._seq += 1
+        item = (took, self._seq, ledger_entry(record, OUTCOME_SLOW))
+        if len(self._slow) < LEDGER_SLOWEST:
+            heapq.heappush(self._slow, item)
+        else:
+            heapq.heapreplace(self._slow, item)
+
+    def after_end(self, record: Optional[StepRecord], run_duration_s: Optional[float], finished: bool) -> None:
+        """How an unfinished search ended once the run stopped waiting for it."""
+        entry = self._open.pop(id(record), None) if record is not None else None
+        if entry is None:
+            return
+        entry["outcome"] = OUTCOME_FINISHED_AFTER_END if finished else OUTCOME_STILL_RUNNING
+        follow: Dict[str, Any] = {"finished": bool(finished), "run_duration_s": run_duration_s}
+        for key, value in (
+            ("dispatch_state", record.dispatch_state),
+            ("done_progress", record.done_progress),
+            ("scan_count", record.scan_count),
+            ("event_count", record.event_count),
+            ("result_count", record.result_count),
+        ):
+            if value is not None:
+                follow[key] = value
+                entry[key] = value
+        if run_duration_s is not None:
+            entry["run_duration_s"] = run_duration_s
+        if record.messages:
+            entry["messages"] = [str(m)[:300] for m in record.messages[:6]]
+        performance = compact_performance(record.performance)
+        if performance:
+            entry["performance"] = performance
+        entry["after_end"] = follow
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "problems": list(self.problems),
+            "slowest": [item[2] for item in sorted(self._slow, key=lambda i: -i[0])],
+            "dropped": dict(self.dropped),
+            "limits": {"per_kind": LEDGER_PER_KIND, "problems": LEDGER_PROBLEMS, "slowest": LEDGER_SLOWEST},
+        }
+
+
+def merge_ledgers(documents: Sequence[Any]) -> Dict[str, Any]:
+    """One ledger from a fleet's: the same caps, applied to the union."""
+    problems: List[Dict[str, Any]] = []
+    slowest: List[Dict[str, Any]] = []
+    dropped: Dict[str, int] = {}
+    for document in documents:
+        if not isinstance(document, dict):
+            continue
+        problems.extend(e for e in (document.get("problems") or []) if isinstance(e, dict))
+        slowest.extend(e for e in (document.get("slowest") or []) if isinstance(e, dict))
+        for kind, count in (document.get("dropped") or {}).items():
+            dropped[kind] = dropped.get(kind, 0) + int(count or 0)
+    problems.sort(key=lambda e: float(e.get("started_at") or 0.0))
+    if len(problems) > LEDGER_PROBLEMS:
+        dropped["over the fleet cap"] = dropped.get("over the fleet cap", 0) + len(problems) - LEDGER_PROBLEMS
+        problems = problems[:LEDGER_PROBLEMS]
+    slowest.sort(key=lambda e: -float(e.get("service_time_ms") or 0.0))
+    return {
+        "problems": problems,
+        "slowest": slowest[:LEDGER_SLOWEST],
+        "dropped": dropped,
+        "limits": {"per_kind": LEDGER_PER_KIND, "problems": LEDGER_PROBLEMS, "slowest": LEDGER_SLOWEST},
+    }
+
+
 class RunStats:
     """Live aggregate over a whole run.
 
@@ -361,6 +607,8 @@ class RunStats:
         self.executions = 0
         self.errors = 0
         self.errors_by_class: Dict[str, int] = {}
+        # The searches worth opening one at a time. See SearchLedger.
+        self.ledger = SearchLedger()
         # Successful executions only. See StepStats.add for why.
         self.overall_latency = LatencyHistogram()
         self.failure_latency = LatencyHistogram()
@@ -457,6 +705,7 @@ class RunStats:
                 self.epoch_executions[self.epoch] = self.epoch_executions.get(self.epoch, 0) + 1
         stats.add(record, phase)
         self.interval.add(record)
+        self.ledger.add(record)
 
         if record.error_class == ERROR_CANCELLED:
             # Unfinished, not failed. Kept out of executions, errors, the
@@ -501,8 +750,11 @@ class RunStats:
         self.interval.loop_lag.record_ms(lag_ms)
         self.max_loop_lag_ms = max(self.max_loop_lag_ms, lag_ms)
 
-    def record_after_end(self, run_duration_s: Optional[float], finished: bool) -> None:
+    def record_after_end(
+        self, run_duration_s: Optional[float], finished: bool, record: Optional[StepRecord] = None
+    ) -> None:
         """One abandoned search the harvest followed up after the run."""
+        self.ledger.after_end(record, run_duration_s, finished)
         if finished:
             self.finished_after_end += 1
             if run_duration_s is not None:

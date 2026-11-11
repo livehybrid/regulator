@@ -41,7 +41,7 @@ from sqlalchemy import select
 
 from regulator_agent.catrust import CA_BUNDLE_PEM_ENV, read_pem as read_ca_pem
 from regulator_agent.histogram import LatencyHistogram, merge_dicts
-from regulator_agent.results import merge_intervals
+from regulator_agent.results import merge_intervals, merge_ledgers
 from regulator_agent.scenario import Scenario, load_scenario
 from regulator_agent.smartstore import cache_state, delta as cache_delta, evict_all
 from regulator_agent.splunk import SplunkClient
@@ -853,6 +853,7 @@ def merge_summaries(run_label: str, scenario: str, summaries: Sequence[Dict[str,
         "arrivals_shed": total("arrivals_shed"),
         "arrivals_skipped": total("arrivals_skipped"),
         "workers": len(summaries),
+        "searches": merge_ledgers([st.get("searches") for st in stats_list]),
     }
     first = summaries[0] if summaries else {}
     target = (first.get("stats") or {}).get("target")

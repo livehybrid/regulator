@@ -66,6 +66,7 @@ const RUN = {
     scenario: 'dashboard-triage',
     target_id: 1,
     target_name: 'lab',
+    target_web_url: 'https://splunk.lab:8000/',
     state: 'completed',
     fleet: 'k8s',
     fleet_state: 'done',
@@ -78,6 +79,68 @@ const RUN = {
         errors: 3,
         errors_by_class: { timeout: 2, server: 1 },
         unknown_sid: { searches: 3, responses: 5 },
+        // The ledger: the searches worth opening one at a time.
+        searches: {
+            problems: [
+                {
+                    outcome: 'still_running',
+                    sid: 'reg_r7_0_ab12cd_41',
+                    step: 'triage.overview',
+                    persona: 'analyst',
+                    vu: 3,
+                    iteration: 12,
+                    started_at: 1757000410,
+                    service_time_ms: 203000,
+                    dispatch_ms: 40,
+                    dispatch_state: 'RUNNING',
+                    done_progress: 0.62,
+                    scan_count: 81234567,
+                    event_count: 1200,
+                    error_class: 'cancelled',
+                    error_detail: 'the run ended while this search was still in flight',
+                    after_end: { finished: false, dispatch_state: 'RUNNING', done_progress: 0.62 },
+                    performance: {
+                        phases: [
+                            { name: 'command.search.rawdata', seconds: 150.5, invocations: 40, input: 0, output: 1200 },
+                            { name: 'command.search.index', seconds: 31.25, invocations: 40 },
+                        ],
+                        indexers: [{ name: 'idx-east-1', seconds: 170.1, output: 900 }],
+                    },
+                },
+                {
+                    outcome: 'failed',
+                    step: 'triage.overview',
+                    persona: 'analyst',
+                    vu: 1,
+                    iteration: 2,
+                    started_at: 1757000030,
+                    service_time_ms: 55,
+                    http_status: 503,
+                    error_class: 'server',
+                    error_detail: 'dispatch: HTTP 503 Service Unavailable',
+                },
+            ],
+            slowest: [
+                {
+                    outcome: 'slow',
+                    sid: 'reg_r7_1_ef34ab_9',
+                    step: 'triage.overview',
+                    persona: 'analyst',
+                    vu: 1000002,
+                    iteration: 4,
+                    slot: 1,
+                    started_at: 1757000100,
+                    service_time_ms: 187400,
+                    run_duration_s: 186.9,
+                    dispatch_state: 'DONE',
+                    scan_count: 64000000,
+                    event_count: 900,
+                    result_count: 20,
+                },
+            ],
+            dropped: { 'failed:server': 4 },
+            limits: { per_kind: 40, problems: 120, slowest: 20 },
+        },
         error_rate_pct: 0.25,
         throughput_per_s: 4.2,
         elapsed_s: 285,
@@ -126,6 +189,31 @@ const RUN = {
     summary: {
         valid: true,
         outcome: 'completed',
+        diagnosis: {
+            at: 1757000900,
+            sids: 2,
+            own: ['1 search(es) were still running when the run stopped waiting for them.'],
+            target: ['1 were recorded as canceled after 301s of run time, as svc_regulator.'],
+            window: { earliest: 1756999940, latest: 1757001080 },
+            queries: [
+                { name: 'audit', description: 'what _audit recorded for each search', available: true, rows: 2, searches: 1 },
+                {
+                    name: 'indexers',
+                    description: 'what each indexer did for each search (splunkd_remote_searches)',
+                    available: false,
+                    reason: 'HTTP 403: this account cannot read _internal',
+                    rows: 0,
+                    searches: 1,
+                },
+            ],
+            searches: {
+                reg_r7_0_ab12cd_41: {
+                    audit: { ended: 'canceled', info: 'granted,canceled', user: 'svc_regulator', total_run_time: 301.2 },
+                    logs: [{ component: 'DispatchManager', log_level: 'WARN', count: 2, message: 'quota wait for reg_r7_0_ab12cd_41' }],
+                },
+            },
+            self_load: { queries: 3 },
+        },
         load_model: 'closed',
         effective_seed: 42,
         scenario_digest: 'abc123',
@@ -784,6 +872,46 @@ const go = async (hash) => {
     );
     await check('run: skipped scheduled searches', '340 skipped: maxconcurrent');
     await check('run: bucket attribution by step', 'Bucket attribution by step');
+    // The ledger: which searches, by id, and what a diagnosis found about them.
+    await check('run: the search ledger', 'Searches to look at');
+    await check('run: a search cut off at the end, by id', 'reg_r7_0_ab12cd_41');
+    await check('run: what happened to it', 'Cut off at the end, still running when deleted');
+    await check('run: what the target recorded for it', 'target: cancelled');
+    await check('run: a refused search has a class and no id', 'Failed: server');
+    await check('run: the ledger says it is a sample', '4 more with a problem');
+    await check('run: the slowest that completed', 'reg_r7_1_ef34ab_9');
+    await check('run: the diagnosis, from the run', 'still running when the run stopped waiting');
+    await check('run: the diagnosis, from the target', 'recorded as canceled after 301s');
+    await check('run: a question the target would not answer', 'this account cannot read _internal');
+    await check('run: diagnose can be asked again', 'Diagnose again');
+    // Open the search: what the job said of itself, what the target said, and
+    // a way to the target's own records of it.
+    {
+        const row = Array.from(window.document.querySelectorAll('tr')).find((tr) =>
+            (tr.textContent || '').includes('reg_r7_0_ab12cd_41')
+        );
+        const toggle = row && row.querySelector('button');
+        if (toggle) {
+            toggle.dispatchEvent(new window.MouseEvent('click', { bubbles: true, cancelable: true }));
+        } else {
+            problems.push('run: the ledger row has nothing to open it with');
+        }
+    }
+    await check('run: an open search says how far the job had got', 'RUNNING, 62% done');
+    await check('run: an open search says where the time went', 'command.search.rawdata');
+    await check('run: an open search has the audit trail', 'cancelled (as svc_regulator)');
+    await check('run: an open search has what splunkd logged', 'DispatchManager');
+    await waitFor('run: an open search links to the target, over the run', () =>
+        Array.from(window.document.querySelectorAll('a')).some((a) => {
+            const href = a.getAttribute('href') || '';
+            return (
+                href.startsWith('https://splunk.lab:8000/app/search/search?q=search%20index%3D_audit') &&
+                href.includes('reg_r7_0_ab12cd_41') &&
+                href.includes('earliest=1756999940') &&
+                href.includes('latest=1757001080')
+            );
+        })
+    );
     await check('run: the share of run time spent waiting', '41%');
     /*
      * The charts are Splunk Line components, loaded as a dynamic chunk. This

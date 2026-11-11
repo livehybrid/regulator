@@ -89,6 +89,49 @@ step's share of its run time can pass 100%. Neither panel is split by search
 head cluster member yet: which member served a request behind a load balancer
 is not something the run can tell.
 
+Below them, **Searches to look at** lists individual searches by search id:
+every one that failed, was cut off by the end of the run or came back partial
+(up to 40 of each kind, with a count of the rest), and the 20 slowest that
+completed. A row opens to what the job said about itself, taken from the status
+poll Regulator made anyway: state and progress, run time, scanned, event and
+result counts, its messages, and its performance table as the Job Inspector
+shows it (the costliest phases, and what each indexer streamed back). The job
+itself is deleted once read, so the Job Inspector cannot open it; with a web
+address on the target, each search links to the target's own records of it.
+
+**Diagnose** is offered once the run is over and is refused while anything is
+running on the target. It first reads the run's own record, which costs the
+target nothing and settles the commonest question (see below). Then it asks the
+target about the listed search ids and nothing else, in three small searches
+over the time of the run: what `_audit` recorded for each (how it ended, as
+whom, run time, counts, buckets searched and eliminated, bucket cache misses),
+what each indexer did for it (`splunkd_remote_searches`: seconds, scanned,
+events, buckets, cache misses and the time spent waiting on them) and what
+splunkd logged about it at WARN or ERROR. The answer is kept on the run. The
+indexer question has not been confirmed on a live cluster on every version: a
+field a version does not write comes back empty rather than wrong. **Events per
+index is not available**: splunkd does not keep it for a finished search
+outside the job's own `search.log`.
+
+### A search "cancelled" at the end of a run
+
+Regulator gives a search no time limit of its own while a run is going. The
+only cut-off is the end of the run: searches still in flight then get
+`REG_DRAIN_BUDGET_S` (60 s) to finish and be measured like any other. One still
+running after that is counted as **unfinished**, not as an error, and its record
+carries `error_class=cancelled`. After a run that completed normally Regulator
+keeps following it for `REG_HARVEST_S` (240 s), reports its run time if it
+finishes, and deletes it either way, which the target's audit trail records as
+canceled if it was still running. A stopped or aborted run deletes its searches
+at once.
+
+So how old a search is when this happens depends on when it started, not on how
+long it takes: in a 140 s run, a search dispatched in the first seconds is cut
+off at 200 s. To let long searches finish, make the run comfortably longer than
+its slowest search, or raise `REG_DRAIN_BUDGET_S` (they are then measured in
+full) and `REG_HARVEST_S`. Set both on the control plane: it passes them to
+fleet workers and widens its own deadlines to match.
+
 Everything degrades. A load-test account frequently cannot read `_audit` or
 `_introspection`, and a benchmark that refused to report because it could not
 also ask the cluster's opinion would be worse than useless. Each probe that
@@ -462,6 +505,7 @@ the environment; everything downstream of the claim is the standalone code.
 | `REG_SCENARIO_UPLOAD_MAX_ARCHIVE_BYTES` and friends | 16 MiB | Extraction-bomb caps for an uploaded scenario archive (`_MAX_MEMBERS` 2000, `_MAX_MEMBER_BYTES` 8 MiB, `_MAX_TOTAL_BYTES` 32 MiB). Enforced on the bytes produced while streaming, never on the sizes the archive declares |
 | `REG_MAX_VIRTUAL_USERS` | `500` | The in-process ceiling described above. The open model is held to the same ceiling of in-flight searches |
 | `REG_MAX_CONCURRENT_RUNS` | `2` | Runs in flight at once, in-process and fleet together. More at once would mean measuring contention between your own tests; the shipped stack and Kubernetes manifest set it to `1` |
+| `REG_DRAIN_BUDGET_S`, `REG_HARVEST_S` | `60`, `240` | How long searches still in flight at the end of a run may finish and be measured, and how long the ones still running after that are followed before they are deleted. Used for console runs, passed to fleet workers, and added to the control plane's lost-worker deadlines. See "A search cancelled at the end of a run" |
 | `REG_MAX_PAUSE_S` | `1800` | The longest a run may spend paused in total. Past it the run is **stopped**, not resumed: whoever paused it may have done so to protect the cluster. `0` removes the limit. Also added to a Kubernetes fleet Job's deadline, which is fixed when the Job is created |
 | `REG_MAX_RUN_DURATION_S` | `14400` | The longest run accepted, so a mistyped duration cannot hold a slot for ever |
 | `REG_SESSION_TTL_S` | `43200` | Sessions are bound to the password as well as the key: changing the password signs everyone out |
@@ -655,7 +699,8 @@ deployment disposable and a CI job a single `docker run`.
 | `REG_DURATION_S` | from the scenario | |
 | `REG_SEED` | from the scenario | Reseeds every draw (parameters, persona assignment, think time, jitter) and is recorded as `effective_seed`. Overriding it changes the workload, so two runs with different seeds are not comparable and the comparison says so |
 | `REG_MAX_IN_FLIGHT` | `512` | Open model shedding ceiling. Hitting it invalidates the run |
-| `REG_DRAIN_BUDGET_S` | `60` | How long in-flight searches may finish after the run ends. Anything still running is recorded as an abandoned failure with the time it had accrued, never silently dropped |
+| `REG_DRAIN_BUDGET_S` | `60` | How long in-flight searches may finish after the run ends. Anything still running is counted as unfinished (not as an error) with the time it had accrued, never silently dropped |
+| `REG_HARVEST_S` | `240` | After a run that completed normally, how long to keep following the searches the drain abandoned, so their real run time is reported. Each is followed for this long however old it already was, then deleted. `0` deletes them at the end of the drain |
 | `REG_LINT_STRICT` | `1` | `0` downgrades blocking lint to warnings |
 | `REG_SUT_SETTLE_S` | `8` | How long to wait for the target's own logging before asking it about the run |
 

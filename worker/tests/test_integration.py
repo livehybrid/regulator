@@ -681,6 +681,46 @@ def test_with_no_harvest_the_job_is_deleted_at_the_end_of_the_drain(env):
     assert stats.jobs_deleted >= 1
 
 
+def test_a_search_older_than_the_read_timeout_is_still_followed(env):
+    """The follow-up is bounded by its own budget and nothing else.
+
+    It used to stop at read_timeout_s from the job's dispatch as well, which
+    deleted any search that had already been running that long the moment
+    the run ended, however generous REG_HARVEST_S was.
+    """
+    summary, _ = _slow_run(env, REG_HARVEST_S="10", REG_READ_TIMEOUT_S="1")
+    s = summary.stats
+    assert s["abandoned"] == 1
+    assert s["unfinished"]["finished_after_end"] == 1
+    assert s["unfinished"]["still_running"] == 0
+
+
+def test_the_ledger_names_a_search_cut_off_at_the_end_and_says_how_it_ended(env):
+    summary, _ = _slow_run(env, REG_HARVEST_S="10")
+    ledger = summary.stats["searches"]
+    assert len(ledger["problems"]) == 1
+    entry = ledger["problems"][0]
+    # A search id to look up, how old it was when the run stopped waiting,
+    # and what became of it afterwards.
+    assert entry["sid"] and entry["step"]
+    assert entry["outcome"] == "finished_after_end"
+    assert entry["error_class"] == "cancelled"
+    assert 900 <= entry["service_time_ms"] <= 2400
+    assert entry["after_end"]["finished"] is True
+    assert entry["run_duration_s"] >= 2.0
+    assert entry["dispatch_state"] == "DONE"
+    # Where the job's time went, from the same status read that said DONE.
+    phases = {row["name"] for row in entry["performance"]["phases"]}
+    assert "command.search" in phases
+    assert {row["name"] for row in entry["performance"]["indexers"]} == {"idx-a", "idx-b"}
+
+
+def test_the_ledger_says_so_when_a_search_was_deleted_unfinished(env):
+    summary, _ = _slow_run(env, REG_HARVEST_S="0")
+    entry = summary.stats["searches"]["problems"][0]
+    assert entry["outcome"] == "unfinished" and "after_end" not in entry
+
+
 # ------------------------------------------- a cluster member that has not heard
 
 

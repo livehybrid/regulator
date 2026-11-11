@@ -141,6 +141,9 @@ class JobStatus:
     earliest_time: Optional[str] = None
     latest_time: Optional[str] = None
     search: Optional[str] = None
+    # The job's own performance table (what the Job Inspector shows), as
+    # splunkd sent it. Not copied or parsed here: most polls never need it.
+    performance: Optional[Dict[str, Any]] = None
 
     @property
     def is_terminal(self) -> bool:
@@ -781,6 +784,7 @@ class SplunkClient:
             earliest_time=(str(content["earliestTime"]) if content.get("earliestTime") else None),
             latest_time=(str(content["latestTime"]) if content.get("latestTime") else None),
             search=(str(content["search"]) if content.get("search") else None),
+            performance=(content.get("performance") if isinstance(content.get("performance"), dict) else None),
         )
 
     async def _fetch(

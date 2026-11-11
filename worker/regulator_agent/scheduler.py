@@ -585,8 +585,8 @@ class Scheduler:
                 return
             self.stats.freeze()
             self._ended_wall = time.time()
-            for _record, run_duration_s, finished in await harvest(budget, self._harvest_abort):
-                self.stats.record_after_end(run_duration_s, finished)
+            for record, run_duration_s, finished in await harvest(budget, self._harvest_abort):
+                self.stats.record_after_end(run_duration_s, finished, record=record)
         except Exception as exc:  # noqa: BLE001 - the harvest never fails a run
             log.warning("following up unfinished searches failed: %s", exc)
 
@@ -1170,6 +1170,9 @@ class Scheduler:
             outcome = OUTCOME_COMPLETED
 
         snapshot = self.stats.snapshot(include_histograms=self.wire_histograms)
+        # Only in the final report: the ledger is for reading afterwards, and
+        # a heartbeat every second has no business carrying it.
+        snapshot["searches"] = self.stats.ledger.to_dict()
         snapshot["arrivals_missed"] = self._arrivals_shed + self._arrivals_skipped
         # What each requested target guard actually did. `unevaluated` is the
         # field that stops a declared ceiling being a lie: a guard named there
