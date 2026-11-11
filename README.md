@@ -143,6 +143,32 @@ only. The CPU fields are confirmed on a live 10.4; the memory, load and disk
 field names are from splunkd's documented schema and have not been confirmed
 on a live cluster, so a field a version does not write shows as empty.
 
+### Where the limit was
+
+At the top of a finished run's page is one reading of all of the above: which
+limit the run reached, if any. The candidates are the load generator itself
+(which outranks everything: if it could not keep time, nothing else is about
+the target), admission on the search head (told apart from the account's own
+role quota by the dispatcher's stated reason), CPU on the search heads, CPU on
+the indexers, memory, disk, the bucket cache, and searches failing rather than
+slowing.
+
+It is rules over the run's own figures, not a model. Each candidate is scored
+from 0 to 1 by how far past its line the signal was, for example the share of
+the run a host spent at 90% CPU or more, the share of searches that waited to be
+admitted, or the share of search run time spent waiting on cache misses. A limit
+is named at 0.5 and called strong at 0.75; two within 0.15 of each other are
+both in the headline. The evidence is listed with each, and so are the signals
+that were checked and found fine and, separately, what could not be checked,
+because "the indexers were not CPU-bound" and "nobody could see the indexers"
+are different answers. Nothing past its line is reported as no limit reached,
+which is a result: the run did not push the target far enough to find one.
+
+The verdict is worked out when the run is read rather than stored, so runs from
+before it existed get one from whatever they collected. The thresholds are in
+`server/regulator_server/bottleneck.py` and are a first cut, set by judgement
+and not yet calibrated against real clusters.
+
 ### A search "cancelled" at the end of a run
 
 Regulator gives a search no time limit of its own while a run is going. The

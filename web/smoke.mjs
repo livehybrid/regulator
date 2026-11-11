@@ -67,6 +67,39 @@ const RUN = {
     target_id: 1,
     target_name: 'lab',
     target_web_url: 'https://splunk.lab:8000/',
+    // Worked out by the control plane from the figures below when the run is read.
+    bottleneck: {
+        headline: 'CPU on the indexers, with disk on the indexers',
+        strength: 'strong',
+        factors: [
+            {
+                kind: 'indexer_cpu',
+                label: 'CPU on the indexers',
+                score: 1,
+                named: true,
+                evidence: ['idx-east-1 averaged 96% CPU during the run and spent 84% of it at 90% or more (peak 99%).'],
+            },
+            {
+                kind: 'disk',
+                label: 'Disk on the indexers',
+                score: 0.64,
+                named: true,
+                evidence: ['idx-east-1 (indexer) averaged 58 ms per disk request on its slowest disk, reading 213 MB/s.'],
+            },
+            {
+                kind: 'admission',
+                label: "Admission: the search head's concurrent-search ceiling",
+                score: 0.33,
+                named: false,
+                evidence: ['8.0% of searches waited to be admitted before they ran.'],
+                advice: 'Searches were held back before they started, so latency past this point is queueing.',
+            },
+        ],
+        fine: ['The load generator kept to its schedule (its loop ran at most 12 ms late).'],
+        not_checked: ["The bucket cache's cost per search: the target's audit trail had no account of this run's searches."],
+        context: "By the target's own search telemetry, 90% of a search's time was the map phase on the indexers (900 ms).",
+        method: 'Rules over this run\'s own figures, not a model.',
+    },
     state: 'completed',
     fleet: 'k8s',
     fleet_state: 'done',
@@ -941,6 +974,15 @@ const go = async (hash) => {
     );
     await check('run: skipped scheduled searches', '340 skipped: maxconcurrent');
     await check('run: bucket attribution by step', 'Bucket attribution by step');
+    // The reading of it all: which limit the run reached, and on what evidence.
+    await check('run: the verdict', 'Where the limit was');
+    await check('run: the verdict names the limit', 'CPU on the indexers, with disk on the indexers');
+    await check('run: the verdict says how sure it is', 'The evidence is strong');
+    await check('run: the verdict shows its evidence', 'spent 84% of it at 90% or more');
+    await check('run: a signal under the line is shown as such', 'below the line for naming it');
+    await check('run: what was checked and fine', 'Checked, and not the limit');
+    await check('run: what could not be checked is kept apart', 'Could not be checked');
+    await check('run: the verdict says it is rules', 'not a model');
     // The machines: which tier ran out, and of what.
     await check('run: host resources', 'What the machines were doing');
     await check('run: a tier is summarised', '3 indexers: CPU averaged 71% during the run');

@@ -22,6 +22,7 @@ import Table from '@splunk/react-ui/Table';
 import Tooltip from '@splunk/react-ui/Tooltip';
 import WaitSpinner from '@splunk/react-ui/WaitSpinner';
 
+import Bottleneck from '../components/Bottleneck';
 import BusyButton from '../components/BusyButton';
 import ComparisonPanel from '../components/ComparisonPanel';
 import CompareModal from '../modals/CompareModal';
@@ -627,6 +628,8 @@ export default function RunDetail({ runId, navigate, onLaunch }) {
                     />
                 ) : null}
             </TileGrid>
+
+            {!live && <Bottleneck verdict={run.bottleneck} />}
 
             <RunCharts run={run} live={live} series={series.current} />
 
