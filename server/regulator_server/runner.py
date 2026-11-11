@@ -34,6 +34,7 @@ from regulator_agent.results import RunStats
 from regulator_agent.scenario import is_advice, lint, scenario_digest
 from regulator_agent.scheduler import Scheduler
 from regulator_agent.smartstore import cache_state, delta as cache_delta, evict_all
+from regulator_agent.hostresources import host_resources
 from regulator_agent.sut import correlate, marker_prefix_for
 
 from .adapters import hec_config, load_named_scenario, worker_config
@@ -517,6 +518,11 @@ class RunManager:
                 )
                 if isinstance(summary.sut, dict):
                     self._lifecycle(run_id, "correlation", findings=summary.sut.get("findings"), probes=sorted((summary.sut.get("probes") or {}).keys()))
+                # After the correlation, so the last of the run's own load has
+                # had that long to reach _introspection too.
+                summary.resources = await host_resources(engine.client, summary.started_at, summary.ended_at)
+                if summary.resources.get("available"):
+                    self._lifecycle(run_id, "host_resources", findings=summary.resources.get("findings"), hosts=len(summary.resources.get("hosts") or []))
 
             payload = summary.to_dict()
             if hec is not None:

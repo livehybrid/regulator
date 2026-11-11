@@ -27,6 +27,7 @@ import ComparisonPanel from '../components/ComparisonPanel';
 import CompareModal from '../modals/CompareModal';
 import DeleteRunsModal, { DELETABLE_STATES } from '../modals/DeleteRunsModal';
 import EditRunModal from '../modals/EditRunModal';
+import HostResources from '../components/HostResources';
 import FleetLogsModal from '../modals/FleetLogsModal';
 import PromoteBaselineModal from '../modals/PromoteBaselineModal';
 import PurgeModal from '../modals/PurgeModal';
@@ -745,6 +746,8 @@ export default function RunDetail({ runId, navigate, onLaunch }) {
             />
 
             <SutSection sut={summary.sut} />
+
+            {!live && <HostResources resources={summary.resources} />}
 
             <SectionHeading>Steps, worst p95 first</SectionHeading>
             {steps.length ? (

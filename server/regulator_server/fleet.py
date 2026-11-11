@@ -46,6 +46,7 @@ from regulator_agent.scenario import Scenario, load_scenario
 from regulator_agent.smartstore import cache_state, delta as cache_delta, evict_all
 from regulator_agent.splunk import SplunkClient
 from regulator_agent.params import sid_prefix_for
+from regulator_agent.hostresources import host_resources
 from regulator_agent.sut import correlate, marker_prefix_for
 
 from .adapters import hec_config, indexer_settings, scenario_path, target_config
@@ -1190,6 +1191,8 @@ class FleetRun(threading.Thread):
                     )
                 except Exception as exc:  # noqa: BLE001 - correlation never fails a run
                     log.warning("correlation failed for run %s: %s", self.run_id, exc)
+                # Never raises: an unreadable _introspection is a reason, not an error.
+                merged["resources"] = await host_resources(client, merged["started_at"], merged["ended_at"])
             from .runner import manager as _manager
 
             epochs = _manager.epochs_for(self.run_id, forget=True)

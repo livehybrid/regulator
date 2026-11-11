@@ -113,6 +113,36 @@ field a version does not write comes back empty rather than wrong. **Events per
 index is not available**: splunkd does not keep it for a finished search
 outside the job's own `search.log`.
 
+### What the machines were doing
+
+A latency curve says the target got slower. It does not say which tier ran out,
+or of what. Every full Splunk instance already writes its host's CPU, memory and
+load to `_introspection` every ten seconds and its disks' throughput and wait
+every minute (`splunk_resource_usage`, components `Hostwide` and `IOStats`).
+After a run, Regulator reads those back in time buckets, from three minutes
+before the run to a minute after it, and sorts the hosts into search heads and
+indexers using the search head's own lists of its peers and cluster members.
+
+The run page then shows, on one time axis with the run's start and end marked:
+CPU by tier, memory by tier, disk throughput and wait on the indexers, and load
+per core. Each tier is two lines, its mean and its busiest host, because a mean
+alone hides one indexer pinned at 100% among nine idle ones. Under the charts,
+every host has a row (cores, memory, CPU before and during, time spent at 90%
+or more, memory peak, load, disk) and the slowest disks are listed. A short
+list of plain statements goes with it: which host was CPU-bound and for how
+long, which ran short of memory or had more runnable work than cores, and
+whose disks were slow.
+
+It costs three searches and three REST reads after the load has stopped;
+nothing is sampled during the run. What it cannot do, it says: a host appears
+only if its `_introspection` is searchable from the search head the run talked
+to (indexers always are; other search head cluster members only if they forward
+their internal logs), a host on neither the peer list nor the member list is
+shown as "unknown" rather than guessed at, and `IOStats` is written on Linux
+only. The CPU fields are confirmed on a live 10.4; the memory, load and disk
+field names are from splunkd's documented schema and have not been confirmed
+on a live cluster, so a field a version does not write shows as empty.
+
 ### A search "cancelled" at the end of a run
 
 Regulator gives a search no time limit of its own while a run is going. The

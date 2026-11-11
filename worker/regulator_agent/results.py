@@ -1030,6 +1030,9 @@ class RunSummary:
     # What the cluster itself recorded: its account of our searches, where the
     # time went by phase, scheduled searches it had to skip, and its own CPU.
     sut: Optional[Dict[str, Any]] = None
+    # CPU, memory and disk on the target's hosts across the run, by tier, read
+    # back from the target's own _introspection afterwards. See hostresources.
+    resources: Optional[Dict[str, Any]] = None
     abort_reason: Optional[str] = None
     scenario_seed: int = 0
     # The seed the draws actually used. An override (REG_SEED) changes every
