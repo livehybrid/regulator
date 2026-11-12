@@ -222,12 +222,13 @@ def audit_spl(sids: Sequence[str]) -> str:
 
 def indexers_spl(sids: Sequence[str]) -> str:
     # What each indexer did for each search: the line an indexer writes to
-    # remote_searches.log when a search head's stream to it closes. NOT yet
-    # confirmed on a live cluster that every field below is present on every
-    # version; a missing one sums to nothing and the column stays empty.
+    # remote_searches.log when a search head's stream to it closes. The line
+    # and every field below confirmed on a live 10.6 cluster (the line was
+    # first written here as "terminated", which matched nothing). The indexer
+    # knows the job as remote_<search head>_<sid>, hence the wildcards.
     return (
         "search index=_internal sourcetype=splunkd_remote_searches "
-        f'"Streamed search connection terminated" {_sid_clause(sids, "search_id")} '
+        f'"Streamed search connection closed" {_sid_clause(sids, "search_id")} '
         "| stats sum(elapsedTime) as elapsed_s, sum(scan_count) as scan_count, "
         "sum(events_count) as events, sum(considered_buckets) as considered_buckets, "
         "sum(eliminated_buckets) as eliminated_buckets, sum(drop_count) as dropped, "
