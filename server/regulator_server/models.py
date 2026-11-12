@@ -61,6 +61,11 @@ class Target(Base):
     indexer_token_encrypted: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     indexer_username: Mapped[Optional[str]] = mapped_column(String(128), nullable=True)
     indexer_password_encrypted: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    # HTTP Event Collector on the target, for the ingest-to-searchable probe:
+    # where to send probe events and the token to send them with. Optional;
+    # without both, a run cannot measure freshness.
+    hec_url: Mapped[Optional[str]] = mapped_column(String(512), nullable=True)
+    hec_token_encrypted: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
 
     # Whether each credential is stored, never what it is: the edit form shows
     # "stored, leave blank to keep" from these.
@@ -83,6 +88,10 @@ class Target(Base):
     @property
     def has_indexer_password(self) -> bool:
         return bool(self.indexer_password_encrypted)
+
+    @property
+    def has_hec_token(self) -> bool:
+        return bool(self.hec_token_encrypted)
 
 
 class Run(Base):
@@ -126,6 +135,10 @@ class Run(Base):
     # again rather than yesterday's epochs.
     warm_cache: Mapped[bool] = mapped_column(Boolean, default=False)
     warm_plan_json: Mapped[Optional[Dict[str, Any]]] = mapped_column(JSON, nullable=True)
+    # Measure ingest-to-searchable latency during the run: {"index",
+    # "interval_s"}. The probe's events go to the target's HEC, so the target
+    # must have one. None means the run does not measure it.
+    freshness_json: Mapped[Optional[Dict[str, Any]]] = mapped_column(JSON, nullable=True)
 
     created_at: Mapped[float] = mapped_column(Float, default=time.time)
     started_at: Mapped[Optional[float]] = mapped_column(Float, nullable=True)

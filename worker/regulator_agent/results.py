@@ -1033,6 +1033,9 @@ class RunSummary:
     # CPU, memory and disk on the target's hosts across the run, by tier, read
     # back from the target's own _introspection afterwards. See hostresources.
     resources: Optional[Dict[str, Any]] = None
+    # How long after sending an event it became searchable, measured by a probe
+    # during the run. See freshness.py. Set by the control plane.
+    freshness: Optional[Dict[str, Any]] = None
     abort_reason: Optional[str] = None
     scenario_seed: int = 0
     # The seed the draws actually used. An override (REG_SEED) changes every

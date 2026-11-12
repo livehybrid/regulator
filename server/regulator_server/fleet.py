@@ -49,6 +49,7 @@ from regulator_agent.params import sid_prefix_for
 from regulator_agent.hostresources import host_resources
 from regulator_agent.sut import correlate, marker_prefix_for
 
+from . import freshnessrun
 from .adapters import hec_config, indexer_settings, scenario_path, target_config
 from .config import FleetSettings, ServerConfig, get_settings
 from .crypto import mint_run_token
@@ -1134,9 +1135,15 @@ class FleetRun(threading.Thread):
             if run_evict_every:
                 periodic_indexes = None if "*" in evict_indexes else (evict_indexes or ([corpus_index] if corpus_index else None))
                 evictor = asyncio.create_task(self._evict_loop(client, where, periodic_indexes, run_evict_every, target_id))
+            # The ingest-to-searchable probe, from now: what it sends while the
+            # workers provision is the idle baseline, reported apart.
+            fresh_probe, fresh_problem = freshnessrun.build(self.run_id, client)
+            fresh_task = freshnessrun.start(fresh_probe)
             try:
                 await self._watch(settings, deadline_basis)
             finally:
+                if fresh_probe is not None:
+                    fresh_probe.stop()
                 if evictor is not None:
                     evictor.cancel()
                     try:
@@ -1193,6 +1200,9 @@ class FleetRun(threading.Thread):
                     log.warning("correlation failed for run %s: %s", self.run_id, exc)
                 # Never raises: an unreadable _introspection is a reason, not an error.
                 merged["resources"] = await host_resources(client, merged["started_at"], merged["ended_at"])
+            merged["freshness"] = await freshnessrun.finish(
+                fresh_probe, fresh_task, merged.get("started_at"), merged.get("ended_at"), fresh_problem
+            )
             from .runner import manager as _manager
 
             epochs = _manager.epochs_for(self.run_id, forget=True)

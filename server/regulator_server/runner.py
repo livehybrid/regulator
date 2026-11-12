@@ -37,6 +37,7 @@ from regulator_agent.smartstore import cache_state, delta as cache_delta, evict_
 from regulator_agent.hostresources import host_resources
 from regulator_agent.sut import correlate, marker_prefix_for
 
+from . import freshnessrun
 from .adapters import hec_config, load_named_scenario, worker_config
 from .config import get_settings
 from .db import session_scope
@@ -488,9 +489,15 @@ class RunManager:
             if every > 0:
                 periodic_indexes = None if "*" in scope else ([i for i in scope.split(",") if i] or indexes)
                 evictor = asyncio.create_task(self._evict_loop(run_id, engine.client, where, periodic_indexes, every, target_id))
+            # The ingest-to-searchable probe, if the run asked for one. Stopped
+            # when the load ends; its follow-up overlaps the correlation below.
+            fresh_probe, fresh_problem = freshnessrun.build(run_id, engine.client)
+            fresh_task = freshnessrun.start(fresh_probe)
             try:
                 summary = await scheduler.run()
             finally:
+                if fresh_probe is not None:
+                    fresh_probe.stop()
                 if evictor is not None:
                     evictor.cancel()
                     try:
@@ -523,6 +530,11 @@ class RunManager:
                 summary.resources = await host_resources(engine.client, summary.started_at, summary.ended_at)
                 if summary.resources.get("available"):
                     self._lifecycle(run_id, "host_resources", findings=summary.resources.get("findings"), hosts=len(summary.resources.get("hosts") or []))
+            summary.freshness = await freshnessrun.finish(
+                fresh_probe, fresh_task, summary.started_at, summary.ended_at, fresh_problem
+            )
+            if isinstance(summary.freshness, dict) and summary.freshness.get("available"):
+                self._lifecycle(run_id, "freshness", findings=summary.freshness.get("findings"))
 
             payload = summary.to_dict()
             if hec is not None:

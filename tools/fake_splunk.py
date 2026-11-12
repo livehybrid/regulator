@@ -122,6 +122,11 @@ class FakeSplunkConfig:
     # The rawdata journal's share of a bucket. A tstats downloads the rest
     # (the index files) and not the journal, as the real cache manager does.
     smartstore_journal_pct: int = 70
+    # HTTP Event Collector: events sent to /services/collector/event become
+    # searchable this long after they arrive, which is what an ingest-to-
+    # searchable probe measures. A token equal to hec_reject_token is refused.
+    ingest_delay_s: float = 1.0
+    hec_reject_token: Optional[str] = None
     # Indexes that /services/data/indexes/<name> reports as existing. Anything
     # else 404s, so a scenario naming an index that is not there is caught by
     # the online lint exactly as it would be against a real cluster.
@@ -236,6 +241,9 @@ class FakeSplunk:
         self._lock = threading.RLock()
         self._rng = random.Random(self.config.seed)
         self._jobs: Dict[str, _Job] = {}
+        # Events received over HEC: (the event, its index time, when it
+        # becomes searchable), in arrival order.
+        self._hec_events: List[Tuple[Dict[str, Any], float, float]] = []
         # bucket id -> "local" | "remote"
         self._buckets: Dict[str, str] = {}
         self._bucket_ranges: Dict[str, Tuple[float, float]] = {}
@@ -464,6 +472,7 @@ class FakeSplunk:
         """Drop every job and zero every counter."""
         with self._lock:
             self._jobs.clear()
+            self._hec_events.clear()
             self._active.clear()
             self._pending.clear()
             self.stats = _Stats()
@@ -807,6 +816,55 @@ class FakeSplunk:
                 t += span
         return 200, {"messages": [], "fields": list(rows[0]) if rows else [], "results": rows}
 
+    def hec_event(self, body: bytes, header: Optional[str]) -> Tuple[int, Any]:
+        """One or more JSON events, as HEC's event endpoint takes them."""
+        parts = (header or "").split(None, 1)
+        if len(parts) != 2 or parts[0] != "Splunk" or not parts[1].strip():
+            return 401, {"text": "Token is required", "code": 2}
+        if self.config.hec_reject_token and parts[1].strip() == self.config.hec_reject_token:
+            return 403, {"text": "Invalid token", "code": 4}
+        raw = body.decode("utf-8", "replace")
+        decoder = json.JSONDecoder()
+        events: List[Dict[str, Any]] = []
+        index = 0
+        raw = raw.strip()
+        try:
+            while index < len(raw):
+                event, end = decoder.raw_decode(raw, index)
+                if isinstance(event, dict):
+                    events.append(event)
+                index = end
+                while index < len(raw) and raw[index].isspace():
+                    index += 1
+        except ValueError:
+            return 400, {"text": "Invalid data format", "code": 6}
+        if not events:
+            return 400, {"text": "No data", "code": 5}
+        now = time.time()
+        with self._lock:
+            for event in events:
+                self._hec_events.append((event, now, now + max(0.0, self.config.ingest_delay_s)))
+        return 200, {"text": "Success", "code": 0}
+
+    def _freshness_search(self, spl: str) -> Tuple[int, Any]:
+        """The probe search: searchable probes from one source, by id."""
+        with self._lock:
+            self.stats.oneshots += 1
+            events = list(self._hec_events)
+        match = re.search(r'source="([^"]+)"', spl)
+        source = match.group(1) if match else None
+        now = time.time()
+        rows = []
+        for event, indextime, searchable_at in events:
+            if searchable_at > now or (source and event.get("source") != source):
+                continue
+            fields = event.get("fields") or {}
+            body = event.get("event") if isinstance(event.get("event"), dict) else {}
+            probe = fields.get("regulator_probe") or body.get("probe")
+            if probe:
+                rows.append({"probe": str(probe), "indextime": str(int(indextime))})
+        return 200, {"messages": [], "fields": ["probe", "indextime"], "results": rows}
+
     def _cacheman_list(self) -> Tuple[int, Any]:
         entries = []
         for bid, status in sorted(self._buckets.items()):
@@ -928,6 +986,8 @@ class FakeSplunk:
         exec_mode = _first(form, "exec_mode", "normal")
         if exec_mode == "oneshot" and re.match(r"\s*\|\s*dbinspect\b", spl):
             return self._dbinspect(spl)
+        if exec_mode == "oneshot" and 'sourcetype="regulator:freshness"' in spl:
+            return self._freshness_search(spl)
         if exec_mode == "oneshot" and "sourcetype=splunk_resource_usage" in spl and (
             "bin _time" in spl or "component=IOStats" in spl
         ):
@@ -1216,6 +1276,12 @@ class _Handler(BaseHTTPRequestHandler):
             form = parse_qs(raw_body.decode("utf-8", "replace"), keep_blank_values=True)
 
         fake.record_request(method, _normalise_path(path))
+
+        if path == "/services/collector/event" and method == "POST":
+            # HEC: its own token scheme and a JSON body, not a form.
+            status, payload = fake.hec_event(raw_body, self.headers.get("Authorization"))
+            self._send(status, payload)
+            return
 
         if not fake.check_auth(path, self.headers.get("Authorization")):
             fake.note_auth_failure()
