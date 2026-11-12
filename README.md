@@ -108,8 +108,9 @@ whom, run time, counts, buckets searched and eliminated, bucket cache misses),
 what each indexer did for it (`splunkd_remote_searches`: seconds, scanned,
 events, buckets, cache misses and the time spent waiting on them) and what
 splunkd logged about it at WARN or ERROR. The answer is kept on the run. The
-indexer question has not been confirmed on a live cluster on every version: a
-field a version does not write comes back empty rather than wrong. **Events per
+audit and indexer questions are confirmed against a live 10.6 cluster by the
+contract tests (see "Contract tests against a real cluster"); on another
+version, a field it does not write comes back empty rather than wrong. **Events per
 index is not available**: splunkd does not keep it for a finished search
 outside the job's own `search.log`.
 
@@ -139,9 +140,10 @@ only if its `_introspection` is searchable from the search head the run talked
 to (indexers always are; other search head cluster members only if they forward
 their internal logs), a host on neither the peer list nor the member list is
 shown as "unknown" rather than guessed at, and `IOStats` is written on Linux
-only. The CPU fields are confirmed on a live 10.4; the memory, load and disk
-field names are from splunkd's documented schema and have not been confirmed
-on a live cluster, so a field a version does not write shows as empty.
+only. Every field it reads (CPU, memory, load, cores and disk) is confirmed
+against a live 10.6 cluster by the contract tests; on another version, a field
+it does not write shows as empty. The cluster manager and the deployer are on
+neither list and show as "unknown".
 
 ### Where the limit was
 
@@ -168,6 +170,44 @@ The verdict is worked out when the run is read rather than stored, so runs from
 before it existed get one from whatever they collected. The thresholds are in
 `server/regulator_server/bottleneck.py` and are a first cut, set by judgement
 and not yet calibrated against real clusters.
+
+### Contract tests against a real cluster
+
+Almost every test runs against the fake splunkd in `tools/fake_splunk.py`, which
+encodes our understanding of Splunk: a test passing against it proves the code
+matches that understanding, not that the understanding is right. The contract
+suite checks the understanding against a real deployment:
+
+```
+make contract-up      # a 3-member search head cluster behind a load balancer,
+                      # a cluster manager, 2 indexers, SmartStore on local S3
+make contract-test
+make contract-down
+```
+
+`contract-up` needs Docker, about 16 GB of memory and 25 GB of disk, and
+starts every container on the trial licence the `splunk/splunk` image carries,
+which means accepting Splunk's licence and general terms. It takes about seven
+minutes. `contract-test` is skipped unless `REG_CONTRACT_SH_URL` is set, so it
+can be pointed at any cluster (see `harness/contract/contract.env`).
+
+What the first run, against Splunk 10.6, found:
+
+| Assumption | Finding |
+|---|---|
+| `dbinspect cached=false` reports what is on local disk, `cached=true` the whole bucket | Confirmed. An evicted copy reports 0 MB with `cached=false` and its full size with `cached=true` |
+| `cm:bucket.earliest_time`, `latest_time` and `journal_size` exist | Confirmed, with `estimated_size` and per-file-type presence flags (`cm:bucket.file_type.*`) |
+| A tstats downloads the index files and not the journal | Confirmed: the tsidx comes local, the journal stays remote, and the bytes on disk are the bucket less its journal. A raw search then brings the journal |
+| A search head cluster member learns within seconds of a job another member dispatched | **Wrong.** Only the dispatching member ever knows an ad hoc job. The unknown-sid grace now runs from the last time any member answered, and the fake's `shc_members` mode behaves like the real cluster |
+| The restart REST paths | The handlers exist and want a POST. The action names are not confirmed without restarting the cluster |
+| `OR` binds tighter than the implicit `AND` | Confirmed. The search scope model may over-read indexes and never under-reads |
+| The partial-results messages Regulator recognises | **Incomplete.** 10.6 reports a peer that could not download its buckets as "may have returned partial results", with the job DONE and no events. Now recognised |
+| Diagnose's indexer query | **Wrong anchor.** The line is "Streamed search connection closed", not "terminated". Fixed; every field it reads is confirmed |
+| Host resources and the freshness probe | Confirmed end to end |
+
+Also seen: on a replicated SmartStore bucket the copy that did not upload reports
+`upload_status=canceled` and sits evicted on its peer, which is why the
+residency check reads the copy with the most on disk.
 
 ### A search "cancelled" at the end of a run
 
@@ -1120,7 +1160,7 @@ set it high or leave it out.
 |---|---|---|
 | `REG_POLL_INITIAL_MS` / `REG_POLL_MAX_MS` | `250` / `1000` | Adaptive job polling. Polling hard is itself load on the target: a thousand users at 100 ms is ten thousand REST calls a second |
 | `REG_DELETE_JOBS` | `1` | Clean up artefacts on the search head. Leaving thousands behind is itself a load characteristic |
-| `REG_UNKNOWN_SID_GRACE_MS` | `10000` | How long after dispatch a 404 for that sid means "this member has not heard of the job yet" rather than "the job is gone". A search head cluster behind a load balancer without stickiness sends each poll to whichever member is next, and a member asked about a job another member dispatched moments ago answers 404 until it learns of it. Inside the grace the request is asked again (status, results and delete) and counted on the record as `unknown_sid_count`; after it the 404 fails the step. `0` fails on the first 404 |
+| `REG_UNKNOWN_SID_GRACE_MS` | `10000` | How long after any member last answered for a job a 404 for its sid means "this member does not know the job" rather than "the job is gone". A search head cluster member knows only the ad hoc jobs it dispatched, for their whole life (confirmed on a live 10.6 cluster: the other members answer 404 on every jobs path and never learn of it), so behind a load balancer without stickiness two polls in three land on a member that will never know the job. Inside the grace the request is asked again (status, results and delete) and counted on the record as `unknown_sid_count`; once no member has answered for the whole grace, the 404 fails the step. `0` fails on the first 404. Sticky sessions on the balancer avoid all of this |
 | `REG_CACHE_BUST` | `1` | The nonce comment. Only turn it off to demonstrate what the cache is worth |
 | `REG_HTTP2`, `REG_CONNECT_TIMEOUT_S`, `REG_READ_TIMEOUT_S` | `0`, `10`, `300` | Every dispatched job also carries `auto_cancel` a minute past the read timeout, so a search this worker gives up on is cancelled by splunkd rather than run to completion for nobody |
 

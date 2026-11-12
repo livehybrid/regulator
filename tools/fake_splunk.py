@@ -109,6 +109,13 @@ class FakeSplunkConfig:
     # balancer sends it a poll for a job another member dispatched before it
     # has heard of it. 0 means jobs are visible at once.
     unknown_sid_ms: float = 0.0
+    # A search head cluster of this many members behind a round-robin
+    # balancer with no stickiness. A member knows only the ad hoc jobs it
+    # dispatched, for their whole life (confirmed on a live 10.6 cluster), so
+    # every request about a job that lands on another member answers 404.
+    # Requests about a job take turns round the members, the dispatch having
+    # landed on the first. 0 or 1 means a single instance.
+    shc_members: int = 0
     # SmartStore simulation. 0 buckets means the cache manager reports nothing,
     # which is how a non-SmartStore instance behaves and is the default.
     smartstore_buckets: int = 0
@@ -215,6 +222,8 @@ class _Job:
     finalized: bool = False
     paused_at: Optional[float] = None
     paused_total: float = 0.0
+    # Requests about this job since its dispatch, for shc_members.
+    requests: int = 0
     retired: bool = False
 
 
@@ -1034,6 +1043,14 @@ class FakeSplunk:
             with self._lock:
                 self.stats.unknown_sid_answers += 1
             return 404, _UNKNOWN_SID_BODY
+        if self.config.shc_members > 1:
+            with self._lock:
+                job.requests += 1
+                elsewhere = job.requests % self.config.shc_members != 0
+                if elsewhere:
+                    self.stats.unknown_sid_answers += 1
+            if elsewhere:
+                return 404, _UNKNOWN_SID_BODY
 
         if tail == "" and method == "GET":
             return 200, self._job_entry(job, time.monotonic())

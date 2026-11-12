@@ -14,6 +14,8 @@ seconds.
 
 from __future__ import annotations
 
+import asyncio
+
 import sys
 import time
 from pathlib import Path
@@ -752,6 +754,58 @@ def test_a_sid_the_member_has_not_heard_of_yet_is_asked_again(env):
     assert record.unknown_sid_count >= 1
     assert record.unknown_sid_count == answered_404
     assert deleted == 1
+
+
+def test_a_search_outlasting_the_grace_behind_an_unsticky_balancer_completes(env):
+    """A real search head cluster member never learns of another's ad hoc job.
+
+    Confirmed on a live 10.6 cluster: two polls in three answer 404 for the
+    job's whole life. Counted from the dispatch, the grace failed every
+    search that ran longer than it; counted from the last time any member
+    answered for the job, the search completes.
+    """
+
+    async def scenario():
+        server = FakeSplunk(port=0, base_latency_ms=2500.0, jitter_ms=0.0, shc_members=3, seed=3)
+        try:
+            engine = ApiEngine(make_config(server, env, REG_UNKNOWN_SID_GRACE_MS="1000", REG_POLL_MAX_MS="200"))
+            await engine.start()
+            try:
+                record = await engine.execute(context_for(search_step(result_count=5)))
+            finally:
+                await engine.close()
+            return record, server.stats.unknown_sid_answers
+        finally:
+            server.close()
+
+    record, answered_404 = run_async(scenario())
+    assert record.ok is True, record.error_detail
+    assert record.dispatch_state == "DONE"
+    assert record.service_time_ms > 2000
+    assert record.unknown_sid_count >= 3 and record.unknown_sid_count <= answered_404
+
+
+def test_a_job_no_member_answers_for_is_still_given_up_after_the_grace(env):
+    """Counting from the last sighting must not turn a vanished job into a hang."""
+
+    async def scenario():
+        server = FakeSplunk(port=0, base_latency_ms=60000.0, jitter_ms=0.0, seed=3)
+        try:
+            engine = ApiEngine(make_config(server, env, REG_UNKNOWN_SID_GRACE_MS="800", REG_POLL_MAX_MS="100"))
+            await engine.start()
+            try:
+                task = asyncio.ensure_future(engine.execute(context_for(search_step())))
+                await asyncio.sleep(0.5)
+                server.reset()  # every job gone, on every member
+                return await asyncio.wait_for(task, timeout=10)
+            finally:
+                await engine.close()
+        finally:
+            server.close()
+
+    record = run_async(scenario())
+    assert record.ok is False and record.http_status == 404
+    assert "still unknown" in (record.error_detail or "")
 
 
 def test_with_no_grace_the_first_404_fails_the_search(env):

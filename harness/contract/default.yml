@@ -1,0 +1,17 @@
+# Extra settings the image's provisioning applies at first boot, on every
+# instance. Mounted at /tmp/defaults/default.yml by docker-compose.yml.
+splunk:
+  conf:
+    server:
+      content:
+        diskUsage:
+          # The default 5000 MB stops every search on a small disk shared by
+          # eight instances. The contract tests write almost nothing.
+          minFreeSpace: 500
+        cachemanager:
+          # SmartStore keeps this much free beyond minFreeSpace and refuses to
+          # download a bucket otherwise (default 5120 MB). On a small shared
+          # disk that refused every download, and searches over evicted
+          # buckets came back DONE with no events and a "may have returned
+          # partial results" message.
+          eviction_padding: 200

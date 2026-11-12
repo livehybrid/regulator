@@ -7,7 +7,7 @@ VENV       ?= .venv
 VENV_PY    := $(VENV)/bin/python
 IMAGE      ?= regulator-worker:dev
 
-.PHONY: help venv install test server-test scenarios lint smoke ui ui-deps ui-lint ui-smoke ui-watch docker-build docker-build-server docker-build-browser docker-smoke clean
+.PHONY: help venv install test server-test scenarios lint smoke ui ui-deps ui-lint ui-smoke ui-watch docker-build docker-build-server docker-build-browser docker-smoke contract-up contract-test contract-down clean
 
 help: ## Show this help
 	@grep -hE '^[a-zA-Z0-9_-]+:.*?## ' $(MAKEFILE_LIST) | \
@@ -54,6 +54,16 @@ ui: ## Build the operator console from web/ into server/ui
 ui-watch: ## Rebuild the console on every change (leave running while editing)
 	@if [ ! -d web/node_modules ]; then $(MAKE) ui-deps; fi
 	cd web && $(NPM) run start
+
+contract-up: install ## Start a real Splunk cluster for the contract tests (accepts Splunk's licence; Docker, ~16 GB RAM, ~25 GB disk)
+	$(VENV_PY) -m pip install -q "moto[server]"
+	PYTHON=$(VENV_PY) harness/contract/up.sh
+
+contract-test: install ## Check Regulator's assumptions about Splunk against the contract cluster
+	PYTHON=$(VENV_PY) harness/contract/test.sh
+
+contract-down: ## Remove the contract cluster and its volumes
+	harness/contract/down.sh
 
 ui-lint: ## Lint the console with Splunk's own eslint config
 	@if [ ! -d web/node_modules ]; then $(MAKE) ui-deps; fi

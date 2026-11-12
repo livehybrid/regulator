@@ -1,0 +1,103 @@
+# A small, disposable Splunk deployment for the contract tests (issue 16).
+#
+#   a cluster manager and two indexers, SmartStore on S3-compatible storage
+#   a three-member search head cluster with a deployer
+#   a load balancer in front of the search heads, round robin, no stickiness
+#
+# Every Splunk container accepts Splunk's licence and general terms, and runs
+# on the trial licence the image carries. Not for production, and not sized
+# for load: the contract tests check behaviour, not throughput.
+#
+# S3 is whatever REG_CONTRACT_S3_ENDPOINT points at (see up.sh, which starts a
+# local one when none is given), reached from the containers through the host.
+
+x-splunk: &splunk
+  image: ${REG_CONTRACT_SPLUNK_IMAGE:-splunk/splunk:latest}
+  extra_hosts:
+    - "host.docker.internal:host-gateway"
+  volumes:
+    - ./default.yml:/tmp/defaults/default.yml:ro
+  environment: &env
+    SPLUNK_START_ARGS: --accept-license
+    SPLUNK_GENERAL_TERMS: --accept-sgt-current-at-splunk-com
+    SPLUNK_PASSWORD: ${REG_CONTRACT_PASSWORD:-Regulator-contract-1}
+    SPLUNK_IDXC_PASS4SYMMKEY: regulator-contract-idxc
+    SPLUNK_IDXC_SECRET: regulator-contract-idxc
+    SPLUNK_SHC_PASS4SYMMKEY: regulator-contract-shc
+    SPLUNK_SHC_SECRET: regulator-contract-shc
+    SPLUNK_IDXC_REPLICATION_FACTOR: "2"
+    SPLUNK_IDXC_SEARCH_FACTOR: "2"
+    SPLUNK_SHC_REPLICATION_FACTOR: "2"
+    SPLUNK_CLUSTER_MASTER_URL: cm
+    SPLUNK_DEPLOYER_URL: dep
+    SPLUNK_INDEXER_URL: idx1,idx2
+    SPLUNK_SEARCH_HEAD_URL: sh2,sh3
+    SPLUNK_SEARCH_HEAD_CAPTAIN_URL: sh1
+    SPLUNK_HEC_TOKEN: ${REG_CONTRACT_HEC_TOKEN:-0d1e2c3b-4a59-4687-9a0b-c1d2e3f4a5b6}
+  restart: "no"
+
+services:
+  cm:
+    <<: *splunk
+    hostname: cm
+    environment:
+      <<: *env
+      SPLUNK_ROLE: splunk_cluster_master
+    ports: ["127.0.0.1:18089:8089"]
+
+  idx1:
+    <<: *splunk
+    hostname: idx1
+    environment:
+      <<: *env
+      SPLUNK_ROLE: splunk_indexer
+    ports: ["127.0.0.1:18189:8089", "127.0.0.1:18188:8088"]
+
+  idx2:
+    <<: *splunk
+    hostname: idx2
+    environment:
+      <<: *env
+      SPLUNK_ROLE: splunk_indexer
+    ports: ["127.0.0.1:18289:8089", "127.0.0.1:18288:8088"]
+
+  dep:
+    <<: *splunk
+    hostname: dep
+    environment:
+      <<: *env
+      SPLUNK_ROLE: splunk_deployer
+
+  sh1:
+    <<: *splunk
+    hostname: sh1
+    environment:
+      <<: *env
+      SPLUNK_ROLE: splunk_search_head_captain
+    ports: ["127.0.0.1:18389:8089", "127.0.0.1:18300:8000"]
+
+  sh2:
+    <<: *splunk
+    hostname: sh2
+    environment:
+      <<: *env
+      SPLUNK_ROLE: splunk_search_head
+    ports: ["127.0.0.1:18489:8089"]
+
+  sh3:
+    <<: *splunk
+    hostname: sh3
+    environment:
+      <<: *env
+      SPLUNK_ROLE: splunk_search_head
+    ports: ["127.0.0.1:18589:8089"]
+
+  # Round robin across the members with no stickiness: the setup that makes a
+  # poll land on a member that has not heard of a job yet. TCP mode, so TLS is
+  # the members' own and the balancer never sees a request.
+  lb:
+    image: ${REG_CONTRACT_HAPROXY_IMAGE:-haproxy:lts}
+    hostname: lb
+    volumes: ["./haproxy.cfg:/usr/local/etc/haproxy/haproxy.cfg:ro"]
+    ports: ["127.0.0.1:18989:8089"]
+    depends_on: [sh1, sh2, sh3]
