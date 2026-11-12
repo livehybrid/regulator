@@ -1,0 +1,71 @@
+# The contract suite (harness/contract) against a real Splunk cluster, built
+# on the runner: three search head cluster members behind a balancer, a
+# cluster manager, two indexers and SmartStore. Nightly and on demand; not on
+# pull requests, because it takes a quarter of an hour and tests Splunk's
+# behaviour rather than a change.
+#
+# A standard runner for a public repository has 4 CPUs, 16 GB of memory and a
+# 14 GB disk. The cluster needs about 25 GB of disk, so the job first removes
+# toolchains the runner ships with and this job does not use.
+name: contract
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "17 3 * * *"
+  push:
+    branches: [feat/contract-ci]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: contract-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  contract:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - name: What the runner has
+        run: |
+          nproc; free -g; df -h / /mnt 2>/dev/null || df -h /
+
+      - name: Free disk
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /usr/local/.ghcup \
+            /opt/hostedtoolcache/CodeQL /usr/local/share/boost /usr/share/swift || true
+          sudo docker image prune --all --force > /dev/null || true
+          df -h /
+
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r worker/requirements.txt -r server/requirements.txt pytest pytest-timeout "moto[server]"
+
+      - name: Bring the cluster up (accepts Splunk's licence and general terms)
+        run: PYTHON=python harness/contract/up.sh
+
+      - name: Resources with the cluster up
+        if: always()
+        run: |
+          free -g; df -h /; docker stats --no-stream --format '{{.Name}} {{.MemUsage}}'
+
+      - name: Contract tests
+        run: PYTHON=python harness/contract/test.sh -q
+
+      - name: Cluster logs on failure
+        if: failure()
+        run: |
+          cd harness/contract && docker compose ps && docker compose logs --tail 80
+
+      - name: Tear down
+        if: always()
+        run: harness/contract/down.sh
