@@ -13,7 +13,7 @@ import uuid
 
 import pytest
 
-from conftest import HEC_TOKEN, HEC_URL, INDEX, SH_URL, client_for, run, wait_for, with_client
+from conftest import HEC_TOKEN, HEC_URL, INDEX, SH_URL, client_for, oneshot, run, wait_for, with_client
 
 
 def test_host_resources_reads_cpu_memory_load_and_roles():
@@ -23,13 +23,8 @@ def test_host_resources_reads_cpu_memory_load_and_roles():
         now = time.time()
         return run(with_client(SH_URL, lambda c: host_resources(c, now - 900, now - 60)))
 
-    # Disk figures are written less often than CPU, so on a cluster minutes
-    # old they may not be there yet (seen on a fresh CI runner): wait for
-    # them rather than read the first answer.
-    result = wait_for(
-        lambda: (lambda r: r if r.get("available") and any(h.get("io") for h in r.get("hosts") or []) else None)(read()),
-        timeout_s=900, every_s=30, what="host resources with disk figures",
-    )
+    result = wait_for(lambda: (lambda r: r if r.get("available") else None)(read()),
+                      timeout_s=300, every_s=30, what="host resources")
     print({k: v for k, v in result.items() if k not in ("roles",)})
     assert result["available"], result.get("reason")
     hosts = {h["host"]: h for h in result["hosts"]}
@@ -45,9 +40,32 @@ def test_host_resources_reads_cpu_memory_load_and_roles():
         assert host["mem"].get("avg_pct") is not None, ("data.mem / data.mem_used", host)
         assert host["load"].get("avg") is not None, ("data.normalized_load_avg_1min", host)
         assert host.get("cores"), ("data.cpu_count / virtual_cpu_count", host)
+
+
+def test_disk_figures_are_read_wherever_splunkd_writes_them():
+    """IOStats, where the hosts have it.
+
+    splunkd did not write IOStats at all on GitHub's hosted runners (none in
+    fifteen minutes), where it did on another Docker host within minutes; the
+    cause was not established. So this checks Regulator's reading of them
+    where splunkd writes them, and says so plainly where it does not.
+    """
+    from regulator_agent.hostresources import host_resources
+
+    def written():
+        rows = run(oneshot(SH_URL, "search index=_introspection sourcetype=splunk_resource_usage "
+                                   "component=IOStats | head 1", earliest=time.time() - 1800))
+        return bool(rows)
+
+    try:
+        wait_for(written, timeout_s=240, every_s=30, what="any IOStats event")
+    except AssertionError:
+        pytest.skip("splunkd wrote no IOStats events on these hosts, so there is nothing to read")
+    now = time.time()
+    result = run(with_client(SH_URL, lambda c: host_resources(c, now - 1800, now - 60)))
     io = [h for h in result["hosts"] if h.get("io")]
     print("disk figures for:", [h["host"] for h in io], "mounts:", result["mounts"][:3])
-    assert io, ("IOStats", result["notes"])
+    assert io and result["mounts"], ("IOStats", result["notes"])
 
 
 def test_diagnose_finds_a_search_in_audit_and_on_each_indexer(corpus):
