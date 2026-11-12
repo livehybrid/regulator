@@ -163,3 +163,115 @@ def test_queueing_and_unknown_sids_are_counted_on_the_step_they_happened_to():
     assert sum(s["unknown_sid"]["responses"] for s in steps.values()) == stats.snapshot()["unknown_sid"]["responses"]
     # And the queued histogram travels, so a fleet's p95 is over the merged whole.
     assert "queued" in stats.steps["busy"].histograms()
+
+
+# ---------------------------------------------------------------- the ledger
+
+
+def test_the_ledger_keeps_the_searches_with_a_problem_and_the_slowest_that_worked():
+    from regulator_agent.results import LEDGER_SLOWEST
+
+    stats = RunStats(run_id="r")
+    stats.record(record(ok=False, error_class="timeout", error_detail="read timed out", sid="s-timeout"))
+    stats.record(record(ok=False, error_class="cancelled", sid="s-cut", latency_ms=200_000.0))
+    stats.record(record(sid="s-partial", partial=True))
+    for n in range(LEDGER_SLOWEST + 10):
+        stats.record(record(sid=f"s-{n}", latency_ms=float(n)))
+
+    ledger = stats.ledger.to_dict()
+    assert [(e["sid"], e["outcome"]) for e in ledger["problems"]] == [
+        ("s-timeout", "failed"), ("s-cut", "unfinished"), ("s-partial", "partial"),
+    ]
+    assert ledger["problems"][0]["error_detail"] == "read timed out"
+    slowest = [e["sid"] for e in ledger["slowest"]]
+    assert len(slowest) == LEDGER_SLOWEST
+    assert slowest[0] == f"s-{LEDGER_SLOWEST + 9}" and "s-0" not in slowest
+    # The live snapshot does not carry it: a heartbeat a second has no use for it.
+    assert "searches" not in stats.snapshot()
+
+
+def test_the_ledger_is_bounded_per_kind_and_counts_what_it_left_out():
+    from regulator_agent.results import LEDGER_PER_KIND
+
+    stats = RunStats(run_id="r")
+    for n in range(LEDGER_PER_KIND + 7):
+        stats.record(record(ok=False, error_class="server", sid=f"s-{n}"))
+    stats.record(record(ok=False, error_class="auth", sid="s-auth"))
+    ledger = stats.ledger.to_dict()
+    # One flood does not crowd out the other kind of failure.
+    assert len(ledger["problems"]) == LEDGER_PER_KIND + 1
+    assert ledger["problems"][-1]["sid"] == "s-auth"
+    assert ledger["dropped"] == {"failed:server": 7}
+
+
+def test_a_followed_search_is_updated_with_how_it_ended():
+    stats = RunStats(run_id="r")
+    cut = record(ok=False, error_class="cancelled", sid="s-cut")
+    gone = record(ok=False, error_class="cancelled", sid="s-gone")
+    stats.record(cut)
+    stats.record(gone)
+    cut.dispatch_state, cut.scan_count, cut.done_progress = "DONE", 1234, 1.0
+    stats.record_after_end(212.5, True, record=cut)
+    gone.dispatch_state, gone.done_progress = "RUNNING", 0.4
+    stats.record_after_end(None, False, record=gone)
+
+    first, second = stats.ledger.to_dict()["problems"]
+    assert first["outcome"] == "finished_after_end"
+    assert first["run_duration_s"] == 212.5 and first["scan_count"] == 1234
+    assert first["after_end"] == {
+        "finished": True, "run_duration_s": 212.5, "dispatch_state": "DONE", "done_progress": 1.0, "scan_count": 1234,
+    }
+    assert second["outcome"] == "still_running"
+    assert second["after_end"]["done_progress"] == 0.4
+    assert stats.finished_after_end == 1 and stats.still_running_at_end == 1
+
+
+def test_a_followed_search_that_failed_on_the_target_is_not_called_still_running():
+    stats = RunStats(run_id="r")
+    died = record(ok=False, error_class="cancelled", sid="s-died")
+    stats.record(died)
+    died.dispatch_state, died.messages = "FAILED", ["FATAL: search process did not exit cleanly"]
+    stats.record_after_end(None, False, record=died)
+    entry = stats.ledger.to_dict()["problems"][0]
+    assert entry["outcome"] == "failed_after_end"
+    assert entry["messages"] == ["FATAL: search process did not exit cleanly"]
+
+
+def test_a_jobs_performance_table_is_cut_down_and_kept_out_of_the_record():
+    from regulator_agent.results import LEDGER_PHASES, compact_performance, ledger_entry
+
+    table = {f"command.c{n}": {"duration_secs": n, "invocations": 1, "input_count": 0, "output_count": n} for n in range(30)}
+    table["dispatch.stream.remote.idx1"] = {"duration_secs": "4.5", "invocations": "2", "output_count": "900"}
+    table["dispatch.stream.remote.idx2"] = {"duration_secs": 9.0}
+    table["not a row"] = "ignored"
+
+    compact = compact_performance(table)
+    assert [row["name"] for row in compact["phases"]][:2] == ["command.c29", "command.c28"]
+    assert len(compact["phases"]) == LEDGER_PHASES and compact["phases_dropped"] == 30 - LEDGER_PHASES
+    assert compact["indexers"] == [
+        {"name": "idx2", "seconds": 9.0},
+        {"name": "idx1", "seconds": 4.5, "invocations": 2, "output": 900},
+    ]
+    assert compact_performance({}) is None and compact_performance(None) is None
+
+    rec = record(sid="s", performance=table)
+    assert "performance" not in rec.to_dict()
+    assert rec.performance is table  # and to_dict left the record as it was
+    assert ledger_entry(rec)["performance"]["phases"][0]["name"] == "command.c29"
+
+
+def test_ledgers_from_a_fleet_merge_under_the_same_caps():
+    from regulator_agent.results import LEDGER_SLOWEST, merge_ledgers
+
+    def doc(slot):
+        return {
+            "problems": [{"sid": f"p{slot}", "outcome": "failed", "started_at": 100.0 - slot}],
+            "slowest": [{"sid": f"w{slot}-{n}", "service_time_ms": slot * 1000.0 + n} for n in range(LEDGER_SLOWEST)],
+            "dropped": {"failed:server": slot},
+        }
+
+    merged = merge_ledgers([doc(1), doc(2), None, "not a ledger"])
+    assert [e["sid"] for e in merged["problems"]] == ["p2", "p1"]  # by start time
+    assert len(merged["slowest"]) == LEDGER_SLOWEST
+    assert all(e["sid"].startswith("w2-") for e in merged["slowest"])
+    assert merged["dropped"] == {"failed:server": 3}

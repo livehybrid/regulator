@@ -505,7 +505,7 @@ class FakeSplunk:
             "latestTime": job.latest or _iso(job.created_wall),
             "eventSearch": _event_search(job.spl),
             "searchProviders": ["fake-splunk"],
-            "performance": {},
+            "performance": _performance(run_duration, job.scan_count, job.event_count),
             "ttl": job.timeout or "86400",
             "messages": messages,
             "request": {
@@ -1210,6 +1210,30 @@ def _sleep_ms(milliseconds: float) -> None:
 
 def _iso(timestamp: float) -> str:
     return time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime(timestamp)) + ".000+00:00"
+
+
+def _performance(run_duration: float, scan_count: int, event_count: int) -> Dict[str, Any]:
+    """A job's performance table in splunkd's shape: phases, then one row a peer."""
+    if run_duration <= 0:
+        return {}
+
+    def row(share: float, output: int, invocations: int = 1) -> Dict[str, Any]:
+        return {
+            "duration_secs": round(run_duration * share, 3),
+            "invocations": invocations,
+            "input_count": 0,
+            "output_count": output,
+        }
+
+    return {
+        "command.search": row(0.8, event_count),
+        "command.search.index": row(0.3, scan_count, 4),
+        "command.search.rawdata": row(0.4, event_count, 4),
+        "dispatch.fetch": row(0.9, event_count),
+        "dispatch.stream.remote": row(0.7, scan_count, 2),
+        "dispatch.stream.remote.idx-a": row(0.5, scan_count // 2),
+        "dispatch.stream.remote.idx-b": row(0.2, scan_count - scan_count // 2),
+    }
 
 
 def _event_search(spl: str) -> str:

@@ -171,6 +171,8 @@ def _serialise(
         base["stats"] = live or run.stats_json
         base["summary"] = run.summary_json
         base["markers"] = markers_for(run)
+        # For the links from a search in the ledger to the target's own UI.
+        base["target_web_url"] = run.target.web_url if run.target is not None else None
     else:
         # The list used to ship every run's complete summary, per-step
         # aggregates and correlation rows included, to draw six columns.
@@ -445,6 +447,65 @@ def stop_run(
             run.ended_at = run.ended_at or time.time()
             session.add(run)
     return _serialise(run) if run is not None else {}
+
+
+@router.post("/runs/{run_id}/diagnose")
+async def diagnose_run(
+    run_id: int, request: Request, session: Session = Depends(get_session)
+) -> Dict[str, Any]:
+    """Work out why searches in a finished run failed, and keep the answer on the run.
+
+    Only once the run is over, and only while nothing else is running on its
+    target: the lookups are searches on that target, and a diagnosis is not
+    worth perturbing a measurement for.
+    """
+    from .. import diagnose as _diagnose
+    from .targets import _runs_in_flight, _with_client
+
+    run = session.get(Run, run_id)
+    if run is None:
+        raise HTTPException(status_code=404, detail=f"no run with id {run_id}")
+    if not is_terminal(run.state):
+        raise HTTPException(
+            status_code=409,
+            detail="the run is still going: a diagnosis asks the target questions, so it waits for the run to end",
+        )
+    busy = _runs_in_flight(session, run.target_id) if run.target_id is not None else []
+    if busy:
+        raise HTTPException(
+            status_code=409,
+            detail=f"run {busy[0]} is in flight on this target: diagnose when it has finished, so its numbers are not disturbed",
+        )
+    settings = get_settings()
+    stats = run.stats_json if isinstance(run.stats_json, dict) else None
+    facts = dict(
+        state=run.state,
+        started_at=run.started_at,
+        ended_at=run.ended_at,
+        duration_s=run.duration_s,
+        drain_budget_s=float(settings.drain_budget_s),
+        harvest_s=float(settings.harvest_s),
+    )
+    target = run.target
+    if target is None or not _diagnose.ledger_sids(_diagnose.ledger_of(stats)):
+        # Nothing to ask the target: Regulator's own record is the diagnosis.
+        result = await _diagnose.diagnose(None, stats, **facts)
+        if target is None:
+            result["note"] = "the run's target no longer exists, so only Regulator's own record was read"
+    else:
+        result = await _with_client(
+            target, lambda client: _diagnose.diagnose(client, stats, **facts), timeout_s=420.0
+        )
+    # A new dict, not a mutation: the JSON column only notices assignment.
+    run.summary_json = {**(run.summary_json or {}), "diagnosis": result}
+    session.add(run)
+    audit_record(
+        "run_diagnosed", request=request, target_id=run.target_id,
+        detail=f"run {run_id}: {result.get('sids', 0)} search id(s) looked up in "
+        f"{(result.get('self_load') or {}).get('queries', 0)} search(es) on the target",
+    )
+    session.commit()
+    return result
 
 
 class RunUpdate(BaseModel):

@@ -692,6 +692,21 @@ def test_merging_adds_up_searches_unfinished_at_the_end():
     assert stats["errors"] == 0
 
 
+def test_merging_keeps_each_workers_search_ledger():
+    a = _summary(0, [100.0], 1)
+    b = _summary(1, [100.0], 1)
+    a["stats"]["searches"] = {"problems": [{"sid": "reg_a_1", "outcome": "failed", "started_at": 20.0}], "slowest": [], "dropped": {}}
+    b["stats"]["searches"] = {
+        "problems": [{"sid": "reg_b_1", "outcome": "still_running", "started_at": 10.0}],
+        "slowest": [{"sid": "reg_b_2", "outcome": "slow", "service_time_ms": 900.0}],
+        "dropped": {"failed:server": 2},
+    }
+    ledger = fleet.merge_summaries("r1", "s", [a, b], lost_slots=[])["stats"]["searches"]
+    assert [e["sid"] for e in ledger["problems"]] == ["reg_b_1", "reg_a_1"]
+    assert [e["sid"] for e in ledger["slowest"]] == ["reg_b_2"]
+    assert ledger["dropped"] == {"failed:server": 2}
+
+
 def test_a_fleet_run_warms_its_confirmed_plan_once_before_any_worker_exists(client, fake_driver):
     """The control plane warms; the workers are told not to and never do."""
     cold = FakeSplunk(

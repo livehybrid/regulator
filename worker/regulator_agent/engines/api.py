@@ -693,10 +693,14 @@ class ApiEngine:
         """Follow abandoned searches to completion after the run.
 
         Returns ``(record, run_duration_s, finished)`` for each parked job.
-        Each job is followed for at most ``budget_s`` overall and never past
-        ``read_timeout_s`` from its own dispatch, the same limit a search gets
-        during the run. Every parked job is deleted at the end, finished or
-        not, so nothing is left running on the target.
+        Every job is followed for ``budget_s``, however long it had already
+        been running: a search is given no time limit of its own during the
+        run, so it gets none here either. (An earlier version also stopped at
+        ``read_timeout_s`` from the job's dispatch, which deleted any search
+        older than five minutes the moment the run ended.) Each record is
+        updated with the last thing the job said about itself, and every
+        parked job is deleted at the end, finished or not, so nothing is left
+        running on the target.
         """
         parked, self._parked = self._parked, []
         if not parked:
@@ -709,11 +713,27 @@ class ApiEngine:
         pending = {record.sid: (record, started) for record, started in parked if record.sid}
         results: Dict[str, Tuple[StepRecord, Optional[float], bool]] = {}
         interval_s = max(0.5, self._config.poll_max_ms / 1000.0)
+
+        def note(record: StepRecord, status: Any) -> None:
+            # What the job last said, for the ledger: how far it had got and
+            # where its time went, whether or not it finished.
+            record.dispatch_state = status.dispatch_state or record.dispatch_state
+            record.done_progress = status.done_progress
+            record.is_finalized = status.is_finalized
+            for name in ("run_duration_s", "scan_count", "event_count", "result_count"):
+                value = getattr(status, name)
+                if value is not None:
+                    setattr(record, name, value)
+            if status.performance:
+                record.performance = status.performance
+            if status.messages:
+                record.messages = list(status.messages)
+
         try:
             while pending:
                 now = time.perf_counter()
                 for sid, (record, started) in list(pending.items()):
-                    if now >= min(overall, started + self._config.read_timeout_s):
+                    if now >= overall:
                         results[sid] = (record, None, False)
                         del pending[sid]
                         continue
@@ -734,6 +754,7 @@ class ApiEngine:
                         results[sid] = (record, None, False)
                         del pending[sid]
                         continue
+                    note(record, status)
                     if status.is_done or status.is_failed:
                         finished = status.is_done and not status.is_failed
                         results[sid] = (record, status.run_duration_s if finished else None, finished)
@@ -881,6 +902,8 @@ class ApiEngine:
                 record.scan_count = job.scan_count
                 record.event_count = job.event_count
                 record.result_count = job.result_count
+                record.done_progress = job.done_progress
+                record.performance = job.performance
                 if job.messages:
                     record.messages = list(job.messages)
 

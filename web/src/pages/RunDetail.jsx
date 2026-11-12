@@ -32,6 +32,7 @@ import PromoteBaselineModal from '../modals/PromoteBaselineModal';
 import PurgeModal from '../modals/PurgeModal';
 import RunCharts from '../components/RunCharts';
 import SearchIssues from '../components/SearchIssues';
+import SearchLedger from '../components/SearchLedger';
 import SutSection from '../components/SutSection';
 import WorkersSection from '../components/WorkersSection';
 import { loadText } from './Runs';
@@ -731,6 +732,17 @@ export default function RunDetail({ runId, navigate, onLaunch }) {
             <ComparisonPanel comparison={comparison} />
 
             <SearchIssues stats={stats} sut={summary.sut} />
+
+            <SearchLedger
+                run={run}
+                stats={stats}
+                summary={summary}
+                onDiagnosed={(diagnosis) =>
+                    setRun((current) =>
+                        current ? { ...current, summary: { ...(current.summary || {}), diagnosis } } : current
+                    )
+                }
+            />
 
             <SutSection sut={summary.sut} />
 
