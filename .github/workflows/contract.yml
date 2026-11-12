@@ -4,9 +4,10 @@
 # pull requests, because it takes a quarter of an hour and tests Splunk's
 # behaviour rather than a change.
 #
-# A standard runner for a public repository has 4 CPUs, 16 GB of memory and a
-# 14 GB disk. The cluster needs about 25 GB of disk, so the job first removes
-# toolchains the runner ships with and this job does not use.
+# Runs on a standard runner, free for a public repository. Measured on one:
+# 4 CPUs, 16 GB of memory (the cluster used under 6 GB) and far more disk
+# than the documented 14 GB (93 GB free). The job still removes toolchains it
+# does not use, as headroom against a smaller image.
 name: contract
 
 on:

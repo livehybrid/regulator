@@ -19,8 +19,17 @@ from conftest import HEC_TOKEN, HEC_URL, INDEX, SH_URL, client_for, run, wait_fo
 def test_host_resources_reads_cpu_memory_load_and_roles():
     from regulator_agent.hostresources import host_resources
 
-    now = time.time()
-    result = run(with_client(SH_URL, lambda c: host_resources(c, now - 900, now - 60)))
+    def read():
+        now = time.time()
+        return run(with_client(SH_URL, lambda c: host_resources(c, now - 900, now - 60)))
+
+    # Disk figures are written less often than CPU, so on a cluster minutes
+    # old they may not be there yet (seen on a fresh CI runner): wait for
+    # them rather than read the first answer.
+    result = wait_for(
+        lambda: (lambda r: r if r.get("available") and any(h.get("io") for h in r.get("hosts") or []) else None)(read()),
+        timeout_s=900, every_s=30, what="host resources with disk figures",
+    )
     print({k: v for k, v in result.items() if k not in ("roles",)})
     assert result["available"], result.get("reason")
     hosts = {h["host"]: h for h in result["hosts"]}
@@ -62,7 +71,10 @@ def test_diagnose_finds_a_search_in_audit_and_on_each_indexer(corpus):
     def asked():
         queries, rows = run(with_client(SH_URL, lambda c: diagnose.ask_target(c, [sid], started, time.time() + 60)))
         found = diagnose.fold([sid], rows["audit"], rows["indexers"], rows["logs"]).get(sid) or {}
-        return (queries, found) if found.get("audit") and found.get("indexers") else None
+        # "completed" is written when the search ends and can lag the
+        # "granted" record by a while on a busy cluster (seen on CI).
+        ended = (found.get("audit") or {}).get("ended")
+        return (queries, found) if ended == "completed" and found.get("indexers") else None
 
     queries, found = wait_for(asked, timeout_s=240, every_s=15, what="audit and remote search records of the search")
     print("queries:", queries)
