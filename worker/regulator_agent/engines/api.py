@@ -163,6 +163,9 @@ class ApiEngine:
         # decides whether a 404 means "not yet" or "gone": see
         # Config.unknown_sid_grace_ms.
         self._dispatched_at: Dict[str, float] = {}
+        # When each job was last answered for, by any member. The grace runs
+        # from here rather than from the dispatch: see _grace_left_s.
+        self._seen_at: Dict[str, float] = {}
         # Deletes that met a member which had not heard of the job yet, retried
         # in the background so the virtual user is not held up by housekeeping
         # and the artefact is not left on the cluster for its whole TTL.
@@ -172,20 +175,38 @@ class ApiEngine:
     # ------------------------------------------------------------------
     # Search ids a search head cluster member has not heard of yet
     # ------------------------------------------------------------------
-    def _grace_left_s(self, dispatched_at: float) -> float:
+    def _grace_left_s(self, dispatched_at: float, sid: Optional[str] = None) -> float:
+        """How long a 404 for this job may still be taken for the wrong member.
+
+        Counted from the last time any member answered for the job, not from
+        its dispatch. A search head cluster member knows only the ad hoc jobs
+        it dispatched itself, for their whole life (confirmed on a live 10.6
+        cluster: the other members answered 404 for thirty seconds and never
+        learned of it). Behind a balancer with no stickiness, two polls in
+        three then land on a member that will never know the job. Counted from
+        the dispatch, the grace ran out ten seconds in and failed every search
+        that took longer; counted from the last sighting, a job is given up
+        only when no member has answered for it for the whole grace.
+        """
         grace_s = max(0, self._config.unknown_sid_grace_ms) / 1000.0
-        return dispatched_at + grace_s - time.perf_counter()
+        since = max(dispatched_at, self._seen_at.get(sid, 0.0)) if sid else dispatched_at
+        return since + grace_s - time.perf_counter()
+
+    def _saw(self, sid: Optional[str]) -> None:
+        if sid:
+            self._seen_at[sid] = time.perf_counter()
 
     def _note_unknown_sid(self, record: StepRecord) -> None:
         record.unknown_sid_count += 1
         if not self._unknown_sid_noted:
             self._unknown_sid_noted = True
             log.info(
-                "splunkd answered 404 for search id %s shortly after dispatching it. "
-                "Treating a 404 within %d ms of dispatch as a member that has not heard "
-                "of the job yet (a search head cluster behind a load balancer without "
-                "stickiness does this) and asking again; each one is counted on the "
-                "record as unknown_sid_count",
+                "splunkd answered 404 for search id %s. Treating a 404 within %d ms of "
+                "the job last being answered for as a member that does not know it (a "
+                "search head cluster member knows only the jobs it dispatched, so a "
+                "balancer without stickiness does this) and asking again; each one is "
+                "counted on the record as unknown_sid_count. Sticky sessions on the "
+                "balancer avoid it",
                 record.sid, self._config.unknown_sid_grace_ms,
             )
 
@@ -214,11 +235,13 @@ class ApiEngine:
         max_delay_s = max(delay_s, self._config.poll_max_ms / 1000.0)
         while True:
             try:
-                return await call()
+                answer = await call()
+                self._saw(record.sid)
+                return answer
             except SplunkHttpError as exc:
                 if exc.status != 404:
                     raise
-                left_s = self._grace_left_s(dispatched_at)
+                left_s = self._grace_left_s(dispatched_at, record.sid)
                 if left_s <= 0:
                     raise self._sid_gone(exc, record, dispatched_at) from exc
                 self._note_unknown_sid(record)
@@ -739,9 +762,10 @@ class ApiEngine:
                         continue
                     try:
                         status = await self._client.job_status(sid)
+                        self._saw(sid)
                     except SplunkHttpError as exc:
                         if exc.status == 404 and self._grace_left_s(
-                            self._dispatched_at.get(sid, started)
+                            self._dispatched_at.get(sid, started), sid
                         ) > 0:
                             # Not heard of yet by the member asked; next round.
                             continue
@@ -792,14 +816,17 @@ class ApiEngine:
         if not record.sid:
             return
         dispatched_at = self._dispatched_at.pop(record.sid, None)
+        seen_at = self._seen_at.pop(record.sid, None)
         if not self._config.delete_jobs:
             return
         try:
             found = await asyncio.shield(self._client.delete_job(record.sid))
         except Exception:  # noqa: BLE001
             return
-        if not found and dispatched_at is not None and self._grace_left_s(dispatched_at) > 0:
-            task = asyncio.ensure_future(self._late_delete(record.sid, dispatched_at))
+        # The delete, too, can land on a member that does not know the job.
+        since = max(dispatched_at, seen_at or 0.0) if dispatched_at is not None else None
+        if not found and since is not None and self._grace_left_s(since) > 0:
+            task = asyncio.ensure_future(self._late_delete(record.sid, since))
             self._late_deletes.add(task)
             task.add_done_callback(self._late_deletes.discard)
 
@@ -865,10 +892,11 @@ class ApiEngine:
             record.poll_count += 1
             try:
                 job = await self._client.job_status(sid)
+                self._saw(sid)
             except SplunkHttpError as exc:
                 if exc.status != 404:
                     raise
-                if self._grace_left_s(dispatched_at) <= 0:
+                if self._grace_left_s(dispatched_at, sid) <= 0:
                     raise self._sid_gone(exc, record, dispatched_at) from exc
                 # The member this poll landed on has not heard of the job
                 # yet. Nothing is known about the interval just elapsed, so it
@@ -952,6 +980,10 @@ class ApiEngine:
 _PARTIAL_MARKERS = (
     "might be incomplete",
     "may be incomplete",
+    # 10.6, when a peer could not download the buckets a search needed: the
+    # job ends DONE with no events and this ERROR. Seen on a live cluster.
+    "may have returned partial results",
+    "partial results",
     "results are incomplete",
     "incomplete results",
     "unable to distribute",

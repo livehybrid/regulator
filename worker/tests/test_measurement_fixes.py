@@ -336,6 +336,8 @@ def test_a_run_id_default_carries_the_start_time(env):
     [
         ("WARN: Unable to distribute to peer named idx3 at uri https://idx3:8089 because peer has status = Down. Results might be incomplete.", True),
         ("WARN: Search auto-finalized after time limit (60 seconds) reached.", True),
+        # Splunk 10.6, a SmartStore peer that could not download its buckets.
+        ('ERROR: [idx1,idx2] The search process with search_id="remote_sh1_1794495661.243_DFFD3F71" may have returned partial results. Try running your search again.', True),
         ("WARN: The search you ran returned a number of results that exceeded the maximum of 500000.", True),
         # Seen live: a slow box warning about limits.conf says nothing about the results.
         ("WARN: Configuration initialization for /opt/splunk/etc took longer than expected (5550ms) when dispatching a search with search ID 1788460920.15309. This might be a hint that the limits.conf setting is too low.", False),

@@ -1,0 +1,19 @@
+# Pushed from the cluster manager to both indexers by up.sh.
+# A SmartStore index with small buckets, so a test can roll, upload, evict and
+# re-read buckets in seconds rather than waiting for real volumes.
+
+[volume:remote_store]
+storageType = remote
+path = s3://@BUCKET@
+remote.s3.endpoint = @ENDPOINT@
+remote.s3.access_key = @ACCESS_KEY@
+remote.s3.secret_key = @SECRET_KEY@
+
+[contract]
+homePath = $SPLUNK_DB/contract/db
+coldPath = $SPLUNK_DB/contract/colddb
+thawedPath = $SPLUNK_DB/contract/thaweddb
+remotePath = volume:remote_store/$_index_name
+repFactor = auto
+maxDataSize = 10
+maxHotBuckets = 2
