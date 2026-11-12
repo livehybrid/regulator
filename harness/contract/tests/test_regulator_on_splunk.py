@@ -79,7 +79,7 @@ def test_diagnose_finds_a_search_in_audit_and_on_each_indexer(corpus):
 
 @pytest.mark.skipif(not HEC_URL, reason="needs a HEC address")
 def test_the_freshness_probe_finds_its_events_on_a_real_cluster():
-    # The probe lands with issue 21; until both are in, this is skipped.
+    # Skipped on a checkout without the probe.
     FreshnessProbe = pytest.importorskip("regulator_agent.freshness").FreshnessProbe
 
     async def go():

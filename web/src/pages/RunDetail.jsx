@@ -30,6 +30,7 @@ import DeleteRunsModal, { DELETABLE_STATES } from '../modals/DeleteRunsModal';
 import EditRunModal from '../modals/EditRunModal';
 import HostResources from '../components/HostResources';
 import FleetLogsModal from '../modals/FleetLogsModal';
+import Freshness from '../components/Freshness';
 import PromoteBaselineModal from '../modals/PromoteBaselineModal';
 import PurgeModal from '../modals/PurgeModal';
 import RunCharts from '../components/RunCharts';
@@ -751,6 +752,8 @@ export default function RunDetail({ runId, navigate, onLaunch }) {
             <SutSection sut={summary.sut} />
 
             {!live && <HostResources resources={summary.resources} />}
+
+            {!live && <Freshness freshness={summary.freshness} run={run} />}
 
             <SectionHeading>Steps, worst p95 first</SectionHeading>
             {steps.length ? (

@@ -171,6 +171,33 @@ before it existed get one from whatever they collected. The thresholds are in
 `server/regulator_server/bottleneck.py` and are a first cut, set by judgement
 and not yet calibrated against real clusters.
 
+### Ingest to searchable
+
+How stale is the data a search returns, and how does that change under load? A
+run can measure it. Give the target a HEC address and token (Targets page),
+tick "Measure how long an event takes from being sent to being searchable" at
+launch and name an index the token can write to. While the run goes, Regulator
+sends a small probe event over HEC every N seconds (default 10), each with a
+unique id, and searches for the probes about twice as often. For each probe it
+records how long after sending it first became searchable.
+
+Regulator sends the probes itself, rather than leaving it to the ingest tool
+generating the ingest load, so that the send time and the time it was found are
+read from the same clock: the headline figure has no clock skew in it. The
+ingest load can come from Stoker, from production, or from nothing at all.
+
+The run page shows the p50, p95, p99 and maximum, a chart of each probe over
+the run, and the probes sent before the load started (a fleet's provisioning)
+as an idle baseline. It also splits the time at `_indextime` into "sent to
+indexed" and "indexed to searchable". That split crosses the indexer's clock
+and this host's, and `_indextime` is whole seconds, so it is to the second at
+best; a probe indexed before it was sent proves the clocks disagree, and the
+split is then withheld rather than shown wrong. A probe is placed between the
+last search that missed it and the first that found it, and the mean width of
+that interval is reported as the resolution. Probes not found 120 seconds
+after the run are counted as not found. The probes are searchable afterwards as
+`index=<index> sourcetype="regulator:freshness" source="regulator:r<run>"`.
+
 ### Contract tests against a real cluster
 
 Almost every test runs against the fake splunkd in `tools/fake_splunk.py`, which
