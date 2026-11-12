@@ -14,8 +14,6 @@ on:
   workflow_dispatch:
   schedule:
     - cron: "17 3 * * *"
-  push:
-    branches: [feat/contract-ci]
 
 permissions:
   contents: read
