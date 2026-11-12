@@ -13,14 +13,18 @@ import uuid
 
 import pytest
 
-from conftest import HEC_TOKEN, HEC_URL, INDEX, SH_URL, client_for, run, wait_for, with_client
+from conftest import HEC_TOKEN, HEC_URL, INDEX, SH_URL, client_for, oneshot, run, wait_for, with_client
 
 
 def test_host_resources_reads_cpu_memory_load_and_roles():
     from regulator_agent.hostresources import host_resources
 
-    now = time.time()
-    result = run(with_client(SH_URL, lambda c: host_resources(c, now - 900, now - 60)))
+    def read():
+        now = time.time()
+        return run(with_client(SH_URL, lambda c: host_resources(c, now - 900, now - 60)))
+
+    result = wait_for(lambda: (lambda r: r if r.get("available") else None)(read()),
+                      timeout_s=300, every_s=30, what="host resources")
     print({k: v for k, v in result.items() if k not in ("roles",)})
     assert result["available"], result.get("reason")
     hosts = {h["host"]: h for h in result["hosts"]}
@@ -36,9 +40,34 @@ def test_host_resources_reads_cpu_memory_load_and_roles():
         assert host["mem"].get("avg_pct") is not None, ("data.mem / data.mem_used", host)
         assert host["load"].get("avg") is not None, ("data.normalized_load_avg_1min", host)
         assert host.get("cores"), ("data.cpu_count / virtual_cpu_count", host)
-    io = [h for h in result["hosts"] if h.get("io")]
+
+
+def test_disk_figures_are_read_wherever_splunkd_writes_them():
+    """IOStats, where the hosts have it.
+
+    On GitHub's hosted runners splunkd did write IOStats, and Regulator read
+    none of them: its queries grouped by a mount point those events did not
+    carry. Skipped only where splunkd writes no IOStats at all.
+    """
+    from regulator_agent.hostresources import host_resources
+
+    def written():
+        rows = run(oneshot(SH_URL, "search index=_introspection sourcetype=splunk_resource_usage "
+                                   "component=IOStats | head 1", earliest=time.time() - 1800))
+        return bool(rows)
+
+    try:
+        wait_for(written, timeout_s=240, every_s=30, what="any IOStats event")
+    except AssertionError:
+        pytest.skip("splunkd wrote no IOStats events on these hosts, so there is nothing to read")
+    sample = run(oneshot(SH_URL, "search index=_introspection sourcetype=splunk_resource_usage "
+                                 "component=IOStats | head 2 | table host _raw", earliest=time.time() - 1800))
+    print("IOStats as splunkd writes it here:", sample)
+    now = time.time()
+    result = run(with_client(SH_URL, lambda c: host_resources(c, now - 1800, now - 60)))
+    io = [h for h in result["hosts"] if (h.get("io") or {}).get("read_mb_s") is not None]
     print("disk figures for:", [h["host"] for h in io], "mounts:", result["mounts"][:3])
-    assert io, ("IOStats", result["notes"])
+    assert io and result["mounts"], ("IOStats", result["notes"], sample)
 
 
 def test_diagnose_finds_a_search_in_audit_and_on_each_indexer(corpus):
@@ -62,7 +91,10 @@ def test_diagnose_finds_a_search_in_audit_and_on_each_indexer(corpus):
     def asked():
         queries, rows = run(with_client(SH_URL, lambda c: diagnose.ask_target(c, [sid], started, time.time() + 60)))
         found = diagnose.fold([sid], rows["audit"], rows["indexers"], rows["logs"]).get(sid) or {}
-        return (queries, found) if found.get("audit") and found.get("indexers") else None
+        # "completed" is written when the search ends and can lag the
+        # "granted" record by a while on a busy cluster (seen on CI).
+        ended = (found.get("audit") or {}).get("ended")
+        return (queries, found) if ended == "completed" and found.get("indexers") else None
 
     queries, found = wait_for(asked, timeout_s=240, every_s=15, what="audit and remote search records of the search")
     print("queries:", queries)

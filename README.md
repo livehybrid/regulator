@@ -185,6 +185,12 @@ make contract-test
 make contract-down
 ```
 
+The suite also runs nightly, and on demand from the Actions tab, on a
+standard GitHub-hosted runner (`.github/workflows/contract.yml`): free for a
+public repository, with room to spare (the cluster used under 6 GB of its
+16 GB of memory). A run takes about twenty minutes, most of it bringing the
+cluster up.
+
 `contract-up` needs Docker, about 16 GB of memory and 25 GB of disk, and
 starts every container on the trial licence the `splunk/splunk` image carries,
 which means accepting Splunk's licence and general terms. It takes about seven
@@ -204,6 +210,7 @@ What the first run, against Splunk 10.6, found:
 | The partial-results messages Regulator recognises | **Incomplete.** 10.6 reports a peer that could not download its buckets as "may have returned partial results", with the job DONE and no events. Now recognised |
 | Diagnose's indexer query | **Wrong anchor.** The line is "Streamed search connection closed", not "terminated". Fixed; every field it reads is confirmed |
 | Host resources and the freshness probe | Confirmed end to end |
+| Host disk figures on every Linux host | **Not everywhere.** On GitHub's hosted runners splunkd's IOStats events name no mount point, and the disk queries grouped by it, so every one was dropped. A disk is now its mount point or its device |
 
 Also seen: on a replicated SmartStore bucket the copy that did not upload reports
 `upload_status=canceled` and sits evicted on its peer, which is why the

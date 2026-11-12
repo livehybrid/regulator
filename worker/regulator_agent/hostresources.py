@@ -101,14 +101,18 @@ def hostwide_spl(span_s: int) -> str:
 
 
 def io_series_spl(span_s: int) -> str:
-    # Per mount first, then per host: throughput adds up across a host's
-    # disks, and the wait that matters is the worst disk's.
+    # Per disk first, then per host: throughput adds up across a host's
+    # disks, and the wait that matters is the worst disk's. A disk is its
+    # mount point, or its device where an event names no mount point: a
+    # stats "by" a field an event lacks drops the event, and on GitHub's
+    # hosted runners every IOStats event was dropped that way.
     return (
         "search index=_introspection sourcetype=splunk_resource_usage component=IOStats "
         f"| bin _time span={int(span_s)}s "
+        "| eval disk=coalesce('data.mount_point', 'data.device', \"unnamed\") "
         "| stats avg(data.reads_kb_ps) as read_kb_ps, avg(data.writes_kb_ps) as write_kb_ps, "
         "avg(data.reads_ps) as reads_ps, avg(data.writes_ps) as writes_ps, "
-        "avg(data.avg_total_ms) as wait_ms by _time, host, data.mount_point "
+        "avg(data.avg_total_ms) as wait_ms by _time, host, disk "
         "| stats sum(read_kb_ps) as read_kb_ps, sum(write_kb_ps) as write_kb_ps, "
         "sum(reads_ps) as reads_ps, sum(writes_ps) as writes_ps, max(wait_ms) as wait_ms by _time, host "
         "| eval t=_time | fields - _time"
@@ -118,11 +122,11 @@ def io_series_spl(span_s: int) -> str:
 def io_mounts_spl() -> str:
     return (
         "search index=_introspection sourcetype=splunk_resource_usage component=IOStats "
+        "| eval mount=coalesce('data.mount_point', 'data.device', \"unnamed\") "
         "| stats avg(data.avg_total_ms) as avg_wait_ms, max(data.avg_total_ms) as max_wait_ms, "
         "avg(data.reads_kb_ps) as read_kb_ps, avg(data.writes_kb_ps) as write_kb_ps, "
         "avg(data.reads_ps) as reads_ps, avg(data.writes_ps) as writes_ps, "
-        "latest(data.fs_type) as fs_type, latest(data.device) as device by host, data.mount_point "
-        '| rename "data.mount_point" as mount '
+        "latest(data.fs_type) as fs_type, latest(data.device) as device by host, mount "
         "| sort 0 - max_wait_ms"
     )
 
