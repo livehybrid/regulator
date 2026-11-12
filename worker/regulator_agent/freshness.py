@@ -314,15 +314,19 @@ class FreshnessProbe:
         in_run = [p for p in sent_ok if during(p)]
         before = [p for p in sent_ok if start is not None and p.sent_wall < start]
         found = [p for p in in_run if p.found]
-        index_delays = [p.indextime - p.sent_wall for p in found if p.indextime is not None]
-        after_index = [p.found_wall - p.indextime for p in found if p.indextime is not None and p.found_wall]
+        # _indextime is the whole second the event was indexed in, so the
+        # middle of that second is the best estimate: a truncated second read
+        # as exact made a probe indexed 0.3 s after it was sent look as if it
+        # had been indexed 0.3 s before (seen on a live 10.6 cluster).
+        index_delays = [p.indextime + 0.5 - p.sent_wall for p in found if p.indextime is not None]
+        after_index = [p.found_wall - (p.indextime + 0.5) for p in found if p.indextime is not None and p.found_wall]
         widths = [p.found_hi_s - p.found_lo_s for p in found]
         skewed = [d for d in index_delays if d < -1.0]
 
         points = [
             [round(p.sent_wall, 3),
              round(p.latency_s, 3) if p.found else None,
-             round(p.indextime - p.sent_wall, 3) if p.indextime is not None else None]
+             round(p.indextime + 0.5 - p.sent_wall, 3) if p.indextime is not None else None]
             for p in sent_ok
         ]
         if len(points) > MAX_POINTS:
@@ -366,6 +370,11 @@ class FreshnessProbe:
         return out
 
 
+def _about(seconds: float) -> str:
+    """A figure read across two clocks to the second, said no more precisely."""
+    return "under a second" if seconds < 1.0 else f"{seconds:.0f}s"
+
+
 def findings(result: Dict[str, Any]) -> List[str]:
     out: List[str] = []
     if not result.get("available"):
@@ -400,8 +409,8 @@ def findings(result: Dict[str, Any]) -> List[str]:
         )
     elif index_delay.get("count") and after.get("count"):
         out.append(
-            f"Of that, indexing took {index_delay['p50_s']:.1f}s at the median (p95 {index_delay['p95_s']:.1f}s) "
-            f"and becoming searchable once indexed {after['p50_s']:.1f}s (p95 {after['p95_s']:.1f}s), "
+            f"Of that, indexing took {_about(index_delay['p50_s'])} at the median (p95 {_about(index_delay['p95_s'])}) "
+            f"and becoming searchable once indexed {_about(after['p50_s'])} (p95 {_about(after['p95_s'])}), "
             "across the indexer's clock and this host's, to the second."
         )
     return out

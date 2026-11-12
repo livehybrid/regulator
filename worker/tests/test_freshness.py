@@ -56,8 +56,9 @@ def test_probes_are_sent_found_and_timed_on_one_clock():
     assert result["resolution_s"] <= 2 * probe.poll_s + 0.5
     # The fake indexes on arrival, so the split puts the delay after indexing,
     # to the second (_indextime is whole seconds).
-    assert result["index_delay"]["max_s"] <= 1.0
-    assert result["after_index"]["p50_s"] >= 0.5
+    # (_indextime is whole seconds; its middle is the estimate.)
+    assert result["index_delay"]["max_s"] <= 1.5
+    assert result["after_index"]["p50_s"] >= 0.0
     assert result["skew_evident"] is False
     assert len(result["points"]) == result["sent"] and result["points"][0][1] is not None
     said = " ".join(result["findings"])
@@ -128,3 +129,16 @@ def test_skew_is_flagged_and_the_split_withheld():
     said = " ".join(result["findings"])
     assert "only possible if the clocks disagree" in said and "Of that, indexing took" not in said
     assert result["latency"]["p50_s"] == 1.5 and result["latency"]["max_s"] == 2.0
+
+
+def test_a_delay_shorter_than_the_second_indextime_counts_in_is_said_as_such():
+    probe = fr.FreshnessProbe(hec_url="h", hec_token="t", client=None, index="main", run_label="r")
+    p = fr.Probe(probe_id="a", seq=1, sent_wall=1000.7, sent_mono=0.0, sent_ok=True)
+    # Indexed 0.2 s after sending, in second 1000: read as exact, that was
+    # "indexed 0.7 s before it was sent".
+    p.found_lo_s, p.found_hi_s, p.found_wall, p.indextime = 1.0, 2.0, 1002.2, 1000.0
+    probe.probes.append(p)
+    result = probe.result(run_started_at=1000.0, run_ended_at=1010.0)
+    assert result["index_delay"]["p50_s"] == -0.2 and result["skew_evident"] is False
+    said = " ".join(result["findings"])
+    assert "indexing took under a second at the median" in said and "-0." not in said
