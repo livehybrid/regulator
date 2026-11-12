@@ -22,11 +22,13 @@ import Table from '@splunk/react-ui/Table';
 import Tooltip from '@splunk/react-ui/Tooltip';
 import WaitSpinner from '@splunk/react-ui/WaitSpinner';
 
+import Bottleneck from '../components/Bottleneck';
 import BusyButton from '../components/BusyButton';
 import ComparisonPanel from '../components/ComparisonPanel';
 import CompareModal from '../modals/CompareModal';
 import DeleteRunsModal, { DELETABLE_STATES } from '../modals/DeleteRunsModal';
 import EditRunModal from '../modals/EditRunModal';
+import HostResources from '../components/HostResources';
 import FleetLogsModal from '../modals/FleetLogsModal';
 import PromoteBaselineModal from '../modals/PromoteBaselineModal';
 import PurgeModal from '../modals/PurgeModal';
@@ -627,6 +629,8 @@ export default function RunDetail({ runId, navigate, onLaunch }) {
                 ) : null}
             </TileGrid>
 
+            {!live && <Bottleneck verdict={run.bottleneck} />}
+
             <RunCharts run={run} live={live} series={series.current} />
 
             {classKeys.length > 0 && (
@@ -745,6 +749,8 @@ export default function RunDetail({ runId, navigate, onLaunch }) {
             />
 
             <SutSection sut={summary.sut} />
+
+            {!live && <HostResources resources={summary.resources} />}
 
             <SectionHeading>Steps, worst p95 first</SectionHeading>
             {steps.length ? (

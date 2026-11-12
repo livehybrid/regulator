@@ -18,7 +18,7 @@ from fastapi import Request
 
 from regulator_agent import cachewarm
 
-from .. import warmup
+from .. import bottleneck, warmup
 from ..adapters import load_named_scenario
 from ..cachelock import evict_lock
 from ..audit import record as audit_record
@@ -171,6 +171,14 @@ def _serialise(
         base["stats"] = live or run.stats_json
         base["summary"] = run.summary_json
         base["markers"] = markers_for(run)
+        if is_terminal(run.state):
+            # Read off the run's own figures each time, never stored: an old
+            # run gets a verdict, and a better rule improves every run.
+            try:
+                base["bottleneck"] = bottleneck.assess(run.stats_json, run.summary_json)
+            except Exception:  # noqa: BLE001 - a reading of the run never breaks the run page
+                log.warning("could not assess run %s", run.id, exc_info=True)
+                base["bottleneck"] = None
         # For the links from a search in the ledger to the target's own UI.
         base["target_web_url"] = run.target.web_url if run.target is not None else None
     else:

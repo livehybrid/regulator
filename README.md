@@ -113,6 +113,62 @@ field a version does not write comes back empty rather than wrong. **Events per
 index is not available**: splunkd does not keep it for a finished search
 outside the job's own `search.log`.
 
+### What the machines were doing
+
+A latency curve says the target got slower. It does not say which tier ran out,
+or of what. Every full Splunk instance already writes its host's CPU, memory and
+load to `_introspection` every ten seconds and its disks' throughput and wait
+every minute (`splunk_resource_usage`, components `Hostwide` and `IOStats`).
+After a run, Regulator reads those back in time buckets, from three minutes
+before the run to a minute after it, and sorts the hosts into search heads and
+indexers using the search head's own lists of its peers and cluster members.
+
+The run page then shows, on one time axis with the run's start and end marked:
+CPU by tier, memory by tier, disk throughput and wait on the indexers, and load
+per core. Each tier is two lines, its mean and its busiest host, because a mean
+alone hides one indexer pinned at 100% among nine idle ones. Under the charts,
+every host has a row (cores, memory, CPU before and during, time spent at 90%
+or more, memory peak, load, disk) and the slowest disks are listed. A short
+list of plain statements goes with it: which host was CPU-bound and for how
+long, which ran short of memory or had more runnable work than cores, and
+whose disks were slow.
+
+It costs three searches and three REST reads after the load has stopped;
+nothing is sampled during the run. What it cannot do, it says: a host appears
+only if its `_introspection` is searchable from the search head the run talked
+to (indexers always are; other search head cluster members only if they forward
+their internal logs), a host on neither the peer list nor the member list is
+shown as "unknown" rather than guessed at, and `IOStats` is written on Linux
+only. The CPU fields are confirmed on a live 10.4; the memory, load and disk
+field names are from splunkd's documented schema and have not been confirmed
+on a live cluster, so a field a version does not write shows as empty.
+
+### Where the limit was
+
+At the top of a finished run's page is one reading of all of the above: which
+limit the run reached, if any. The candidates are the load generator itself
+(which outranks everything: if it could not keep time, nothing else is about
+the target), admission on the search head (told apart from the account's own
+role quota by the dispatcher's stated reason), CPU on the search heads, CPU on
+the indexers, memory, disk, the bucket cache, and searches failing rather than
+slowing.
+
+It is rules over the run's own figures, not a model. Each candidate is scored
+from 0 to 1 by how far past its line the signal was, for example the share of
+the run a host spent at 90% CPU or more, the share of searches that waited to be
+admitted, or the share of search run time spent waiting on cache misses. A limit
+is named at 0.5 and called strong at 0.75; two within 0.15 of each other are
+both in the headline. The evidence is listed with each, and so are the signals
+that were checked and found fine and, separately, what could not be checked,
+because "the indexers were not CPU-bound" and "nobody could see the indexers"
+are different answers. Nothing past its line is reported as no limit reached,
+which is a result: the run did not push the target far enough to find one.
+
+The verdict is worked out when the run is read rather than stored, so runs from
+before it existed get one from whatever they collected. The thresholds are in
+`server/regulator_server/bottleneck.py` and are a first cut, set by judgement
+and not yet calibrated against real clusters.
+
 ### A search "cancelled" at the end of a run
 
 Regulator gives a search no time limit of its own while a run is going. The

@@ -67,6 +67,39 @@ const RUN = {
     target_id: 1,
     target_name: 'lab',
     target_web_url: 'https://splunk.lab:8000/',
+    // Worked out by the control plane from the figures below when the run is read.
+    bottleneck: {
+        headline: 'CPU on the indexers, with disk on the indexers',
+        strength: 'strong',
+        factors: [
+            {
+                kind: 'indexer_cpu',
+                label: 'CPU on the indexers',
+                score: 1,
+                named: true,
+                evidence: ['idx-east-1 averaged 96% CPU during the run and spent 84% of it at 90% or more (peak 99%).'],
+            },
+            {
+                kind: 'disk',
+                label: 'Disk on the indexers',
+                score: 0.64,
+                named: true,
+                evidence: ['idx-east-1 (indexer) averaged 58 ms per disk request on its slowest disk, reading 213 MB/s.'],
+            },
+            {
+                kind: 'admission',
+                label: "Admission: the search head's concurrent-search ceiling",
+                score: 0.33,
+                named: false,
+                evidence: ['8.0% of searches waited to be admitted before they ran.'],
+                advice: 'Searches were held back before they started, so latency past this point is queueing.',
+            },
+        ],
+        fine: ['The load generator kept to its schedule (its loop ran at most 12 ms late).'],
+        not_checked: ["The bucket cache's cost per search: the target's audit trail had no account of this run's searches."],
+        context: "By the target's own search telemetry, 90% of a search's time was the map phase on the indexers (900 ms).",
+        method: 'Rules over this run\'s own figures, not a model.',
+    },
     state: 'completed',
     fleet: 'k8s',
     fleet_state: 'done',
@@ -189,6 +222,75 @@ const RUN = {
     summary: {
         valid: true,
         outcome: 'completed',
+        resources: {
+            available: true,
+            span_s: 30,
+            window: { earliest: 1756999820, latest: 1757000345, run_started_at: 1757000000, run_ended_at: 1757000285 },
+            findings: [
+                '3 indexers: CPU averaged 71% during the run (9% before it), peaking at 99% on idx-east-1.',
+                'idx-east-1 (indexer) was at or above 90% CPU for 4m of the 5m run: it was CPU-bound for that time.',
+            ],
+            roles: {
+                'search head': {
+                    hosts: 1,
+                    t: [1756999830, 1757000010, 1757000130, 1757000250, 1757000310],
+                    cpu_avg: [6, 31, 38, 35, 8],
+                    cpu_max: [6, 31, 38, 35, 8],
+                    mem_avg: [40, 44, 47, 47, 45],
+                    mem_max: [40, 44, 47, 47, 45],
+                    load_max: [0.1, 0.4, 0.5, 0.5, 0.2],
+                },
+                indexer: {
+                    hosts: 3,
+                    t: [1756999830, 1757000010, 1757000130, 1757000250, 1757000310],
+                    cpu_avg: [9, 64, 74, 73, 12],
+                    cpu_max: [11, 93, 99, 97, 15],
+                    mem_avg: [52, 55, 58, 58, 57],
+                    mem_max: [55, 61, 66, 66, 64],
+                    load_max: [0.2, 1.1, 1.6, 1.5, 0.3],
+                    read_mb_s: [4, 410, 520, 500, 10],
+                    write_mb_s: [20, 25, 24, 26, 21],
+                    io_wait_max: [1.1, 38, 71, 64, 2],
+                },
+            },
+            hosts: [
+                {
+                    host: 'sh-east-1',
+                    role: 'search head',
+                    cores: 16,
+                    mem_mb: 65536,
+                    cpu: { avg_pct: 35, peak_pct: 41, before_pct: 6, hot_s: 0 },
+                    mem: { avg_pct: 46, peak_pct: 47 },
+                    load: { avg: 0.45, peak: 0.52 },
+                },
+                {
+                    host: 'idx-east-1',
+                    role: 'indexer',
+                    cores: 32,
+                    mem_mb: 131072,
+                    cpu: { avg_pct: 96, peak_pct: 99, before_pct: 11, hot_s: 240 },
+                    mem: { avg_pct: 63, peak_pct: 66 },
+                    load: { avg: 1.4, peak: 1.63 },
+                    io: { read_mb_s: 212.5, write_mb_s: 9, wait_ms: 58.2, peak_wait_ms: 71 },
+                },
+            ],
+            mounts: [
+                {
+                    host: 'idx-east-1',
+                    role: 'indexer',
+                    mount: '/opt/splunk/var/lib/splunk',
+                    device: 'nvme1n1',
+                    fs_type: 'xfs',
+                    avg_wait_ms: 44.6,
+                    max_wait_ms: 71,
+                    read_mb_s: 180.2,
+                    write_mb_s: 8.1,
+                    iops: 5400,
+                },
+            ],
+            notes: [],
+            self_load: { queries: 3 },
+        },
         diagnosis: {
             at: 1757000900,
             sids: 2,
@@ -872,6 +974,37 @@ const go = async (hash) => {
     );
     await check('run: skipped scheduled searches', '340 skipped: maxconcurrent');
     await check('run: bucket attribution by step', 'Bucket attribution by step');
+    // The reading of it all: which limit the run reached, and on what evidence.
+    await check('run: the verdict', 'Where the limit was');
+    await check('run: the verdict names the limit', 'CPU on the indexers, with disk on the indexers');
+    await check('run: the verdict says how sure it is', 'The evidence is strong');
+    await check('run: the verdict shows its evidence', 'spent 84% of it at 90% or more');
+    await check('run: a signal under the line is shown as such', 'below the line for naming it');
+    await check('run: what was checked and fine', 'Checked, and not the limit');
+    await check('run: what could not be checked is kept apart', 'Could not be checked');
+    await check('run: the verdict says it is rules', 'not a model');
+    // The machines: which tier ran out, and of what.
+    await check('run: host resources', 'What the machines were doing');
+    await check('run: a tier is summarised', '3 indexers: CPU averaged 71% during the run');
+    await check('run: a host pinned on CPU is named', 'idx-east-1 (indexer) was at or above 90% CPU');
+    await check('run: a chart a tier', 'CPU by tier');
+    await check('run: disk is drawn for the indexers', 'Disk on the indexers');
+    await waitFor('run: every host has a row, with its tier and its figures', () =>
+        Array.from(window.document.querySelectorAll('tr')).some((tr) => {
+            const cells = Array.from(tr.querySelectorAll('td')).map((td) => (td.textContent || '').trim());
+            return (
+                cells[0] === 'idx-east-1' &&
+                cells[1] === 'indexer' &&
+                cells[2] === '32' &&
+                cells[3] === '128 GB' &&
+                cells[4] === '11%' &&
+                cells[5] === '96%' &&
+                cells[7] === '4m 0s' &&
+                cells[11] === '58.2 peak 71'
+            );
+        })
+    );
+    await check('run: the slowest disks', '/opt/splunk/var/lib/splunk');
     // The ledger: which searches, by id, and what a diagnosis found about them.
     await check('run: the search ledger', 'Searches to look at');
     await check('run: a search cut off at the end, by id', 'reg_r7_0_ab12cd_41');

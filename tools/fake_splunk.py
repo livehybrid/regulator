@@ -36,6 +36,7 @@ from __future__ import annotations
 
 import argparse
 import fnmatch
+import math
 import re
 import json
 import random
@@ -767,6 +768,45 @@ class FakeSplunk:
                 })
         return 200, {"messages": [], "fields": list(rows[0]) if rows else [], "results": rows}
 
+    def _resource_usage(self, spl: str, form: Dict[str, List[str]]) -> Tuple[int, Any]:
+        """This host's CPU, memory and disk in time buckets, as _introspection has it.
+
+        One host, named as server/info names it. Busier the more searches the
+        fake has seen at once, so a run that loaded it reads as loaded.
+        """
+        with self._lock:
+            self.stats.oneshots += 1
+            busy = min(95.0, 5.0 + 8.0 * self.stats.peak_concurrent)
+        host = "fake-splunk"
+        earliest = float(_first(form, "earliest_time", "0") or 0)
+        latest = float(_first(form, "latest_time", "0") or 0) or time.time()
+        match = re.search(r"span=(\d+)s", spl)
+        rows: List[Dict[str, str]] = []
+        if match is None:
+            rows.append({
+                "host": host, "mount": "/opt/splunk", "device": "nvme0n1", "fs_type": "xfs",
+                "avg_wait_ms": "1.4", "max_wait_ms": "6.0", "read_kb_ps": "20480", "write_kb_ps": "2048",
+                "reads_ps": "300", "writes_ps": "40",
+            })
+        else:
+            span = max(1, int(match.group(1)))
+            t = math.floor(earliest / span) * span
+            while t < latest and len(rows) < 2000:
+                if "component=IOStats" in spl:
+                    rows.append({
+                        "host": host, "t": str(t), "read_kb_ps": "20480", "write_kb_ps": "2048",
+                        "reads_ps": "300", "writes_ps": "40", "wait_ms": "1.4",
+                    })
+                else:
+                    rows.append({
+                        "host": host, "t": str(t), "cpu_pct": f"{busy:.1f}", "cpu_peak_pct": f"{min(100.0, busy + 4):.1f}",
+                        "mem_pct": "41.0", "mem_peak_pct": "43.5", "load": f"{busy / 100.0:.2f}",
+                        "load_peak": f"{busy / 90.0:.2f}", "mem_mb": "65536", "swap_used_mb": "0",
+                        "cores": "8", "vcpus": "16",
+                    })
+                t += span
+        return 200, {"messages": [], "fields": list(rows[0]) if rows else [], "results": rows}
+
     def _cacheman_list(self) -> Tuple[int, Any]:
         entries = []
         for bid, status in sorted(self._buckets.items()):
@@ -888,6 +928,10 @@ class FakeSplunk:
         exec_mode = _first(form, "exec_mode", "normal")
         if exec_mode == "oneshot" and re.match(r"\s*\|\s*dbinspect\b", spl):
             return self._dbinspect(spl)
+        if exec_mode == "oneshot" and "sourcetype=splunk_resource_usage" in spl and (
+            "bin _time" in spl or "component=IOStats" in spl
+        ):
+            return self._resource_usage(spl, form)
         if exec_mode == "oneshot":
             return self._oneshot(spl, form, api_version)
 
