@@ -45,10 +45,9 @@ def test_host_resources_reads_cpu_memory_load_and_roles():
 def test_disk_figures_are_read_wherever_splunkd_writes_them():
     """IOStats, where the hosts have it.
 
-    splunkd did not write IOStats at all on GitHub's hosted runners (none in
-    fifteen minutes), where it did on another Docker host within minutes; the
-    cause was not established. So this checks Regulator's reading of them
-    where splunkd writes them, and says so plainly where it does not.
+    On GitHub's hosted runners splunkd did write IOStats, and Regulator read
+    none of them: its queries grouped by a mount point those events did not
+    carry. Skipped only where splunkd writes no IOStats at all.
     """
     from regulator_agent.hostresources import host_resources
 
@@ -61,11 +60,14 @@ def test_disk_figures_are_read_wherever_splunkd_writes_them():
         wait_for(written, timeout_s=240, every_s=30, what="any IOStats event")
     except AssertionError:
         pytest.skip("splunkd wrote no IOStats events on these hosts, so there is nothing to read")
+    sample = run(oneshot(SH_URL, "search index=_introspection sourcetype=splunk_resource_usage "
+                                 "component=IOStats | head 2 | table host _raw", earliest=time.time() - 1800))
+    print("IOStats as splunkd writes it here:", sample)
     now = time.time()
     result = run(with_client(SH_URL, lambda c: host_resources(c, now - 1800, now - 60)))
-    io = [h for h in result["hosts"] if h.get("io")]
+    io = [h for h in result["hosts"] if (h.get("io") or {}).get("read_mb_s") is not None]
     print("disk figures for:", [h["host"] for h in io], "mounts:", result["mounts"][:3])
-    assert io and result["mounts"], ("IOStats", result["notes"])
+    assert io and result["mounts"], ("IOStats", result["notes"], sample)
 
 
 def test_diagnose_finds_a_search_in_audit_and_on_each_indexer(corpus):
