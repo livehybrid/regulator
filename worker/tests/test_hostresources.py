@@ -79,7 +79,12 @@ def test_the_searches_follow_the_quoting_that_works_on_a_live_instance():
     # eval names a dotted field in single quotes; stats takes it bare.
     assert "'data.cpu_system_pct' + 'data.cpu_user_pct'" in spl
     assert "avg(data.normalized_load_avg_1min)" in spl and "span=30s" in spl
-    assert "by _time, host, data.mount_point" in hr.io_series_spl(60)
+    # A disk is its mount point or, failing that, its device: grouping by a
+    # field an event lacks drops the event (every IOStats event on GitHub's
+    # hosted runners).
+    for spl in (hr.io_series_spl(60), hr.io_mounts_spl()):
+        assert "coalesce('data.mount_point', 'data.device', \"unnamed\")" in spl
+    assert "by _time, host, disk" in hr.io_series_spl(60)
     assert "bin _time" not in hr.io_mounts_spl()
 
 
