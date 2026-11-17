@@ -94,13 +94,16 @@ class TargetCreate(BaseModel):
     indexer_token: Optional[str] = None
     indexer_username: Optional[str] = None
     indexer_password: Optional[str] = None
+    # HTTP Event Collector on the target, for the ingest-to-searchable probe.
+    hec_url: Optional[str] = None
+    hec_token: Optional[str] = None
 
     @field_validator("indexer_urls")
     @classmethod
     def _indexers_http_only(cls, value: List[str]) -> List[str]:
         return _clean_indexer_urls(value)
 
-    @field_validator("mgmt_url", "web_url")
+    @field_validator("mgmt_url", "web_url", "hec_url")
     @classmethod
     def _http_only(cls, value: Optional[str]) -> Optional[str]:
         return _clean_url(value)
@@ -131,6 +134,7 @@ class TargetOut(BaseModel):
     health_detail: Optional[str]
     indexer_urls: Optional[str] = None
     indexer_username: Optional[str] = None
+    hec_url: Optional[str] = None
     # Deliberately absent: token, username, password, and their indexer
     # counterparts. There is no field to accidentally populate. What the edit
     # form needs is only whether one is stored, so it can say "stored, leave
@@ -140,6 +144,7 @@ class TargetOut(BaseModel):
     has_password: bool = False
     has_indexer_token: bool = False
     has_indexer_password: bool = False
+    has_hec_token: bool = False
 
 
 # A target's write-only secrets, and the column each is stored encrypted in.
@@ -148,6 +153,7 @@ TARGET_SECRET_COLUMNS = {
     "password": "password_encrypted",
     "indexer_token": "indexer_token_encrypted",
     "indexer_password": "indexer_password_encrypted",
+    "hec_token": "hec_token_encrypted",
 }
 
 
@@ -176,6 +182,8 @@ class TargetUpdate(BaseModel):
     indexer_token: Optional[str] = None
     indexer_username: Optional[str] = None
     indexer_password: Optional[str] = None
+    hec_url: Optional[str] = None
+    hec_token: Optional[str] = None
     clear: List[str] = Field(default_factory=list)
 
     @field_validator("indexer_urls")
@@ -188,10 +196,10 @@ class TargetUpdate(BaseModel):
     def _mgmt_url(cls, value: Optional[str]) -> Optional[str]:
         return _clean_url(value)
 
-    @field_validator("web_url")
+    @field_validator("web_url", "hec_url")
     @classmethod
     def _web_url(cls, value: Optional[str]) -> Optional[str]:
-        # Empty clears the optional web URL.
+        # Empty clears an optional URL.
         return _clean_url(value) if value else value
 
     @field_validator("api_version")
@@ -481,6 +489,12 @@ class RunCreate(BaseModel):
     warm_concurrency: int = Field(default=4, ge=1, le=16)
     warm_budget_s: float = Field(default=1800.0, ge=10, le=4 * 3600, allow_inf_nan=False)
     warm_confirmed: bool = False
+    # Measure ingest-to-searchable latency while the run goes: a probe event
+    # to the target's HEC every freshness_interval_s, searched for in
+    # freshness_index. The target needs a HEC address and token.
+    freshness: bool = False
+    freshness_index: Optional[str] = Field(default=None, max_length=80)
+    freshness_interval_s: float = Field(default=10.0, ge=2, le=300, allow_inf_nan=False)
     # Where the load is generated: inprocess (this control plane), swarm or
     # k8s (worker containers). Blank means the configured default.
     fleet: Optional[str] = None
@@ -556,6 +570,14 @@ class RunCreate(BaseModel):
                     "confirm the plan first: check that these are the indexes and time "
                     "ranges you want warmed. Warming is load on the target and the "
                     "suggestion is only a reading of the scenario's search strings"
+                )
+        if self.freshness:
+            from regulator_agent.freshness import valid_index
+
+            if not valid_index(self.freshness_index or ""):
+                raise ValueError(
+                    "freshness needs the index to send probe events to and search for them in: "
+                    "letters, digits, underscores and hyphens"
                 )
 
 

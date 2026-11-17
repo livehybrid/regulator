@@ -81,6 +81,11 @@ export default function LaunchModal({ scenario, initial, onClose, onLaunched }) 
     );
     const [warmConfirmed, setWarmConfirmed] = useState(false);
     const [suggestion, setSuggestion] = useState(null);
+    // The ingest-to-searchable probe. "Run again" asks for it again as before.
+    const fromFresh = from.freshness || null;
+    const [fresh, setFresh] = useState(Boolean(fromFresh));
+    const [freshIndex, setFreshIndex] = useState((fromFresh && fromFresh.index) || '');
+    const [freshInterval, setFreshInterval] = useState((fromFresh && fromFresh.interval_s) || 10);
     const notify = useNotify();
 
     useEffect(() => {
@@ -195,6 +200,9 @@ export default function LaunchModal({ scenario, initial, onClose, onLaunched }) 
         }
     };
 
+    const freshTarget = targets.find((t) => String(t.id) === String(form.target_id));
+    const freshReady = Boolean(freshTarget && freshTarget.hec_url && freshTarget.has_hec_token);
+
     const launch = async () => {
         const body = {
             target_id: /^\d+$/.test(form.target_id) ? parseInt(form.target_id, 10) : form.target_id,
@@ -242,6 +250,19 @@ export default function LaunchModal({ scenario, initial, onClose, onLaunched }) 
             body.warm_budget_s = (Number(warmBudgetMin) || 30) * 60;
             // Only ever set from the tick box: nothing confirms a plan for the operator.
             body.warm_confirmed = true;
+        }
+        if (fresh) {
+            if (!freshTarget || !freshTarget.hec_url || !freshTarget.has_hec_token) {
+                notify('Give this target a HEC address and token to measure ingest-to-searchable latency', 'warning');
+                return;
+            }
+            if (!/^[A-Za-z0-9_][A-Za-z0-9_-]*$/.test(freshIndex.trim())) {
+                notify('Name the index to send probe events to', 'warning');
+                return;
+            }
+            body.freshness = true;
+            body.freshness_index = freshIndex.trim();
+            body.freshness_interval_s = Number(freshInterval) || 10;
         }
         // A periodic eviction needs a scope, and the eviction list is what
         // decides it: asking for one without the other would evict nothing.
@@ -546,6 +567,53 @@ export default function LaunchModal({ scenario, initial, onClose, onLaunched }) 
                         eviction) and a warm p95, and the charts mark every epoch. It uses the same
                         index scope as the eviction above.
                     </Note>
+
+                    <SectionHeading>Ingest to searchable</SectionHeading>
+                    <Checkbox
+                        checked={fresh}
+                        disabled={!freshReady}
+                        onChange={() => setFresh((v) => !v)}
+                        value="freshness"
+                    >
+                        Measure how long an event takes from being sent to being searchable
+                    </Checkbox>
+                    {!freshReady && (
+                        <Muted $small>
+                            {' '}
+                            Give this target a HEC address and token (on the Targets page) to measure this.
+                        </Muted>
+                    )}
+                    {fresh && (
+                        <>
+                            <Grid2>
+                                <ControlGroup
+                                    label="Index for probe events"
+                                    labelPosition="top"
+                                    help="Must exist and accept the target's HEC token."
+                                >
+                                    <Text value={freshIndex} placeholder="main" onChange={(e, { value }) => setFreshIndex(value)} />
+                                </ControlGroup>
+                                <ControlGroup
+                                    label="One probe every N seconds"
+                                    labelPosition="top"
+                                    help="Between 2 and 300."
+                                >
+                                    <NumberInput
+                                        value={freshInterval}
+                                        min={2}
+                                        max={300}
+                                        onChange={(e, { value }) => setFreshInterval(value)}
+                                    />
+                                </ControlGroup>
+                            </Grid2>
+                            <Note>
+                                Regulator sends a small event over HEC at that interval during the run and
+                                searches for it about twice as often, so the time from sending to being
+                                searchable is measured on one clock. It adds one event and two small searches
+                                per interval to the target.
+                            </Note>
+                        </>
+                    )}
                 </>
             )}
         </Dialog>
@@ -574,6 +642,8 @@ LaunchModal.propTypes = {
         warm_cache: PropTypes.bool,
         // The earlier run's plan as it was written: { plan, mode, concurrency, budget_s }.
         warm_plan: PropTypes.object,
+        // The earlier run's probe: { index, interval_s }.
+        freshness: PropTypes.object,
     }),
     onClose: PropTypes.func.isRequired,
     onLaunched: PropTypes.func.isRequired,

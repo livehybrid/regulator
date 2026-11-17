@@ -222,6 +222,37 @@ const RUN = {
     summary: {
         valid: true,
         outcome: 'completed',
+        freshness: {
+            available: true,
+            index: 'probes',
+            sourcetype: 'regulator:freshness',
+            source: 'regulator:r7',
+            interval_s: 10,
+            poll_s: 5,
+            sent: 31,
+            send_failed: 0,
+            during_run: 29,
+            found: 29,
+            not_found: 0,
+            resolution_s: 4.8,
+            latency: { count: 29, p50_s: 12.4, p95_s: 31.2, p99_s: 33.0, max_s: 33.0, mean_s: 14.1, min_s: 4.0 },
+            before_run: { count: 2, p50_s: 3.1, p95_s: 3.4, p99_s: 3.4, max_s: 3.4 },
+            index_delay: { count: 29, p50_s: 9.0, p95_s: 27.0, p99_s: 29.0, max_s: 29.0 },
+            after_index: { count: 29, p50_s: 3.0, p95_s: 5.0, p99_s: 5.0, max_s: 5.0 },
+            skew_evident: false,
+            points: [
+                [1757000005, 4.0, 1.0],
+                [1757000105, 12.4, 9.0],
+                [1757000205, 31.2, 27.0],
+            ],
+            searches: 70,
+            search_failures: 0,
+            errors: [],
+            findings: [
+                'Events became searchable 12.4s after they were sent at the median, 31.2s at the 95th percentile and 33.0s at worst (29 probes, to within about 4.8s).',
+                'Before the load started the median was 3.1s (2 probes).',
+            ],
+        },
         resources: {
             available: true,
             span_s: 30,
@@ -467,6 +498,8 @@ const ROUTES = {
             has_username: false,
             has_password: false,
             has_indexer_token: false,
+            hec_url: 'https://splunk.lab:8088',
+            has_hec_token: true,
             has_indexer_password: false,
         },
     ],
@@ -983,6 +1016,13 @@ const go = async (hash) => {
     await check('run: what was checked and fine', 'Checked, and not the limit');
     await check('run: what could not be checked is kept apart', 'Could not be checked');
     await check('run: the verdict says it is rules', 'not a model');
+    // How stale the data a search returns was, while the run went.
+    await check('run: ingest to searchable', 'Ingest to searchable');
+    await check('run: the freshness headline', 'Events became searchable 12.4s after they were sent at the median');
+    await check('run: the idle baseline', 'Before the load started the median was 3.1s');
+    await check('run: the freshness chart', 'Seconds from sending an event to finding it in a search');
+    await check('run: the split is labelled as two clocks', 'two clocks, to the second');
+    await check('run: how to find the probes', 'source="regulator:r7"');
     // The machines: which tier ran out, and of what.
     await check('run: host resources', 'What the machines were doing');
     await check('run: a tier is summarised', '3 indexers: CPU averaged 71% during the run');
@@ -1185,6 +1225,7 @@ const go = async (hash) => {
     clickByText('Add target', 'open the add-target form');
     await settle();
     await check('add target form', 'A bearer token is preferred');
+    await check('add target form: HEC for the freshness probe', 'HTTP Event Collector, for ingest-to-searchable latency');
 
     clickByText('Cancel', 'close the add-target form');
     await settle();
@@ -1238,6 +1279,7 @@ const go = async (hash) => {
     clickByText('Launch a run', 'open the launch dialog');
     await settle(400);
     await check('launch dialog', 'Pacing decides what the latency numbers mean');
+    await check('launch dialog: ingest to searchable', 'Measure how long an event takes from being sent to being searchable');
 
     // Type a user count and press Launch. Converting a typed number is what
     // crashed (React error #321): the number input was imported as `Number`,

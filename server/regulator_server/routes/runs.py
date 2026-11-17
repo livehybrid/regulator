@@ -147,6 +147,8 @@ def _serialise(
         "warm_cache": bool(run.warm_cache),
         # The plan as the operator wrote it, for the run page and "Run again".
         "warm_plan": run.warm_plan_json,
+        # The ingest-to-searchable probe asked for at launch, if any.
+        "freshness": run.freshness_json,
         # Set only while the warm-up before the run is in flight.
         "warming_since": warmup.warming_since(run.id),
         "seed": run.seed,
@@ -364,6 +366,18 @@ def create_run(
             "budget_s": body.warm_budget_s,
         }
 
+    freshness_spec = None
+    if body.freshness:
+        if not (target.hec_url and target.hec_token_encrypted):
+            raise HTTPException(
+                status_code=422,
+                detail=(
+                    "measuring ingest-to-searchable latency sends probe events over HTTP Event "
+                    "Collector: give the target a HEC address and token first"
+                ),
+            )
+        freshness_spec = {"index": body.freshness_index, "interval_s": body.freshness_interval_s}
+
     run = Run(
         label=body.label,
         target_id=body.target_id,
@@ -385,6 +399,7 @@ def create_run(
         cold_window_s=(body.cold_window_s or (body.evict_every_s / 2.0 if body.evict_every_s else None)),
         warm_cache=bool(warm_spec),
         warm_plan_json=warm_spec,
+        freshness_json=freshness_spec,
         state="pending",
     )
     session.add(run)
@@ -401,6 +416,12 @@ def create_run(
             f" with a {body.warm_mode} warm-up of a confirmed plan: "
             f"{warmup.plan_text([t.to_dict() for t in resolved])}"
             if warm_spec
+            else ""
+        )
+        + (
+            f", measuring ingest-to-searchable latency with a probe every "
+            f"{body.freshness_interval_s:g}s into index {body.freshness_index}"
+            if freshness_spec
             else ""
         ),
     )

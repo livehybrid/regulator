@@ -95,12 +95,14 @@ TARGET_FIELDS = [
     "api_version",
     "indexer_urls",
     "indexer_username",
+    "hec_url",
 ]
 TARGET_SECRETS = [
     "token_encrypted",
     "password_encrypted",
     "indexer_token_encrypted",
     "indexer_password_encrypted",
+    "hec_token_encrypted",
 ]
 
 # A scenario directory is text. These are the only names carried, so a stray
