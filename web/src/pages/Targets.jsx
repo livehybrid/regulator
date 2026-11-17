@@ -56,14 +56,18 @@ const EMPTY_TARGET = {
     indexer_token: '',
     indexer_username: '',
     indexer_password: '',
+    hec_url: '',
+    hec_token: '',
     verify_tls: true,
 };
 
 // The write-only credentials. An edit sends one only when it was typed, so a
 // blank field keeps what is stored.
-const SECRETS = ['token', 'password', 'indexer_token', 'indexer_password'];
+const SECRETS = ['token', 'password', 'indexer_token', 'indexer_password', 'hec_token'];
 // Sent on an edit only when it differs from what the target has now.
-const PLAIN = ['name', 'mgmt_url', 'web_url', 'app', 'owner', 'api_version', 'verify_tls'];
+const PLAIN = ['name', 'mgmt_url', 'web_url', 'hec_url', 'app', 'owner', 'api_version', 'verify_tls'];
+// Optional addresses: emptied on an edit, they are sent empty to clear them.
+const CLEARABLE = ['web_url', 'hec_url'];
 
 /** The form's starting values: blank for a new target, the target's own for an edit. */
 function formFrom(target) {
@@ -80,6 +84,7 @@ function formFrom(target) {
         api_version: target.api_version || '',
         indexer_urls: (target.indexer_urls || '').split(',').filter(Boolean).join(', '),
         indexer_username: target.indexer_username || '',
+        hec_url: target.hec_url || '',
         verify_tls: target.verify_tls !== false,
     };
 }
@@ -616,7 +621,7 @@ function TargetForm({ target, onCancel, onSaved }) {
 
     const createBody = () => {
         const body = { name: form.name, mgmt_url: form.mgmt_url, verify_tls: form.verify_tls };
-        ['web_url', 'username', 'app', 'owner', 'api_version', 'indexer_username', ...SECRETS].forEach((k) => {
+        ['web_url', 'hec_url', 'username', 'app', 'owner', 'api_version', 'indexer_username', ...SECRETS].forEach((k) => {
             const v = (form[k] || '').trim();
             if (v) {
                 body[k] = v;
@@ -634,7 +639,7 @@ function TargetForm({ target, onCancel, onSaved }) {
         const body = {};
         PLAIN.forEach((k) => {
             const v = typeof form[k] === 'string' ? form[k].trim() : form[k];
-            if (v !== before[k] && (v !== '' || k === 'web_url')) {
+            if (v !== before[k] && (v !== '' || CLEARABLE.includes(k))) {
                 body[k] = v;
             }
         });
@@ -801,6 +806,30 @@ function TargetForm({ target, onCancel, onSaved }) {
                             {...secretProps('indexer_password')}
                         />
                         {removeBox('indexer_password', 'Remove the stored indexer password')}
+                    </Field>
+                </ControlGroup>
+            </Grid2>
+
+            <SectionHeading>HTTP Event Collector, for ingest-to-searchable latency</SectionHeading>
+            <Note>
+                Optional. A run can measure how long an event takes from being sent to being searchable
+                by sending small probe events here and searching for them. The token needs to be able to
+                write to the index the run names.
+            </Note>
+            <Grid2>
+                <ControlGroup label="HEC URL" labelPosition="top" help="Usually port 8088.">
+                    <Text value={form.hec_url} placeholder="https://hec.splunk.example:8088" onChange={set('hec_url')} />
+                </ControlGroup>
+                <ControlGroup label="HEC token" labelPosition="top">
+                    <Field>
+                        <Text
+                            type="password"
+                            value={form.hec_token}
+                            autoComplete="off"
+                            onChange={set('hec_token')}
+                            {...secretProps('hec_token')}
+                        />
+                        {removeBox('hec_token', 'Remove the stored HEC token')}
                     </Field>
                 </ControlGroup>
             </Grid2>

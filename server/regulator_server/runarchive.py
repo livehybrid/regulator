@@ -163,6 +163,7 @@ def import_document(session: Session, document: Dict[str, Any], uid: Optional[st
     run.summary_json = row.get("summary")
     run.controls_json = row.get("controls") or None
     run.warm_plan_json = row.get("warm_plan") or None
+    run.freshness_json = row.get("freshness") or None
     session.add(run)
     session.flush()
 

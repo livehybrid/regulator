@@ -159,6 +159,8 @@ def create_target(body: TargetCreate, session: Session = Depends(get_session)) -
         indexer_token_encrypted=encrypt(body.indexer_token),
         indexer_username=body.indexer_username,
         indexer_password_encrypted=encrypt(body.indexer_password),
+        hec_url=body.hec_url,
+        hec_token_encrypted=encrypt(body.hec_token),
     )
     session.add(target)
     try:
@@ -207,12 +209,12 @@ def update_target(
     clear = set(sent.pop("clear", []) or [])
     changed = []
 
-    for field_name in ("name", "mgmt_url", "web_url", "verify_tls", "app", "owner", "api_version"):
+    for field_name in ("name", "mgmt_url", "web_url", "hec_url", "verify_tls", "app", "owner", "api_version"):
         if field_name not in sent:
             continue
         value = sent[field_name]
-        if field_name == "web_url":
-            value = value or None  # the one optional field: empty clears it
+        if field_name in ("web_url", "hec_url"):
+            value = value or None  # the optional addresses: empty clears them
         elif value is None:
             continue
         if getattr(target, field_name) != value:
