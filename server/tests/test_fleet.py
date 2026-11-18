@@ -776,3 +776,23 @@ def test_merging_keeps_queueing_and_unknown_sids_on_their_step():
     assert step["queued"] == 3
     assert step["unknown_sid"] == {"searches": 2, "responses": 5}
     assert step["queued_p95_ms"] == pytest.approx(900.0, rel=0.05)
+
+
+def test_merging_keeps_each_workers_issue_sids_for_the_split_by_member():
+    """The correlation after a fleet run looks members up for every worker's searches, not one's."""
+    docs = []
+    for slot in (0, 1):
+        doc = _summary(slot, [20.0], 1)
+        doc["stats"]["issue_sids"] = {
+            "failed": [[f"sid{slot}", "one", "timeout"]], "partial": [], "queued": [[f"q{slot}", "one"]],
+            "dropped": {"queued": slot}, "no_sid": {"failed": 1},
+        }
+        docs.append(doc)
+    # An older worker ships none.
+    docs.append(_summary(2, [25.0], 1))
+
+    merged = fleet.merge_summaries("r1", "s", docs, [])
+    sids = merged["stats"]["issue_sids"]
+    assert sids["failed"] == [["sid0", "one", "timeout"], ["sid1", "one", "timeout"]]
+    assert sids["queued"] == [["q0", "one"], ["q1", "one"]]
+    assert sids["dropped"] == {"queued": 1} and sids["no_sid"] == {"failed": 2}

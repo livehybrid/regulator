@@ -379,7 +379,7 @@ def test_the_per_step_probe_reads_the_step_from_the_run_marker():
 
     pattern = re.search(r'rex field=search "([^"]+)"', spl).group(1)
     assert "\\\\" not in pattern  # nothing SPL's own unescaping could change
-    extract = re.compile(pattern.replace("(?<step>", "(?P<step>"))
+    extract = re.compile(pattern.replace("(?<reg_step>", "(?P<step>"))
     audited = "search index=main error | stats count ```" + cache_bust_marker("r7-v1.2", 3, 12, "triage.overview") + "```"
     assert extract.search(audited).group("step") == "triage.overview"
     # A run whose label differs only where this one has a dot is not ours.
@@ -408,3 +408,168 @@ def test_a_warm_run_names_no_costly_step():
         {"step": "triage.overview", "searches": "600", "run_time_s": "300", "cold_path_s": "0", "cache_misses": "0"},
     ]))
     assert not any(f.startswith("step ") for f in findings)
+
+
+# ---------------------------------------- split by search head cluster member (#18)
+
+
+def test_the_member_probe_splits_the_same_records_by_step_and_host():
+    probes = {p.name: p for p in build_probes(marker_prefix_for("r7"), "reg_r7_")}
+    by_step, by_member = probes["our_searches_by_step"].spl, probes["our_searches_by_member"].spl
+    # The same selection and the same figures as the split by step, so a
+    # step's rows across members add up to its row there.
+    assert by_member.split(" | ")[0] == by_step.split(" | ")[0]
+    stats_by_step = next(part for part in by_step.split(" | ") if part.startswith("stats "))
+    stats_by_member = next(part for part in by_member.split(" | ") if part.startswith("stats "))
+    assert stats_by_member == stats_by_step.replace(" by step", " by step, member")
+    # The member is the host that wrote the audit record; none is still counted.
+    assert '| eval member=coalesce(host, "(member not recorded)")' in by_member
+    # Steps by members passes the usual 50 rows.
+    assert probes["our_searches_by_member"].max_rows > 50
+
+
+def test_the_member_lookup_matches_each_sid_exactly():
+    from regulator_agent.sut import member_lookup_spl
+
+    spl = member_lookup_spl(["reg_r7_0_ab12cd_1", "reg_r7_0_ab12cd_2"])
+    # Quoted as _audit writes it and bare, and never a wildcard: *_1* would
+    # also find _10 to _19.
+    assert "search_id IN (\"reg_r7_0_ab12cd_1\", \"'reg_r7_0_ab12cd_1'\", " in spl
+    assert "*" not in spl
+    assert "stats latest(host) as member" in spl and " by sid" in spl
+
+
+class _AuditStub:
+    """A target whose audit trail places each sid on a member, and records what it was asked."""
+
+    def __init__(self, members, fail_lookups=False):
+        self.members = members
+        self.fail_lookups = fail_lookups
+        self.searches = []
+
+    async def oneshot(self, spl, window, count=50):
+        import re
+
+        self.searches.append((spl, count))
+        if "eventcount" in spl:
+            return [{"index": i, "events": "10"} for i in ("_audit", "_internal", "_introspection")], None
+        if "search_id IN" in spl:
+            if self.fail_lookups:
+                from regulator_agent.splunk import SplunkError
+
+                raise SplunkError("lookup refused")
+            # Each sid is asked for bare and in single quotes; take the quoted.
+            asked = set(re.findall(r"'([^']+)'", spl.split("search_id IN", 1)[1].split(") ")[0]))
+            # As _audit has them: quoted.
+            return [{"sid": f"'{sid}'", "member": self.members[sid], "members": "1"} for sid in asked if sid in self.members], None
+        return [], None
+
+
+def _correlate_with(stub, issue_sids):
+    return run_async(correlate(stub, 1.0, 2.0, "reg:r7:", settle_s=0, sid_prefix="reg_r7_", issue_sids=issue_sids))
+
+
+def test_issues_are_split_by_the_member_the_audit_trail_names():
+    from regulator_agent.sut import NO_AUDIT_RECORD
+
+    stub = _AuditStub({"s1": "sh1", "s2": "sh2", "s3": "sh1", "s4": "sh2"})
+    issue_sids = {
+        "failed": [["s1", "a", "timeout"], ["s2", "a", "quota"], ["s9", "a", "server"]],
+        "partial": [["s3", "b"]],
+        "queued": [["s4", "b"], ["s3", "b"]],
+        "dropped": {"queued": 12},
+        "no_sid": {"failed": 2},
+    }
+    result = _correlate_with(stub, issue_sids)
+    split = result["issues_by_member"]
+    assert split["available"] and split["members"] == ["sh1", "sh2"]
+    rows = {(r["step"], r["member"]): r for r in split["rows"]}
+    assert rows[("a", "sh1")]["failed"] == 1 and rows[("a", "sh1")]["errors_by_class"] == {"timeout": 1}
+    assert rows[("a", "sh2")]["errors_by_class"] == {"quota": 1}
+    # A sid the audit trail does not hold yet is still counted, under its own row.
+    assert rows[("a", NO_AUDIT_RECORD)]["errors_by_class"] == {"server": 1}
+    assert rows[("b", "sh1")]["partial"] == 1 and rows[("b", "sh1")]["queued"] == 1
+    assert rows[("b", "sh2")]["queued"] == 1
+    # What the worker could not keep, and could not name a member for, is carried.
+    assert split["dropped"] == {"queued": 12} and split["no_sid"] == {"failed": 2}
+    # One lookup for five distinct sids, and it is counted as load.
+    lookups = [s for s in stub.searches if "search_id IN" in s[0]]
+    assert len(lookups) == 1
+    assert result["self_load"]["queries"] == len(build_probes("x")) + 1 + 1
+
+
+def test_the_member_lookup_runs_in_batches_and_drops_unsafe_sids():
+    from regulator_agent.sut import MEMBER_LOOKUP_BATCH
+
+    sids = [f"reg_r7_0_aa_{n}" for n in range(MEMBER_LOOKUP_BATCH + 1)]
+    stub = _AuditStub({sid: "sh1" for sid in sids})
+    issue_sids = {"failed": [[sid, "a", "server"] for sid in sids] + [['x" | delete', "a", "server"]]}
+    result = _correlate_with(stub, issue_sids)
+    lookups = [s for s in stub.searches if "search_id IN" in s[0]]
+    assert len(lookups) == 2
+    assert not any("delete" in spl for spl, _ in lookups)
+    rows = {r["member"]: r for r in result["issues_by_member"]["rows"]}
+    assert rows["sh1"]["failed"] == MEMBER_LOOKUP_BATCH + 1
+
+
+def test_a_failed_member_lookup_is_a_note_not_a_failure():
+    stub = _AuditStub({}, fail_lookups=True)
+    result = _correlate_with(stub, {"failed": [["s1", "a", "server"]]})
+    assert result["issues_by_member"] == {"available": False, "reason": "lookup refused"}
+    assert any(n.startswith("issues_by_member:") for n in result["notes"])
+
+
+def test_no_issue_sids_means_no_lookup():
+    stub = _AuditStub({})
+    result = _correlate_with(stub, {"failed": [], "partial": [], "queued": [], "dropped": {}, "no_sid": {"failed": 3}})
+    assert "issues_by_member" not in result
+    assert not any("search_id IN" in s[0] for s in stub.searches)
+
+
+def test_findings_name_a_member_with_most_of_an_issue():
+    from regulator_agent.sut import NO_AUDIT_RECORD, _findings
+
+    def split(rows, members):
+        return {"probes": {}, "issues_by_member": {"available": True, "rows": rows, "members": members, "dropped": {}}}
+
+    concentrated = split(
+        [
+            {"step": "a", "member": "sh2", "failed": 0, "partial": 8, "queued": 0},
+            {"step": "b", "member": "sh2", "failed": 0, "partial": 1, "queued": 0},
+            {"step": "a", "member": "sh1", "failed": 0, "partial": 1, "queued": 0},
+            # Not placed on a member, so not counted for or against one.
+            {"step": "a", "member": NO_AUDIT_RECORD, "failed": 0, "partial": 50, "queued": 0},
+        ],
+        ["sh1", "sh2"],
+    )
+    line = next(f for f in _findings(concentrated) if "member" in f)
+    assert line.startswith("search head cluster member sh2 had 9 of the 10 partial results")
+
+    spread = split(
+        [{"step": "a", "member": m, "failed": 0, "partial": 5, "queued": 0} for m in ("sh1", "sh2", "sh3")],
+        ["sh1", "sh2", "sh3"],
+    )
+    assert not any("cluster member" in f for f in _findings(spread))
+    # One member is a standalone search head, or a sticky balancer: nothing to compare.
+    single = split([{"step": "a", "member": "sh1", "failed": 9, "partial": 0, "queued": 0}], ["sh1"])
+    assert not any("cluster member" in f for f in _findings(single))
+
+
+def test_the_probes_leave_their_own_audit_records_out():
+    """Each probe names the run marker, so it matched the next probe's selection.
+
+    Seen on the contract cluster: a probe's own audit record turned up in the
+    split by member as a step called 'coalesce(step, ...)', which Splunk had
+    extracted as step=... from the logged search text.
+    """
+    from regulator_agent.sut import CORRELATION_TAG
+
+    for probe in build_probes(marker_prefix_for("r7"), "reg_r7_"):
+        if '"reg:r7:"' in probe.spl:
+            # The selection excludes the tag, and in doing so carries it, so
+            # each probe's own record is left out by every probe after it.
+            assert f'NOT "{CORRELATION_TAG}"' in probe.spl, probe.name
+    # The step comes from the marker only, never from a field Splunk extracted
+    # from the logged search text: that one is called step too.
+    by_step = next(p for p in build_probes(marker_prefix_for("r7"), "reg_r7_") if p.name == "our_searches_by_step")
+    assert "coalesce(reg_step, " in by_step.spl and "coalesce(step, " not in by_step.spl

@@ -594,6 +594,100 @@ def merge_ledgers(documents: Sequence[Any]) -> Dict[str, Any]:
     }
 
 
+# ---------------------------------------------------------------------------
+# Which searches had which issue, by search id
+# ---------------------------------------------------------------------------
+#
+# The per-step issue counts say what went wrong and on which step. They cannot
+# say on which search head cluster member, because behind a load balancer the
+# client never learns which member served it. The target's own audit trail
+# does: the member that dispatched a job writes its _audit records, with its
+# own name as the host. So the run keeps the search ids of its searches with
+# an issue, and the correlation after the run asks _audit which member wrote
+# each (sut.members_for_sids). Bounded, because a run that went badly can have
+# tens of thousands of them: past the cap a kind is counted, not kept, and the
+# split is reported as a sample.
+#
+# Unknown-sid responses are deliberately not among them. A 404 comes from a
+# member that did NOT dispatch the job, so laying it against the member that
+# did would blame the wrong one.
+
+ISSUE_SIDS_PER_KIND = 300
+ISSUE_KINDS = ("failed", "partial", "queued")
+
+
+class IssueSids:
+    """Search ids of the run's searches with an issue, per kind. Bounded."""
+
+    def __init__(self) -> None:
+        self.kept: Dict[str, List[List[str]]] = {kind: [] for kind in ISSUE_KINDS}
+        self.dropped: Dict[str, int] = {}
+        # Issues on a search that never got a search id (a dispatch refused
+        # outright), which no member can be named for.
+        self.no_sid: Dict[str, int] = {}
+
+    def _keep(self, kind: str, entry: List[str]) -> None:
+        if len(self.kept[kind]) >= ISSUE_SIDS_PER_KIND:
+            self.dropped[kind] = self.dropped.get(kind, 0) + 1
+            return
+        self.kept[kind].append(entry)
+
+    def add(self, record: StepRecord) -> None:
+        if record.error_class == ERROR_CANCELLED:
+            return
+        kinds = []
+        if not record.ok:
+            kinds.append("failed")
+        else:
+            if record.partial:
+                kinds.append("partial")
+            if record.queued_ms:
+                kinds.append("queued")
+        for kind in kinds:
+            if not record.sid:
+                self.no_sid[kind] = self.no_sid.get(kind, 0) + 1
+                continue
+            entry = [str(record.sid), str(record.step_id)]
+            if kind == "failed":
+                entry.append(str(record.error_class or ERROR_CLIENT))
+            self._keep(kind, entry)
+
+    def to_dict(self) -> Dict[str, Any]:
+        out: Dict[str, Any] = {kind: list(entries) for kind, entries in self.kept.items()}
+        out["dropped"] = dict(self.dropped)
+        out["no_sid"] = dict(self.no_sid)
+        out["limit_per_kind"] = ISSUE_SIDS_PER_KIND
+        return out
+
+
+def merge_issue_sids(documents: Sequence[Any]) -> Dict[str, Any]:
+    """One fleet's issue sids: the same cap per kind, applied to the union."""
+    out: Dict[str, Any] = {kind: [] for kind in ISSUE_KINDS}
+    dropped: Dict[str, int] = {}
+    no_sid: Dict[str, int] = {}
+    for document in documents:
+        if not isinstance(document, dict):
+            continue
+        for kind in ISSUE_KINDS:
+            for entry in document.get(kind) or []:
+                if not isinstance(entry, (list, tuple)) or len(entry) < 2:
+                    continue
+                if len(out[kind]) >= ISSUE_SIDS_PER_KIND:
+                    dropped[kind] = dropped.get(kind, 0) + 1
+                else:
+                    out[kind].append([str(x) for x in entry])
+        for target, source in ((dropped, document.get("dropped")), (no_sid, document.get("no_sid"))):
+            for kind, n in (source or {}).items():
+                try:
+                    target[kind] = target.get(kind, 0) + int(n or 0)
+                except (TypeError, ValueError):
+                    continue
+    out["dropped"] = dropped
+    out["no_sid"] = no_sid
+    out["limit_per_kind"] = ISSUE_SIDS_PER_KIND
+    return out
+
+
 class RunStats:
     """Live aggregate over a whole run.
 
@@ -617,6 +711,8 @@ class RunStats:
         self.errors_by_class: Dict[str, int] = {}
         # The searches worth opening one at a time. See SearchLedger.
         self.ledger = SearchLedger()
+        # Search ids of the searches with an issue, for the split by member.
+        self.issue_sids = IssueSids()
         # Successful executions only. See StepStats.add for why.
         self.overall_latency = LatencyHistogram()
         self.failure_latency = LatencyHistogram()
@@ -714,6 +810,7 @@ class RunStats:
         stats.add(record, phase)
         self.interval.add(record)
         self.ledger.add(record)
+        self.issue_sids.add(record)
 
         if record.error_class == ERROR_CANCELLED:
             # Unfinished, not failed. Kept out of executions, errors, the

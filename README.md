@@ -52,7 +52,7 @@ cluster its own opinion, because the difference between "p95 went from 4 s to
 scheduled searches were skipped" is the difference between a load test and a
 benchmark.
 
-Fourteen questions, each one search against Splunk's own internal indexes
+Fifteen questions, each one search against Splunk's own internal indexes
 (the later ones follow the shape of the search-performance dashboards in
 silkyrich/cluster_health_tools, re-derived and confirmed on a live 10.4):
 
@@ -60,6 +60,7 @@ silkyrich/cluster_health_tools, re-derived and confirmed on a live 10.4):
 |---|---|
 | `_audit`, this run | The cluster's own account of the searches we dispatched, matched by the marker each one carries: run times, scan counts, **startup time, bucket elimination, and the bucket-cache hits and misses with the seconds each miss cost**, which turns cache provenance into a price per search |
 | `_audit`, this run, by step | The same audit records split by the step each search names in its run marker: buckets searched and eliminated, cache hits and misses, and the seconds each step's searches waited on misses beside their run time. "The run was partly cold" becomes "this step spent 41% of its run time waiting on 212 bucket downloads" |
+| `_audit`, this run, by step and member | The same again split by the host that wrote each audit record, which is the search head cluster member that ran the search |
 | `_audit`, everything | All searches in the window, so other traffic on a shared cluster is visible rather than silently mixed in |
 | `search_telemetry` | Where the time went by phase. Indexer-side elapsed time separates a busy search head from busy indexers, which no client-side timing can |
 | Queueing, and why | The search head's own count of searches it queued, how deep and how long, and the dispatcher's reasons, which tell the instance's ceiling from a per-role quota (the client sees the same wait for both) |
@@ -82,12 +83,28 @@ window, and errors by class (timeout, quota, auth, server, parse, other), with a
 row for the whole run and the scheduled searches the target skipped or deferred
 meanwhile. **Bucket attribution by step** is the per-step audit probe as a
 table. Its split depends on the run marker surviving into the audited search
-string, which has not been confirmed on every version: a record without it is
+string, confirmed on 10.6 but not on every version: a record without it is
 counted under "(step not in the audited search)" rather than dropped, so the
 rows still add up to the run's. Waiting is added up across indexers, so a
-step's share of its run time can pass 100%. Neither panel is split by search
-head cluster member yet: which member served a request behind a load balancer
-is not something the run can tell.
+step's share of its run time can pass 100%.
+
+Both panels are also split **by search head cluster member**. Behind a load
+balancer the client never learns which member served a search, but the
+target's audit trail does: only the member that dispatched a job ever knows it,
+and that member writes the job's `_audit` records under its own host name. So
+the worker keeps the search ids of its searches that failed, came back partial
+or waited in QUEUED (up to 300 of each kind; past that it counts them and the
+split says it is a sample), and after the run looks each one up in `_audit`,
+100 to a search, counted in the self-load like every other probe. The bucket
+figures come split by step and member from one more probe over the same audit
+records, so a step's member rows add up to its row in the table above. A search
+the audit trail did not hold yet is shown as "(no audit record yet)", a search
+refused before it had a search id is on no member, and unknown-sid responses
+are not split at all, because a 404 comes from a member that did *not*
+dispatch the job. When one member holds 60% or more of a kind of issue (five or
+more, across two members or more), the findings name it. A standalone search
+head, or a balancer that kept every search on one member, shows one line saying
+so instead of a table.
 
 Below them, **Searches to look at** lists individual searches by search id:
 every one that failed, was cut off by the end of the run or came back partial
@@ -237,6 +254,7 @@ What the first run, against Splunk 10.6, found:
 | The partial-results messages Regulator recognises | **Incomplete.** 10.6 reports a peer that could not download its buckets as "may have returned partial results", with the job DONE and no events. Now recognised |
 | Diagnose's indexer query | **Wrong anchor.** The line is "Streamed search connection closed", not "terminated". Fixed; every field it reads is confirmed |
 | Host resources and the freshness probe | Confirmed end to end |
+| The host on a search's `_audit` records is the member that dispatched it (issue 18) | **Confirmed.** Two searches dispatched on each of three members directly; the per-sid lookup and the per-member probe, read through the balanced address, named the right member for all six. The run marker survives into `_audit`'s `search` field. It also found that the correlation probes matched their own audit records (each names the run marker), so every `_audit` selection now leaves them out |
 | Host disk figures on every Linux host | **Not everywhere.** On GitHub's hosted runners splunkd's IOStats events name no mount point, and the disk queries grouped by it, so every one was dropped. A disk is now its mount point or its device |
 
 Also seen: on a replicated SmartStore bucket the copy that did not upload reports
@@ -1549,7 +1567,7 @@ engine with no Splunk anywhere.
 | `server/…/fleet.py`, `drivers/` | Planning shares, the lease protocol, merging, and the Swarm, Kubernetes and fake drivers |
 | `server/…/warmup.py` | Warming a confirmed plan: the one implementation behind the Warm cache button and a run's warm-up before its load |
 | `smartstore.py` | Cache state and eviction per indexer, discovered from the search peers, with evictions confirmed rather than assumed |
-| `sut.py` | The fourteen correlation probes against the cluster's own indexes |
+| `sut.py` | The fifteen correlation probes against the cluster's own indexes, and the lookup of the member that served each search with an issue |
 | `compare.py` | Baselines, per-step deltas and the gate language |
 
 ---

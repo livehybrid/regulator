@@ -95,6 +95,9 @@ class Probe:
     # over no events, which used to show as "1 row(s)" of zeros. A probe
     # whose count is zero reports no rows instead.
     count_field: str = ""
+    # How many rows to ask for. Most probes return a handful; one split two
+    # ways (step by member) can return many more.
+    max_rows: int = 50
     rows: List[Dict[str, Any]] = field(default_factory=list)
     available: bool = False
     reason: str = ""
@@ -117,6 +120,39 @@ class Probe:
 # The row an audit record lands in when its search string does not carry the
 # run marker, so the step it belongs to cannot be read.
 UNATTRIBUTED_STEP = "(step not in the audited search)"
+
+
+# Written into every correlation probe's search string, so the probes can
+# leave their own audit records out of the run's. See build_probes.
+CORRELATION_TAG = "regulator-correlation-probe"
+
+# The member an audit record lands under when it names no host.
+UNKNOWN_MEMBER = "(member not recorded)"
+# The member a search with an issue lands under when the audit trail held no
+# record of its search id when it was read.
+NO_AUDIT_RECORD = "(no audit record yet)"
+# Steps by members can pass the usual 50 rows: 40 steps on 3 members is 120.
+MEMBER_PROBE_ROWS = 500
+
+# What each step's audit records add up to, shared by the split by step and
+# the split by step and member so the two can never disagree on a figure.
+_ATTRIBUTION_STATS = (
+    "count as searches, sum(total_run_time) as run_time_s, "
+    "sum(searched_buckets) as searched_buckets, sum(eliminated_buckets) as eliminated_buckets, "
+    "sum(invocations_command_search_index_bucketcache_hit) as index_cache_hits, "
+    "sum(invocations_command_search_index_bucketcache_miss) as index_cache_misses, "
+    "sum(duration_command_search_index_bucketcache_miss) as index_miss_s, "
+    "sum(invocations_command_search_rawdata_bucketcache_hit) as rawdata_cache_hits, "
+    "sum(invocations_command_search_rawdata_bucketcache_miss) as rawdata_cache_misses, "
+    "sum(duration_command_search_rawdata_bucketcache_miss) as rawdata_miss_s"
+)
+_ATTRIBUTION_EVALS = (
+    "cold_path_s=coalesce(index_miss_s, 0) + coalesce(rawdata_miss_s, 0), "
+    "cache_hits=coalesce(index_cache_hits, 0) + coalesce(rawdata_cache_hits, 0), "
+    "cache_misses=coalesce(index_cache_misses, 0) + coalesce(rawdata_cache_misses, 0), "
+    "cache_miss_pct=if(cache_hits + cache_misses > 0, round(100 * cache_misses / (cache_hits + cache_misses), 2), null()), "
+    "cold_path_pct=if(run_time_s > 0, round(100 * cold_path_s / run_time_s, 1), null())"
+)
 
 
 def _marker_regex(marker_prefix: str) -> str:
@@ -146,6 +182,18 @@ def build_probes(marker_prefix: str, sid_prefix: str = "") -> List[Probe]:
         ours = f'(search_id="*{sid_prefix}*" OR "{marker_prefix}")'
     else:
         ours = f'"{marker_prefix}"'
+    # Not the correlation's own searches. Each probe names the run marker in
+    # its own search string, so a probe's audit record matched the next
+    # probe's selection and counted as one of the run's searches (seen on the
+    # contract cluster). The exclusion term is written into every probe by
+    # this very clause, so a probe excludes itself and every other probe,
+    # and no search a scenario dispatches carries it.
+    ours = f'{ours} NOT "{CORRELATION_TAG}"'
+    attribution_stats, attribution_evals = _ATTRIBUTION_STATS, _ATTRIBUTION_EVALS
+    step_from_marker = (
+        f'| rex field=search "{_marker_regex(marker_prefix)}vu\\d+:i\\d+:(?<reg_step>[A-Za-z0-9_.:-]+)" '
+        f'| eval step=coalesce(reg_step, "{UNATTRIBUTED_STEP}")'
+    )
     return [
         Probe(
             name="our_searches",
@@ -208,21 +256,31 @@ def build_probes(marker_prefix: str, sid_prefix: str = "") -> List[Probe]:
             # into _audit's search field on every version.
             spl=(
                 f"search index=_audit action=search info=completed {ours} "
-                f'| rex field=search "{_marker_regex(marker_prefix)}vu\\d+:i\\d+:(?<step>[A-Za-z0-9_.:-]+)" '
-                f'| eval step=coalesce(step, "{UNATTRIBUTED_STEP}") '
-                "| stats count as searches, sum(total_run_time) as run_time_s, "
-                "sum(searched_buckets) as searched_buckets, sum(eliminated_buckets) as eliminated_buckets, "
-                "sum(invocations_command_search_index_bucketcache_hit) as index_cache_hits, "
-                "sum(invocations_command_search_index_bucketcache_miss) as index_cache_misses, "
-                "sum(duration_command_search_index_bucketcache_miss) as index_miss_s, "
-                "sum(invocations_command_search_rawdata_bucketcache_hit) as rawdata_cache_hits, "
-                "sum(invocations_command_search_rawdata_bucketcache_miss) as rawdata_cache_misses, "
-                "sum(duration_command_search_rawdata_bucketcache_miss) as rawdata_miss_s by step "
-                "| eval cold_path_s=coalesce(index_miss_s, 0) + coalesce(rawdata_miss_s, 0), "
-                "cache_hits=coalesce(index_cache_hits, 0) + coalesce(rawdata_cache_hits, 0), "
-                "cache_misses=coalesce(index_cache_misses, 0) + coalesce(rawdata_cache_misses, 0), "
-                "cache_miss_pct=if(cache_hits + cache_misses > 0, round(100 * cache_misses / (cache_hits + cache_misses), 2), null()), "
-                "cold_path_pct=if(run_time_s > 0, round(100 * cold_path_s / run_time_s, 1), null()) "
+                f"{step_from_marker} "
+                f"| stats {attribution_stats} by step "
+                f"| eval {attribution_evals} "
+                "| sort - cold_path_s, - run_time_s"
+            ),
+        ),
+        Probe(
+            name="our_searches_by_member",
+            description=(
+                "the same split again by search head cluster member: the host on each audit "
+                "record is the member that dispatched and ran the search, which behind a load "
+                "balancer is the only place the run can learn it"
+            ),
+            # The host of an _audit record is the instance that wrote it, and
+            # only the member that dispatched a job ever knows it (contract
+            # suite, 10.6), so the writer is the member that served it. On a
+            # standalone search head every row names the one host. A record
+            # without a host is counted under a row that says so.
+            max_rows=MEMBER_PROBE_ROWS,
+            spl=(
+                f"search index=_audit action=search info=completed {ours} "
+                f"{step_from_marker} "
+                f'| eval member=coalesce(host, "{UNKNOWN_MEMBER}") '
+                f"| stats {attribution_stats} by step, member "
+                f"| eval {attribution_evals} "
                 "| sort - cold_path_s, - run_time_s"
             ),
         ),
@@ -415,8 +473,14 @@ async def correlate(
     timeout_s: float = QUERY_TIMEOUT_S,
     settle_s: float = SETTLE_S,
     sid_prefix: str = "",
+    issue_sids: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
-    """Ask the cluster what it thought was happening. Never raises."""
+    """Ask the cluster what it thought was happening. Never raises.
+
+    ``issue_sids`` is the run's ``IssueSids`` document (results.py): the search
+    ids of its searches with an issue. Given one, the issues are also split by
+    the search head cluster member that served each search.
+    """
     if settle_s > 0:
         # Wait for the audit trail to catch up before asking it about searches
         # that finished moments ago.
@@ -445,7 +509,7 @@ async def correlate(
     async def run_probe(probe: Probe) -> None:
         try:
             rows, _ = await asyncio.wait_for(
-                client.oneshot(probe.spl, window, count=50), timeout=timeout_s
+                client.oneshot(probe.spl, window, count=probe.max_rows), timeout=timeout_s
             )
         except asyncio.TimeoutError:
             probe.reason = f"the query did not answer within {timeout_s:.0f}s"
@@ -474,6 +538,19 @@ async def correlate(
         if not probe.available and probe.reason:
             notes.append(f"{probe.name}: {probe.reason}")
 
+    by_member = None
+    lookups = 0
+    if issue_sids and any(issue_sids.get(kind) for kind in ISSUE_KINDS):
+        if readable is not None and "_audit" not in readable:
+            by_member = {
+                "available": False,
+                "reason": "not run: this account cannot read _audit, or it holds no events",
+            }
+        else:
+            by_member, lookups = await _issues_by_member(client, window, issue_sids, timeout_s)
+        if not by_member.get("available") and by_member.get("reason"):
+            notes.append(f"issues_by_member: {by_member['reason']}")
+
     result: Dict[str, Any] = {
         "window": {
             "earliest": started_at,
@@ -489,15 +566,129 @@ async def correlate(
         # These searches ran on the cluster under test. Small, after the fact,
         # and recorded rather than pretended away.
         "self_load": {
-            "queries": sum(1 for probe in probes if not probe.reason.startswith("not run:")) + 1,
+            "queries": sum(1 for probe in probes if not probe.reason.startswith("not run:")) + 1 + lookups,
             "note": (
                 "these correlation searches ran on the target after the load stopped, so "
                 "they add a small, known amount of work to the system being measured"
             ),
         },
     }
+    if by_member is not None:
+        result["issues_by_member"] = by_member
     result["findings"] = _findings(result)
     return result
+
+
+# ---------------------------------------------------------------------------
+# Issues by search head cluster member
+# ---------------------------------------------------------------------------
+
+# The kinds results.IssueSids keeps, in the order the panel shows them.
+ISSUE_KINDS = ("failed", "partial", "queued")
+# Search ids per lookup search: long enough to keep the number of searches
+# small, short enough to keep each search string reasonable.
+MEMBER_LOOKUP_BATCH = 100
+# A search id goes into a quoted SPL operand, so only the characters a search
+# id is made of are let through; anything else is reported as unattributed.
+_SAFE_SID = re.compile(r"^[A-Za-z0-9_.:-]{1,200}$")
+
+
+def member_lookup_spl(sids: List[str]) -> str:
+    """One search naming the member that wrote the audit records of each sid.
+
+    ``_audit`` writes search_id wrapped in single quotes, so each id is
+    matched both quoted and bare, and the quotes are trimmed before grouping.
+    Exact values rather than wildcards: ``*_1*`` would also match ``_10``
+    to ``_19``. Any action=search record will do: every one of them is
+    written by the member that holds the job.
+    """
+    terms = ", ".join(f'"{sid}", "\'{sid}\'"' for sid in sids)
+    return (
+        f"search index=_audit action=search search_id IN ({terms}) "
+        "| eval sid=trim(search_id, \"'\") "
+        "| stats latest(host) as member, dc(host) as members by sid"
+    )
+
+
+async def members_for_sids(
+    client: SplunkClient, window: TimeWindow, sids: List[str], timeout_s: float = QUERY_TIMEOUT_S
+) -> "tuple[Dict[str, str], int, str]":
+    """sid -> member, from the audit trail; with the searches it took and a reason if any failed."""
+    wanted = sorted({sid for sid in sids if _SAFE_SID.match(sid)})
+    found: Dict[str, str] = {}
+    queries = 0
+    reason = ""
+    for start in range(0, len(wanted), MEMBER_LOOKUP_BATCH):
+        batch = wanted[start:start + MEMBER_LOOKUP_BATCH]
+        queries += 1
+        try:
+            rows, _ = await asyncio.wait_for(
+                client.oneshot(member_lookup_spl(batch), window, count=len(batch) + 10),
+                timeout=timeout_s,
+            )
+        except asyncio.TimeoutError:
+            reason = f"a member lookup did not answer within {timeout_s:.0f}s"
+            break
+        except Exception as exc:  # noqa: BLE001 - correlation never fails a run
+            reason = str(exc)[:300]
+            break
+        batch_set = set(batch)
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            sid = str(row.get("sid") or "").strip("'")
+            member = str(row.get("member") or "")
+            if sid in batch_set and member:
+                found[sid] = member
+    return found, queries, reason
+
+
+def split_issues_by_member(issue_sids: Dict[str, Any], members: Dict[str, str]) -> List[Dict[str, Any]]:
+    """Rows of (step, member) with the count of each issue kind, failures by class."""
+    rows: Dict[tuple, Dict[str, Any]] = {}
+    for kind in ISSUE_KINDS:
+        for entry in issue_sids.get(kind) or []:
+            if not isinstance(entry, (list, tuple)) or len(entry) < 2:
+                continue
+            sid, step = str(entry[0]), str(entry[1])
+            member = members.get(sid, NO_AUDIT_RECORD)
+            row = rows.setdefault(
+                (step, member),
+                {"step": step, "member": member, "failed": 0, "partial": 0, "queued": 0, "errors_by_class": {}},
+            )
+            row[kind] += 1
+            if kind == "failed":
+                cls = str(entry[2]) if len(entry) > 2 and entry[2] else "client"
+                row["errors_by_class"][cls] = row["errors_by_class"].get(cls, 0) + 1
+    return sorted(rows.values(), key=lambda r: (r["step"], r["member"] == NO_AUDIT_RECORD, r["member"]))
+
+
+async def _issues_by_member(
+    client: SplunkClient, window: TimeWindow, issue_sids: Dict[str, Any], timeout_s: float
+) -> "tuple[Dict[str, Any], int]":
+    sids = [
+        str(entry[0])
+        for kind in ISSUE_KINDS
+        for entry in issue_sids.get(kind) or []
+        if isinstance(entry, (list, tuple)) and entry
+    ]
+    members, queries, reason = await members_for_sids(client, window, sids, timeout_s)
+    if reason and not members:
+        return {"available": False, "reason": reason}, queries
+    out: Dict[str, Any] = {
+        "available": True,
+        "reason": reason,
+        "rows": split_issues_by_member(issue_sids, members),
+        "members": sorted(set(members.values())),
+        "looked_up": len(set(sids)),
+        "found": len(members),
+        # Kept per kind by the worker up to a cap; past it, counted only. A
+        # split with anything here is a sample of that kind, not all of it.
+        "dropped": dict(issue_sids.get("dropped") or {}),
+        # Issues on searches that never had a search id: no member to name.
+        "no_sid": dict(issue_sids.get("no_sid") or {}),
+    }
+    return out, queries
 
 
 ACCESS_CHECK_SPL = (
@@ -658,6 +849,8 @@ def _findings(correlation: Dict[str, Any]) -> List[str]:
             f"({waited:.1f}s of {run_time:.1f}s): the step the cold path cost most"
         )
 
+    findings.extend(_member_findings(correlation.get("issues_by_member") or {}))
+
     queueing = first_row("queueing")
     if queueing.get("enqueued") not in (None, "", "0", 0):
         try:
@@ -682,6 +875,42 @@ def _findings(correlation: Dict[str, Any]) -> List[str]:
             "client-side measurement"
         )
     return findings
+
+
+# A member is called out when it holds at least this share of a kind of issue
+# that at least MEMBER_FINDING_MIN searches had, across two members or more.
+MEMBER_FINDING_SHARE = 0.6
+MEMBER_FINDING_MIN = 5
+
+
+def _member_findings(by_member: Dict[str, Any]) -> List[str]:
+    """A member that had most of an issue, which points at the member rather than the cluster."""
+    if not by_member.get("available"):
+        return []
+    named = [m for m in by_member.get("members") or [] if m not in (NO_AUDIT_RECORD, UNKNOWN_MEMBER)]
+    if len(named) < 2:
+        return []
+    out: List[str] = []
+    labels = {"failed": "failures", "partial": "partial results", "queued": "queued searches"}
+    for kind in ISSUE_KINDS:
+        totals: Dict[str, int] = {}
+        for row in by_member.get("rows") or []:
+            member = row.get("member")
+            if member in (NO_AUDIT_RECORD, UNKNOWN_MEMBER):
+                continue
+            totals[member] = totals.get(member, 0) + int(row.get(kind) or 0)
+        attributed = sum(totals.values())
+        if attributed < MEMBER_FINDING_MIN:
+            continue
+        member, most = max(totals.items(), key=lambda item: item[1])
+        if most / attributed >= MEMBER_FINDING_SHARE:
+            sample = " (of a sample)" if (by_member.get("dropped") or {}).get(kind) else ""
+            out.append(
+                f"search head cluster member {member} had {most} of the {attributed} {labels[kind]} "
+                f"the audit trail could place{sample}, across {len(named)} members: look at that member "
+                "before the cluster"
+            )
+    return out
 
 
 def _number(value: Any) -> str:
