@@ -262,6 +262,13 @@ class WarmLine(BaseModel):
     latest: Any = "now"
 
 
+class PlanMapRequest(BaseModel):
+    """A warm-up plan to draw on the bucket map, before anything is warmed."""
+
+    plan: List[WarmLine] = Field(min_length=1, max_length=100)
+    bins: int = Field(default=60, ge=10, le=240)
+
+
 class WarmRequest(BaseModel):
     plan: List[WarmLine] = Field(min_length=1, max_length=100)
     mode: str = Field(default="tsidx", pattern="^(tsidx|full)$")

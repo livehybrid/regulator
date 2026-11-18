@@ -21,6 +21,7 @@ import P from '@splunk/react-ui/Paragraph';
 import Select from '@splunk/react-ui/Select';
 import WaitSpinner from '@splunk/react-ui/WaitSpinner';
 
+import { PlanBucketMap } from '../components/BucketMap';
 import BusyButton from '../components/BusyButton';
 import Dialog from '../components/Dialog';
 import {
@@ -212,6 +213,11 @@ export default function WarmModal({ targetId, onClose, onDone }) {
 
             <SectionHeading>Plan</SectionHeading>
             <WarmPlanTable rows={rows} onChange={edit} />
+            <PlanBucketMap
+                targetId={targetId}
+                rows={rows}
+                epoch={job && job.state !== 'running' ? job.finished_at || job.started_at || 'done' : null}
+            />
 
             <Grid2>
                 <ControlGroup label="Searches at once" labelPosition="top">

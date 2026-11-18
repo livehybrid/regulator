@@ -36,6 +36,7 @@ import PurgeModal from '../modals/PurgeModal';
 import RunCharts from '../components/RunCharts';
 import SearchIssues from '../components/SearchIssues';
 import SearchLedger from '../components/SearchLedger';
+import RunBucketMap from '../components/RunBucketMap';
 import SutSection from '../components/SutSection';
 import WorkersSection from '../components/WorkersSection';
 import { loadText } from './Runs';
@@ -752,6 +753,8 @@ export default function RunDetail({ runId, navigate, onLaunch }) {
             <SutSection sut={summary.sut} />
 
             {!live && <HostResources resources={summary.resources} />}
+
+            {!live && <RunBucketMap cache={summary.cache} />}
 
             {!live && <Freshness freshness={summary.freshness} run={run} />}
 

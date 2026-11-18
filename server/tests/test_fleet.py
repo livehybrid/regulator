@@ -746,6 +746,10 @@ def test_a_fleet_run_warms_its_confirmed_plan_once_before_any_worker_exists(clie
         assert warm["after"]["local"] == warm["after"]["buckets"] == warmed
         # A fleet run carries the forecast too, taken after the warm-up.
         assert "forecast" in run["summary"]["cache"]
+        # And the bucket map either side, on the same rows for both.
+        pair = run["summary"]["cache"]["map"]
+        assert pair["available"] is True
+        assert [r["index"] for r in pair["before"]["indexes"]] == [r["index"] for r in pair["after"]["indexes"]]
         assert run["warm_plan"]["plan"] == [{"index": "main", "earliest": "-2h", "latest": "now"}]
     finally:
         cold.close()

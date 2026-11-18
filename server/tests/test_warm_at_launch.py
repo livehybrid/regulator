@@ -161,6 +161,17 @@ def test_every_run_carries_a_forecast_of_what_it_was_about_to_read(client, cold,
     assert cache["forecast"]["available"] is True
     assert cache["forecast"]["buckets"] > 0 and cache["forecast"]["local"] == 0
 
+    # The bucket map either side of the run, from the two readings it took:
+    # the rows are what the forecast says it reads, on one axis for both.
+    pair = cache["map"]
+    assert pair["available"] is True and pair["source"] == "forecast"
+    before, after = pair["before"], pair["after"]
+    assert [r["index"] for r in before["indexes"]] == ["main"] == [r["index"] for r in after["indexes"]]
+    assert (before["earliest"], before["latest"]) == (after["earliest"], after["latest"])
+    assert before["indexes"][0]["local_pct"] == 0
+    assert after["indexes"][0]["local_pct"] > 0
+    assert pair["overlay"] and {s["index"] for s in pair["overlay"]} == {"main"}
+
     # Warm everything the scenario reads (its subsearch reaches back three
     # hours), and the next run's forecast finds it local.
     warmed = launch(client, target, scenario, warm_mode="full",

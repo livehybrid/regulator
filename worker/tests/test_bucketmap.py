@@ -135,3 +135,109 @@ def test_the_overlay_matches_wildcards_merges_and_clips():
     assert out == [{
         "index": "web_prod", "earliest": int(T0 + DAY), "latest": int(T0 + 20 * DAY), "clipped": True,
     }]
+
+
+# ------------------------------------------------------------ plan map
+
+
+def test_plan_map_draws_the_plans_indexes_and_lines_with_a_margin():
+    state = state_of([
+        bucket(1, index="web_a", day=0), bucket(2, index="web_b", day=2),
+        bucket(3, index="other", day=1, size=50 * GB),
+    ])
+    plan = cachewarm.parse_plan([
+        {"index": "web_*", "earliest": T0 + DAY, "latest": T0 + 2 * DAY},
+        {"index": "absent", "earliest": T0, "latest": T0 + DAY},
+    ], now=T0)
+    m = bucketmap.plan_map(state, plan, bins=20, now=T0)
+    assert m["available"]
+    # The wildcard is matched against what the cache manager lists; the
+    # largest index on the target is not drawn because the plan does not name it.
+    assert sorted(r["index"] for r in m["indexes"]) == ["web_a", "web_b"]
+    # The axis reaches past the plan on both sides.
+    assert m["earliest"] < T0 and m["latest"] > T0 + 2 * DAY
+    spans = sorted((s["index"], s["earliest"], s["latest"]) for s in m["overlay"]["spans"])
+    assert spans == [
+        ("web_a", int(T0 + DAY), int(T0 + 2 * DAY)),
+        ("web_b", int(T0 + DAY), int(T0 + 2 * DAY)),
+    ]
+    assert m["overlay"]["plan"] is True
+    assert any("absent" in n for n in m["overlay"]["notes"])
+
+
+def test_plan_map_says_why_when_the_cache_cannot_be_read():
+    plan = cachewarm.parse_plan([{"index": "main", "earliest": T0, "latest": T0 + DAY}], now=T0)
+    m = bucketmap.plan_map(CacheState(available=False, reason="401 from the cluster manager"), plan, now=T0)
+    assert not m["available"] and "401" in m["reason"]
+
+
+# ------------------------------------------------------- run before/after
+
+
+def _with_counts(state):
+    for b in state.buckets:
+        entry = state.per_index[b.index]
+        entry.total_bytes += b.size
+        if b.is_local:
+            entry.local_buckets += 1
+        else:
+            entry.remote_buckets += 1
+    return state
+
+
+def test_run_pair_shares_rows_and_axis_and_shows_what_the_run_fetched():
+    before = _with_counts(state_of([
+        bucket(1, index="web", status="remote", day=0), bucket(2, index="web", status="remote", day=5),
+        bucket(3, index="big", status="remote", day=0, days=30, size=99 * GB),
+    ]))
+    # The run read web's day 5 bucket; a new bucket also rolled in afterwards.
+    after = _with_counts(state_of([
+        bucket(1, index="web", status="remote", day=0), bucket(2, index="web", status="local", day=5),
+        bucket(4, index="web", status="local", day=8),
+        bucket(3, index="big", status="remote", day=0, days=30, size=99 * GB),
+    ]))
+    forecast = {
+        "available": True,
+        "per_index": {"web": {"bytes_total": 2 * GB, "spans": [[T0 + 4 * DAY, T0 + 6 * DAY]]}},
+    }
+    pair = bucketmap.run_pair(before, after, forecast, bins=10)
+    assert pair["available"] and pair["source"] == "forecast"
+    b, a = pair["before"], pair["after"]
+    # Only what the run reads is drawn, on one axis for both sides.
+    assert [r["index"] for r in b["indexes"]] == ["web"] == [r["index"] for r in a["indexes"]]
+    assert (b["earliest"], b["latest"], b["bins"]) == (a["earliest"], a["latest"], a["bins"])
+    assert (b["earliest"], b["latest"]) == (int(T0 + 4 * DAY), int(T0 + 6 * DAY))
+
+    def local_bytes(doc):
+        return sum(c["bytes"].get("local", 0) for c in doc["indexes"][0]["cells"])
+
+    assert local_bytes(b) == 0 and local_bytes(a) == GB
+    assert pair["overlay"] == [
+        {"index": "web", "earliest": int(T0 + 4 * DAY), "latest": int(T0 + 6 * DAY), "clipped": False}
+    ]
+
+
+def test_run_pair_without_a_forecast_shows_the_indexes_that_changed():
+    before = _with_counts(state_of([
+        bucket(1, index="quiet", day=0, size=50 * GB), bucket(2, index="busy", day=0),
+    ]))
+    after = _with_counts(state_of([
+        bucket(1, index="quiet", day=0, size=50 * GB), bucket(2, index="busy", status="local", day=0),
+    ]))
+    pair = bucketmap.run_pair(before, after, None, bins=10)
+    assert pair["source"] == "changed"
+    assert [r["index"] for r in pair["after"]["indexes"]] == ["busy"]
+    assert pair["overlay"] == []
+
+
+def test_run_pair_with_nothing_changed_falls_back_to_the_largest():
+    state = _with_counts(state_of([bucket(1, index="small", day=0), bucket(2, index="large", day=0, size=9 * GB)]))
+    pair = bucketmap.run_pair(state, state, {"available": False}, bins=10, max_indexes=1)
+    assert pair["source"] == "largest"
+    assert [r["index"] for r in pair["before"]["indexes"]] == ["large"]
+
+
+def test_run_pair_is_unavailable_when_either_reading_failed():
+    good = _with_counts(state_of([bucket(1)]))
+    pair = bucketmap.run_pair(good, CacheState(available=False, reason="timed out"), None)
+    assert not pair["available"] and pair["reason"] == "timed out"

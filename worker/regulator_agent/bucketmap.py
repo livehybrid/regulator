@@ -190,3 +190,163 @@ def overlay(
                 "clipped": lo < earliest or hi > latest,
             })
     return out
+
+
+class _Span:
+    """The shape :func:`overlay` reads: lower-cased index patterns and a range."""
+
+    __slots__ = ("indexes", "earliest", "latest")
+
+    def __init__(self, indexes: Sequence[str], earliest: float, latest: float) -> None:
+        self.indexes = [i.lower() for i in indexes]
+        self.earliest = float(earliest)
+        self.latest = float(latest)
+
+
+def _matching(state: CacheState, patterns: Iterable[str]) -> List[str]:
+    """Index names the cache manager lists that match any of ``patterns``."""
+    import fnmatch
+
+    wanted = [p.lower() for p in patterns]
+    return sorted(
+        name for name in {b.index for b in state.buckets}
+        if any(fnmatch.fnmatchcase(name.lower(), p) for p in wanted)
+    )
+
+
+def _extent(states: Sequence[CacheState], names: Sequence[str]) -> Optional[Tuple[float, float]]:
+    """The earliest and latest time any dated bucket of ``names`` covers."""
+    wanted = {n.lower() for n in names}
+    los, his = [], []
+    for state in states:
+        for bucket in state.buckets:
+            if bucket.index.lower() in wanted and bucket.earliest is not None and bucket.latest is not None:
+                los.append(bucket.earliest)
+                his.append(bucket.latest)
+    return (min(los), max(his)) if los else None
+
+
+def plan_map(
+    state: CacheState,
+    plan: Sequence[Any],
+    *,
+    bins: int = 60,
+    max_indexes: int = 20,
+    now: Optional[float] = None,
+) -> Dict[str, Any]:
+    """The map around a warm-up plan, with the plan's lines drawn over it.
+
+    ``plan`` is a list of ``cachewarm.WarmTarget``. The rows are the indexes
+    the plan names (wildcards matched against the cache manager's list) and
+    the time axis is the plan's own span with a margin either side, so what
+    sits just outside a line is visible too.
+    """
+    names = _matching(state, [t.index for t in plan]) if state.available else []
+    lo = min(t.earliest for t in plan)
+    hi = max(t.latest for t in plan)
+    margin = max(60.0, 0.1 * (hi - lo))
+    document = build(
+        state, indexes=names or [t.index for t in plan], earliest=lo - margin, latest=hi + margin,
+        bins=bins, max_indexes=max_indexes, now=now,
+    )
+    if document["available"]:
+        document["overlay"] = {
+            "plan": True,
+            "spans": overlay(
+                [_Span([t.index], t.earliest, t.latest) for t in plan],
+                [row["index"] for row in document["indexes"]],
+                document["earliest"], document["latest"],
+            ),
+            "notes": [],
+        }
+        unmatched = sorted({
+            t.index for t in plan if not _matching(state, [t.index])
+        })
+        if unmatched:
+            document["overlay"]["notes"].append(
+                "no bucket in the cache manager matches " + ", ".join(unmatched)
+                + ": a non-SmartStore index, or one this account cannot see"
+            )
+    return document
+
+
+def run_pair(
+    before: CacheState,
+    after: CacheState,
+    forecast: Optional[Dict[str, Any]] = None,
+    *,
+    bins: int = 60,
+    max_indexes: int = 10,
+) -> Dict[str, Any]:
+    """The map before and after a run, on the same rows and the same axis.
+
+    Built from the two cache manager readings every run already takes, so it
+    costs the target nothing more: no extra listing and no dbinspect. That
+    also means the states are local or remote only. A forecast read with
+    dbinspect at the start describes the before side alone, and refining one
+    side and not the other would make the pair disagree about buckets that
+    did not change.
+
+    The rows are the indexes the run's forecast says it reads, the largest
+    first; without a forecast, the indexes whose local bucket count changed;
+    failing that, the largest. The axis spans what the run reads, clipped to
+    the buckets that exist.
+    """
+    out: Dict[str, Any] = {"available": False, "reason": "", "source": None, "notes": []}
+    if not before.available or not after.available:
+        out["reason"] = before.reason or after.reason or "the SmartStore cache could not be read"
+        return out
+
+    forecast = forecast or {}
+    per_index = (forecast.get("per_index") or {}) if forecast.get("available") else {}
+    spans: List[_Span] = []
+    if per_index:
+        ranked = sorted(per_index.items(), key=lambda kv: (-(kv[1].get("bytes_total") or 0), kv[0]))
+        names = [name for name, _ in ranked[:max_indexes]]
+        for name in names:
+            for lo, hi in per_index[name].get("spans") or []:
+                spans.append(_Span([name], lo, hi))
+        source = "forecast"
+    else:
+        b_idx, a_idx = before.per_index, after.per_index
+
+        def local(side: Dict[str, Any], name: str) -> int:
+            return side[name].local_buckets if name in side else 0
+
+        def size(name: str) -> int:
+            return max(a_idx[name].total_bytes if name in a_idx else 0, b_idx[name].total_bytes if name in b_idx else 0)
+
+        changed = [name for name in set(b_idx) | set(a_idx) if local(b_idx, name) != local(a_idx, name)]
+        if changed:
+            names, source = sorted(changed, key=lambda n: (-size(n), n))[:max_indexes], "changed"
+        else:
+            names = sorted(set(b_idx) | set(a_idx), key=lambda n: (-size(n), n))[:max_indexes]
+            source = "largest"
+    if len(per_index) > max_indexes:
+        out["notes"].append(
+            f"showing the {max_indexes} largest of the {len(per_index)} indexes the run reads"
+        )
+
+    extent = _extent([before, after], names)
+    if extent is None:
+        lo = hi = None
+    else:
+        lo, hi = extent
+        if spans:
+            lo = max(lo, min(s.earliest for s in spans))
+            hi = min(hi, max(s.latest for s in spans))
+            if hi <= lo:
+                lo, hi = extent
+    pair = {
+        side: build(state, indexes=names or None, earliest=lo, latest=hi, bins=bins, max_indexes=max_indexes)
+        for side, state in (("before", before), ("after", after))
+    }
+    if not pair["before"]["available"] and not pair["after"]["available"]:
+        out["reason"] = pair["before"]["reason"]
+        return out
+    base = pair["before"] if pair["before"]["available"] else pair["after"]
+    out.update(available=True, source=source, before=pair["before"], after=pair["after"])
+    out["overlay"] = overlay(
+        spans, [row["index"] for row in base["indexes"]], base["earliest"], base["latest"]
+    ) if spans else []
+    return out

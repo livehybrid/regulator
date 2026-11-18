@@ -18,7 +18,7 @@ import logging
 import time
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
-from regulator_agent import cachewarm
+from regulator_agent import bucketmap, cachewarm
 from regulator_agent.smartstore import CacheState, cache_state
 from regulator_agent.splunk import SplunkClient
 
@@ -173,6 +173,21 @@ async def forecast_for_run(
         log.debug("the cache forecast failed", exc_info=True)
         return None
     return fc.to_dict()
+
+
+def bucket_map_for_run(
+    before: CacheState, after: CacheState, forecast: Optional[Dict[str, Any]]
+) -> Optional[Dict[str, Any]]:
+    """The bucket map before and after a run, or None. Never raises.
+
+    Built from the two cache readings the run takes anyway, so it adds no
+    load: nothing is read from the target during the run, or for this.
+    """
+    try:
+        return bucketmap.run_pair(before, after, forecast)
+    except Exception:  # noqa: BLE001 - a nicety, never fatal to a run
+        log.debug("the run's bucket map failed", exc_info=True)
+        return None
 
 
 def record_run_warm(run_id: int, result: Dict[str, Any], state_after: Optional[CacheState]) -> None:
