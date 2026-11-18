@@ -83,7 +83,7 @@ window, and errors by class (timeout, quota, auth, server, parse, other), with a
 row for the whole run and the scheduled searches the target skipped or deferred
 meanwhile. **Bucket attribution by step** is the per-step audit probe as a
 table. Its split depends on the run marker surviving into the audited search
-string, which has not been confirmed on every version: a record without it is
+string, confirmed on 10.6 but not on every version: a record without it is
 counted under "(step not in the audited search)" rather than dropped, so the
 rows still add up to the run's. Waiting is added up across indexers, so a
 step's share of its run time can pass 100%.
@@ -254,7 +254,7 @@ What the first run, against Splunk 10.6, found:
 | The partial-results messages Regulator recognises | **Incomplete.** 10.6 reports a peer that could not download its buckets as "may have returned partial results", with the job DONE and no events. Now recognised |
 | Diagnose's indexer query | **Wrong anchor.** The line is "Streamed search connection closed", not "terminated". Fixed; every field it reads is confirmed |
 | Host resources and the freshness probe | Confirmed end to end |
-| The host on a search's `_audit` records is the member that dispatched it (issue 18) | Added after the first run: each member dispatches searches directly, and both the per-sid lookup and the per-member probe, read through the balanced address, must name that member. Not yet run against the cluster |
+| The host on a search's `_audit` records is the member that dispatched it (issue 18) | **Confirmed.** Two searches dispatched on each of three members directly; the per-sid lookup and the per-member probe, read through the balanced address, named the right member for all six. The run marker survives into `_audit`'s `search` field. It also found that the correlation probes matched their own audit records (each names the run marker), so every `_audit` selection now leaves them out |
 | Host disk figures on every Linux host | **Not everywhere.** On GitHub's hosted runners splunkd's IOStats events name no mount point, and the disk queries grouped by it, so every one was dropped. A disk is now its mount point or its device |
 
 Also seen: on a replicated SmartStore bucket the copy that did not upload reports
