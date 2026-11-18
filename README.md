@@ -1004,6 +1004,26 @@ examines every bucket of each index it is given. The same data is at
 `detail`, `scenario`), aggregated on the server so a large estate is a few
 thousand cells and not one row per bucket.
 
+In the **Warm cache** dialog, **Show the plan on the bucket map** draws the plan's
+lines over the indexes they name (wildcards matched against the cache manager's
+list), with a margin either side, before anything is warmed. It is one cache
+manager listing and no `dbinspect` (the dialog's forecast of the plan already has
+the on-disk detail), and it says so when the plan has been edited, or a warm-up
+has finished, since it was drawn. The same is at `POST /api/targets/{id}/buckets/plan`
+with `{"plan": [...], "bins": 60}`; a plan that could not be warmed is refused
+with a 422 here too.
+
+A finished run's page carries the map **before and after** the run, on the same
+rows and the same time axis, with what the run read drawn under each index and a
+table of each index's local share either side. It is built from the two cache
+manager readings every run already takes (at the start of the load, after any
+warm-up or eviction, and at its end), so it costs the target nothing more and
+nothing is read during the run. For the same reason it shows local or remote
+only. The rows are the indexes the run's forecast says it reads, up to ten,
+largest first; without a forecast, the indexes whose local bucket count changed.
+It is stored on the run under `summary.cache.map`, for in-process and fleet runs
+alike.
+
 **Warm from a plan you confirm.** Regulator never warms values it derived on its
 own. The forecast *suggests* a plan, a list of indexes each with an earliest and
 latest time; you check it, edit it, and only the plan as you left it is warmed.

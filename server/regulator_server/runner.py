@@ -506,7 +506,7 @@ class RunManager:
                         pass
             summary.scenario_digest = scenario_digest(scenario)
 
-            summary.cache = await self._cache_provenance(engine.client, before, eviction, where)
+            summary.cache = await self._cache_provenance(engine.client, before, eviction, where, cache_forecast)
             if isinstance(summary.cache, dict):
                 if cache_forecast is not None:
                     summary.cache["forecast"] = cache_forecast
@@ -582,7 +582,7 @@ class RunManager:
         warmup.record_run_warm(run_id, result, state_after)
         return result
 
-    async def _cache_provenance(self, client, before, eviction, where) -> Optional[Dict[str, Any]]:
+    async def _cache_provenance(self, client, before, eviction, where, forecast=None) -> Optional[Dict[str, Any]]:
         if not before.available:
             return {"available": False, "reason": before.reason}
         after = await cache_state(client, **where)
@@ -591,6 +591,11 @@ class RunManager:
             "after": after.to_dict(),
             "delta": cache_delta(before, after).to_dict(),
         }
+        from .warmup import bucket_map_for_run
+
+        bucket_map = bucket_map_for_run(before, after, forecast)
+        if bucket_map is not None:
+            payload["map"] = bucket_map
         if eviction is not None:
             payload["eviction"] = eviction.to_dict()
         return payload

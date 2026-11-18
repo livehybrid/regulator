@@ -1178,6 +1178,11 @@ class FleetRun(threading.Thread):
             if before is not None and before.available:
                 after = await cache_state(client, **where)
                 merged["cache"] = {"before": before.to_dict(), "after": after.to_dict(), "delta": cache_delta(before, after).to_dict()}
+                from .warmup import bucket_map_for_run
+
+                bucket_map = bucket_map_for_run(before, after, cache_forecast)
+                if bucket_map is not None:
+                    merged["cache"]["map"] = bucket_map
                 if eviction is not None:
                     merged["cache"]["eviction"] = eviction.to_dict()
                 with session_scope() as session:

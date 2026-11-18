@@ -42,6 +42,7 @@ from ..runner import manager
 from ..schemas import (
     TARGET_SECRET_COLUMNS,
     EvictRequest,
+    PlanMapRequest,
     SavedSearchPreview,
     TargetCreate,
     TargetOut,
@@ -541,6 +542,30 @@ async def target_bucket_map(
         return document
 
     return await _with_client(target, read, ACTION_TIMEOUT_S * 2)
+
+
+@router.post("/{target_id}/buckets/plan")
+async def target_plan_map(
+    target_id: int, body: PlanMapRequest, session: Session = Depends(get_session)
+) -> Dict[str, Any]:
+    """The bucket map around a warm-up plan, with the plan's lines drawn on it.
+
+    For the Warm cache dialog, so the operator sees what a plan covers before
+    confirming it. One cache manager listing, no dbinspect: the dialog's own
+    forecast of the plan already reads residency. Nothing is warmed.
+    """
+    target = _get_target(session, target_id)
+    try:
+        plan = cachewarm.parse_plan([line.model_dump() for line in body.plan])
+    except cachewarm.PlanError as exc:
+        raise HTTPException(status_code=422, detail=str(exc))
+    extra = _cache_kwargs(target)
+
+    async def read(client: SplunkClient) -> Dict[str, Any]:
+        state = await cache_state(client, **extra)
+        return bucketmap.plan_map(state, plan, bins=body.bins)
+
+    return await _with_client(target, read, ACTION_TIMEOUT_S)
 
 
 # --------------------------------------------------------------- warm-up

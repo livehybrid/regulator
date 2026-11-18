@@ -31,6 +31,7 @@ import { useSplunkTheme, variables } from '@splunk/themes';
 
 import BusyButton from './BusyButton';
 import { Actions, Grid2, Mono, Muted, Note, Panel } from './primitives';
+import { planLines, planValid } from './WarmPlan';
 import { api } from '../api';
 import { fmtBytes, fmtInt, fmtPct } from '../format';
 
@@ -203,8 +204,202 @@ function fmtWhen(epoch, withTime) {
     return withTime ? `${day} ${pad(d.getUTCHours())}:${pad(d.getUTCMinutes())}` : day;
 }
 
-export default function BucketMap({ targetId }) {
+/**
+ * One map document drawn: legend, rows, axis, hover and the table beneath.
+ * The target page, the Warm cache dialog and a run's page all draw through
+ * this, so a state looks the same wherever it appears.
+ *
+ * ``spans`` are lines drawn under the rows (what a scenario reads, what a
+ * plan warms), each ``{index, earliest, latest}``; ``spansLabel`` names them
+ * in the legend.
+ */
+export function BucketMapView({ map, spans, spansLabel, notes, table, caption }) {
     const theme = useSplunkTheme();
+    const [tip, setTip] = useState(null);
+    const palette = useMemo(() => colours(theme, map.detail), [theme, map]);
+    const span = map.latest - map.earliest;
+    const shortRange = span > 0 && span <= 3 * 86400;
+    const ticks = [0, 0.25, 0.5, 0.75, 1].map((f) => map.earliest + f * span);
+
+    const showTip = (e, row, cell) => {
+        setTip({
+            x: Math.min(e.clientX + 14, window.innerWidth - 260),
+            y: e.clientY + 14,
+            key: `${row.index}:${cell.bin}`,
+            index: row.index,
+            from: map.earliest + cell.bin * map.bin_s,
+            to: map.earliest + (cell.bin + 1) * map.bin_s,
+            cell,
+        });
+    };
+
+    return (
+        <>
+            <Legend>
+                {map.states.map((s) => (
+                    <Key key={s}>
+                        <Swatch style={{ backgroundColor: palette[s] }} />
+                        {s === 'local' && map.detail === 'disk' ? 'Local (detail not read)' : LABELS[s]}
+                    </Key>
+                ))}
+                {spans.length > 0 && spansLabel && (
+                    <Key>
+                        <LineKey />
+                        {spansLabel}
+                    </Key>
+                )}
+            </Legend>
+
+            <Rows onMouseLeave={() => setTip(null)}>
+                {map.indexes.map((row) => (
+                    <React.Fragment key={row.index}>
+                        <IndexLabel title={row.index}>{row.index}</IndexLabel>
+                        <Track $bins={map.bins}>
+                            {row.cells.map((cell) => {
+                                const total = Object.values(cell.bytes).reduce((a, b) => a + b, 0) || 1;
+                                return (
+                                    <Cell
+                                        key={cell.bin}
+                                        style={{ gridColumn: cell.bin + 1 }}
+                                        $active={tip && tip.key === `${row.index}:${cell.bin}`}
+                                        $ink={theme.contentColorDefault}
+                                        onMouseMove={(e) => showTip(e, row, cell)}
+                                    >
+                                        {map.states
+                                            .filter((s) => cell.bytes[s])
+                                            .map((s) => (
+                                                <Segment
+                                                    key={s}
+                                                    style={{
+                                                        backgroundColor: palette[s],
+                                                        flex: `${cell.bytes[s] / total} 1 0`,
+                                                    }}
+                                                />
+                                            ))}
+                                    </Cell>
+                                );
+                            })}
+                            {spans
+                                .filter((o) => o.index === row.index)
+                                .map((o) => {
+                                    const left = Math.max(0, (o.earliest - map.earliest) / span);
+                                    const right = Math.min(1, (o.latest - map.earliest) / span);
+                                    return (
+                                        <ReadBar
+                                            key={`${o.earliest}-${o.latest}`}
+                                            style={{
+                                                left: `${left * 100}%`,
+                                                width: `max(3px, ${(right - left) * 100}%)`,
+                                            }}
+                                        />
+                                    );
+                                })}
+                        </Track>
+                    </React.Fragment>
+                ))}
+                <div />
+                <Axis>
+                    {ticks.map((t) => (
+                        <span key={t}>{fmtWhen(t, shortRange)}</span>
+                    ))}
+                </Axis>
+            </Rows>
+            <Caption>
+                <Muted $small>{caption || 'Times are UTC. A bucket spanning several slices is drawn in each.'}</Muted>
+            </Caption>
+
+            {tip && (
+                <Tip style={{ left: tip.x, top: tip.y }}>
+                    <Mono>{tip.index}</Mono>
+                    <div>
+                        <Muted $small>
+                            {fmtWhen(tip.from, true)} to {fmtWhen(tip.to, true)}
+                        </Muted>
+                    </div>
+                    {map.states
+                        .filter((s) => tip.cell.bytes[s])
+                        .map((s) => (
+                            <TipRow key={s}>
+                                <Swatch style={{ backgroundColor: palette[s], width: 10, height: 3 }} />
+                                <strong>{fmtBytes(tip.cell.bytes[s])}</strong>
+                                <Muted $small>
+                                    {s === 'local' && map.detail === 'disk'
+                                        ? 'local (detail not read)'
+                                        : LABELS[s].toLowerCase()}
+                                </Muted>
+                            </TipRow>
+                        ))}
+                    <Muted $small>{fmtInt(tip.cell.buckets)} bucket(s) overlap this slice</Muted>
+                </Tip>
+            )}
+
+            {notes.map((n) => (
+                <Note key={n}>{n}</Note>
+            ))}
+
+            {/* The same numbers as a table: nothing on the map is
+                reachable only by hovering. A caller that tabulates
+                them its own way turns this one off. */}
+            {table && (
+                <TableWrap>
+                    <Table horizontalOverflow="scroll">
+                        <Table.Head>
+                            <Table.HeadCell>Index</Table.HeadCell>
+                            <Table.HeadCell align="right">Buckets</Table.HeadCell>
+                            <Table.HeadCell align="right">Size</Table.HeadCell>
+                            <Table.HeadCell align="right">Local</Table.HeadCell>
+                            {map.states.map((s) => (
+                                <Table.HeadCell key={s} align="right">
+                                    {s === 'local' && map.detail === 'disk' ? 'Local (detail not read)' : LABELS[s]}
+                                </Table.HeadCell>
+                            ))}
+                        </Table.Head>
+                        <Table.Body>
+                            {map.indexes.map((row) => (
+                                <Table.Row key={row.index}>
+                                    <Table.Cell>
+                                        <Mono>{row.index}</Mono>
+                                    </Table.Cell>
+                                    <Table.Cell align="right">{fmtInt(row.buckets)}</Table.Cell>
+                                    <Table.Cell align="right">{fmtBytes(row.bytes)}</Table.Cell>
+                                    <Table.Cell align="right">{fmtPct(row.local_pct, 0)}</Table.Cell>
+                                    {map.states.map((s) => (
+                                        <Table.Cell key={s} align="right">
+                                            {row.by_state[s]
+                                                ? `${fmtInt(row.by_state[s].buckets)} (${fmtBytes(
+                                                      row.by_state[s].bytes
+                                                  )})`
+                                                : fmtInt(0)}
+                                        </Table.Cell>
+                                    ))}
+                                </Table.Row>
+                            ))}
+                        </Table.Body>
+                    </Table>
+                </TableWrap>
+            )}
+        </>
+    );
+}
+
+BucketMapView.propTypes = {
+    map: PropTypes.object.isRequired,
+    spans: PropTypes.array,
+    spansLabel: PropTypes.string,
+    notes: PropTypes.array,
+    table: PropTypes.bool,
+    caption: PropTypes.string,
+};
+
+BucketMapView.defaultProps = {
+    spans: [],
+    spansLabel: '',
+    notes: [],
+    table: true,
+    caption: '',
+};
+
+export default function BucketMap({ targetId }) {
     const [map, setMap] = useState(null);
     const [scenarios, setScenarios] = useState([]);
     const [range, setRange] = useState('-30d');
@@ -212,7 +407,6 @@ export default function BucketMap({ targetId }) {
     const [picked, setPicked] = useState([]);
     const [detail, setDetail] = useState(false);
     const [known, setKnown] = useState([]);
-    const [tip, setTip] = useState(null);
     const live = useRef(true);
 
     useEffect(() => {
@@ -253,23 +447,7 @@ export default function BucketMap({ targetId }) {
         setKnown((prev) => Array.from(new Set([...prev, ...(r.indexes || []).map((i) => i.index)])).sort());
     };
 
-    const palette = useMemo(() => colours(theme, map ? map.detail : 'cache'), [theme, map]);
-    const span = map && map.available ? map.latest - map.earliest : 0;
-    const shortRange = span > 0 && span <= 3 * 86400;
     const overlay = (map && map.overlay && map.overlay.spans) || [];
-    const ticks = map && map.available ? [0, 0.25, 0.5, 0.75, 1].map((f) => map.earliest + f * span) : [];
-
-    const showTip = (e, row, cell) => {
-        setTip({
-            x: Math.min(e.clientX + 14, window.innerWidth - 260),
-            y: e.clientY + 14,
-            key: `${row.index}:${cell.bin}`,
-            index: row.index,
-            from: map.earliest + cell.bin * map.bin_s,
-            to: map.earliest + (cell.bin + 1) * map.bin_s,
-            cell,
-        });
-    };
 
     return (
         <Panel title="Bucket map">
@@ -284,7 +462,11 @@ export default function BucketMap({ targetId }) {
                 <ControlGroup
                     label="Indexes"
                     labelPosition="top"
-                    help={known.length ? 'Blank shows the largest.' : 'Blank shows the largest. Load once to pick from a list.'}
+                    help={
+                        known.length
+                            ? 'Blank shows the largest.'
+                            : 'Blank shows the largest. Load once to pick from a list.'
+                    }
                 >
                     <Multiselect values={picked} allowNewValues onChange={(e, { values }) => setPicked(values)}>
                         {known.map((n) => (
@@ -324,144 +506,12 @@ export default function BucketMap({ targetId }) {
             {map && !map.available && <Note>The bucket map could not be read: {map.reason}</Note>}
 
             {map && map.available && (
-                <>
-                    <Legend>
-                        {map.states.map((s) => (
-                            <Key key={s}>
-                                <Swatch style={{ backgroundColor: palette[s] }} />
-                                {s === 'local' && map.detail === 'disk' ? 'Local (detail not read)' : LABELS[s]}
-                            </Key>
-                        ))}
-                        {overlay.length > 0 && (
-                            <Key>
-                                <LineKey />
-                                Read by {map.overlay.scenario}
-                            </Key>
-                        )}
-                    </Legend>
-
-                    <Rows onMouseLeave={() => setTip(null)}>
-                        {map.indexes.map((row) => (
-                            <React.Fragment key={row.index}>
-                                <IndexLabel title={row.index}>{row.index}</IndexLabel>
-                                <Track $bins={map.bins}>
-                                    {row.cells.map((cell) => {
-                                        const total = Object.values(cell.bytes).reduce((a, b) => a + b, 0) || 1;
-                                        return (
-                                            <Cell
-                                                key={cell.bin}
-                                                style={{ gridColumn: cell.bin + 1 }}
-                                                $active={tip && tip.key === `${row.index}:${cell.bin}`}
-                                                $ink={theme.contentColorDefault}
-                                                onMouseMove={(e) => showTip(e, row, cell)}
-                                            >
-                                                {map.states
-                                                    .filter((s) => cell.bytes[s])
-                                                    .map((s) => (
-                                                        <Segment
-                                                            key={s}
-                                                            style={{
-                                                                backgroundColor: palette[s],
-                                                                flex: `${cell.bytes[s] / total} 1 0`,
-                                                            }}
-                                                        />
-                                                    ))}
-                                            </Cell>
-                                        );
-                                    })}
-                                    {overlay
-                                        .filter((o) => o.index === row.index)
-                                        .map((o) => {
-                                            const left = Math.max(0, (o.earliest - map.earliest) / span);
-                                            const right = Math.min(1, (o.latest - map.earliest) / span);
-                                            return (
-                                                <ReadBar
-                                                    key={`${o.earliest}-${o.latest}`}
-                                                    style={{
-                                                        left: `${left * 100}%`,
-                                                        width: `max(3px, ${(right - left) * 100}%)`,
-                                                    }}
-                                                />
-                                            );
-                                        })}
-                                </Track>
-                            </React.Fragment>
-                        ))}
-                        <div />
-                        <Axis>
-                            {ticks.map((t) => (
-                                <span key={t}>{fmtWhen(t, shortRange)}</span>
-                            ))}
-                        </Axis>
-                    </Rows>
-                    <Caption>
-                        <Muted $small>Times are UTC. A bucket spanning several slices is drawn in each.</Muted>
-                    </Caption>
-
-                    {tip && (
-                        <Tip style={{ left: tip.x, top: tip.y }}>
-                            <Mono>{tip.index}</Mono>
-                            <div>
-                                <Muted $small>
-                                    {fmtWhen(tip.from, true)} to {fmtWhen(tip.to, true)}
-                                </Muted>
-                            </div>
-                            {map.states
-                                .filter((s) => tip.cell.bytes[s])
-                                .map((s) => (
-                                    <TipRow key={s}>
-                                        <Swatch style={{ backgroundColor: palette[s], width: 10, height: 3 }} />
-                                        <strong>{fmtBytes(tip.cell.bytes[s])}</strong>
-                                        <Muted $small>
-                                            {s === 'local' && map.detail === 'disk' ? 'local (detail not read)' : LABELS[s].toLowerCase()}
-                                        </Muted>
-                                    </TipRow>
-                                ))}
-                            <Muted $small>{fmtInt(tip.cell.buckets)} bucket(s) overlap this slice</Muted>
-                        </Tip>
-                    )}
-
-                    {(map.notes || []).concat((map.overlay && map.overlay.notes) || []).map((n) => (
-                        <Note key={n}>{n}</Note>
-                    ))}
-
-                    {/* The same numbers as a table: nothing on the map is
-                        reachable only by hovering. */}
-                    <TableWrap>
-                        <Table horizontalOverflow="scroll">
-                            <Table.Head>
-                                <Table.HeadCell>Index</Table.HeadCell>
-                                <Table.HeadCell align="right">Buckets</Table.HeadCell>
-                                <Table.HeadCell align="right">Size</Table.HeadCell>
-                                <Table.HeadCell align="right">Local</Table.HeadCell>
-                                {map.states.map((s) => (
-                                    <Table.HeadCell key={s} align="right">
-                                        {s === 'local' && map.detail === 'disk' ? 'Local (detail not read)' : LABELS[s]}
-                                    </Table.HeadCell>
-                                ))}
-                            </Table.Head>
-                            <Table.Body>
-                                {map.indexes.map((row) => (
-                                    <Table.Row key={row.index}>
-                                        <Table.Cell>
-                                            <Mono>{row.index}</Mono>
-                                        </Table.Cell>
-                                        <Table.Cell align="right">{fmtInt(row.buckets)}</Table.Cell>
-                                        <Table.Cell align="right">{fmtBytes(row.bytes)}</Table.Cell>
-                                        <Table.Cell align="right">{fmtPct(row.local_pct, 0)}</Table.Cell>
-                                        {map.states.map((s) => (
-                                            <Table.Cell key={s} align="right">
-                                                {row.by_state[s]
-                                                    ? `${fmtInt(row.by_state[s].buckets)} (${fmtBytes(row.by_state[s].bytes)})`
-                                                    : fmtInt(0)}
-                                            </Table.Cell>
-                                        ))}
-                                    </Table.Row>
-                                ))}
-                            </Table.Body>
-                        </Table>
-                    </TableWrap>
-                </>
+                <BucketMapView
+                    map={map}
+                    spans={overlay}
+                    spansLabel={overlay.length ? `Read by ${map.overlay.scenario}` : ''}
+                    notes={(map.notes || []).concat((map.overlay && map.overlay.notes) || [])}
+                />
             )}
         </Panel>
     );
@@ -469,4 +519,80 @@ export default function BucketMap({ targetId }) {
 
 BucketMap.propTypes = {
     targetId: PropTypes.any.isRequired,
+};
+
+/**
+ * A warm-up plan drawn on the bucket map, before it is confirmed.
+ *
+ * The rows are the indexes the plan names and the axis is the plan's span
+ * with a margin, so the operator sees what each line covers, how much of it
+ * is already local, and what lies just outside it. Drawn on request only:
+ * it is a cache manager listing on the target. An edit to the plan after it
+ * was drawn is called out, since the lines shown are then not the plan.
+ */
+export function PlanBucketMap({ targetId, rows, epoch }) {
+    const [map, setMap] = useState(null);
+    const [drawn, setDrawn] = useState(null);
+    const [drawnEpoch, setDrawnEpoch] = useState(null);
+    const live = useRef(true);
+    useEffect(
+        () => () => {
+            live.current = false;
+        },
+        []
+    );
+    const lines = planLines(rows);
+    const key = JSON.stringify(lines);
+
+    const draw = async () => {
+        const r = await api(`/targets/${encodeURIComponent(targetId)}/buckets/plan`, {
+            method: 'POST',
+            body: { plan: lines, bins: BINS },
+        });
+        if (live.current) {
+            setMap(r);
+            setDrawn(key);
+            setDrawnEpoch(epoch);
+        }
+    };
+
+    const edited = map && drawn !== key;
+    return (
+        <>
+            <Actions>
+                <BusyButton
+                    label={map ? 'Redraw the plan on the bucket map' : 'Show the plan on the bucket map'}
+                    disabled={!planValid(rows)}
+                    onClick={draw}
+                />
+                <Muted $small>One cache listing on the target. Nothing is warmed.</Muted>
+            </Actions>
+            {map && !map.available && <Note>The bucket map could not be read: {map.reason}</Note>}
+            {edited && <Note>The plan has been edited since this was drawn: redraw it to see the lines as they are.</Note>}
+            {!edited && map && drawnEpoch !== epoch && (
+                <Note>A warm-up has finished since this was drawn: redraw it to see what the warm-up changed.</Note>
+            )}
+            {map && map.available && (
+                <BucketMapView
+                    map={map}
+                    spans={(map.overlay && map.overlay.spans) || []}
+                    spansLabel="In the plan"
+                    notes={(map.notes || []).concat((map.overlay && map.overlay.notes) || [])}
+                    table={false}
+                    caption="Times are UTC. Local or remote, from the cache manager; the forecast above has the on-disk detail."
+                />
+            )}
+        </>
+    );
+}
+
+PlanBucketMap.propTypes = {
+    targetId: PropTypes.any.isRequired,
+    rows: PropTypes.array.isRequired,
+    // Changes when a warm-up finishes, so a map drawn before it says so.
+    epoch: PropTypes.any,
+};
+
+PlanBucketMap.defaultProps = {
+    epoch: null,
 };

@@ -211,3 +211,31 @@ def test_a_bad_range_is_refused(client, cold):  # noqa: F811
     base = f"/api/targets/{target['id']}/buckets"
     assert client.get(base, params={"earliest": "-1h", "latest": "-2h"}).status_code == 422
     assert client.get(base, params={"earliest": "whenever"}).status_code == 422
+
+
+def test_a_plan_is_drawn_on_the_map_before_anything_is_warmed(client, cold):  # noqa: F811
+    target = make_target(client, cold)
+    body = client.post(
+        f"/api/targets/{target['id']}/buckets/plan",
+        json={"plan": [{"index": "main", "earliest": "-4h", "latest": "now"}], "bins": 20},
+    ).json()
+    assert body["available"] is True
+    # Only the index the plan names, though the target has two.
+    assert [row["index"] for row in body["indexes"]] == ["main"]
+    spans = body["overlay"]["spans"]
+    assert len(spans) == 1 and spans[0]["index"] == "main"
+    assert 4 * 3600 - 2 <= spans[0]["latest"] - spans[0]["earliest"] <= 4 * 3600 + 2
+    assert body["earliest"] < spans[0]["earliest"] and body["latest"] > spans[0]["latest"]
+    # Drawing a plan warms nothing, dispatches no job, and costs the target
+    # what the plain map does: one cache listing, no dbinspect.
+    assert cold.stats.buckets_localised == 0 and cold.stats.jobs_created == 0
+    cost = cold.stats.oneshots
+    client.get(f"/api/targets/{target['id']}/buckets", params={"bins": 20})
+    assert cold.stats.oneshots == 2 * cost
+
+
+def test_a_plan_that_cannot_be_warmed_cannot_be_drawn_either(client, cold):  # noqa: F811
+    target = make_target(client, cold)
+    url = f"/api/targets/{target['id']}/buckets/plan"
+    assert client.post(url, json={"plan": [{"index": "*", "earliest": "-1h", "latest": "now"}]}).status_code == 422
+    assert client.post(url, json={"plan": [{"index": "main", "earliest": "-1h", "latest": "-2h"}]}).status_code == 422

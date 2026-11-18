@@ -636,6 +636,62 @@ const ROUTES = {
                     bytes_remote: 0,
                     residency: { available: true, counts: { full: 0, index_only: 12, partial: 0, stub: 0 } },
                 },
+                map: {
+                    available: true,
+                    source: 'forecast',
+                    notes: [],
+                    before: {
+                        available: true,
+                        detail: 'cache',
+                        states: ['remote', 'local'],
+                        earliest: 1757000000,
+                        latest: 1757086400,
+                        bin_s: 1440,
+                        bins: 60,
+                        notes: [],
+                        indexes: [
+                            {
+                                index: 'cultivar_web',
+                                buckets: 2,
+                                bytes: 2000000000,
+                                local_pct: 50,
+                                undated: 0,
+                                outside: 0,
+                                by_state: { remote: { buckets: 1, bytes: 1000000000 }, local: { buckets: 1, bytes: 1000000000 } },
+                                cells: [
+                                    { bin: 10, buckets: 1, bytes: { remote: 1000000000 } },
+                                    { bin: 40, buckets: 1, bytes: { local: 1000000000 } },
+                                ],
+                            },
+                        ],
+                    },
+                    after: {
+                        available: true,
+                        detail: 'cache',
+                        states: ['remote', 'local'],
+                        earliest: 1757000000,
+                        latest: 1757086400,
+                        bin_s: 1440,
+                        bins: 60,
+                        notes: [],
+                        indexes: [
+                            {
+                                index: 'cultivar_web',
+                                buckets: 2,
+                                bytes: 2000000000,
+                                local_pct: 100,
+                                undated: 0,
+                                outside: 0,
+                                by_state: { local: { buckets: 2, bytes: 2000000000 } },
+                                cells: [
+                                    { bin: 10, buckets: 1, bytes: { local: 1000000000 } },
+                                    { bin: 40, buckets: 1, bytes: { local: 1000000000 } },
+                                ],
+                            },
+                        ],
+                    },
+                    overlay: [{ index: 'cultivar_web', earliest: 1757000000, latest: 1757086400, clipped: false }],
+                },
                 warm: {
                     mode: 'tsidx',
                     searches: 7,
@@ -694,6 +750,37 @@ const ROUTES = {
             scenario: 'web-dashboards',
             duration_s: 600,
             spans: [{ index: 'cultivar_web', earliest: 1757000000 + 29 * 86400, latest: 1757000000 + 30 * 86400, clipped: false }],
+            notes: [],
+        },
+    },
+    // The plan drawn on the map in the Warm cache dialog.
+    '/targets/1/buckets/plan': {
+        available: true,
+        detail: 'cache',
+        states: ['remote', 'local'],
+        earliest: 1757000000 - 8640,
+        latest: 1757086400 + 8640,
+        bin_s: 1584,
+        bins: 60,
+        notes: [],
+        indexes: [
+            {
+                index: 'cultivar_web',
+                buckets: 2,
+                bytes: 2000000000,
+                local_pct: 50,
+                undated: 0,
+                outside: 0,
+                by_state: { remote: { buckets: 1, bytes: 1000000000 }, local: { buckets: 1, bytes: 1000000000 } },
+                cells: [
+                    { bin: 10, buckets: 1, bytes: { remote: 1000000000 } },
+                    { bin: 40, buckets: 1, bytes: { local: 1000000000 } },
+                ],
+            },
+        ],
+        overlay: {
+            plan: true,
+            spans: [{ index: 'cultivar_web', earliest: 1757000000, latest: 1757086400, clipped: false }],
             notes: [],
         },
     },
@@ -1174,6 +1261,25 @@ const go = async (hash) => {
     await check('warm dialog: residency shown', 'index files only');
     await check('warm dialog: what it could not see', 'a macro hides');
     const warmPosts = () => posted.filter((x) => x.url.endsWith('/targets/1/warm'));
+    // The plan on the bucket map: drawn on request, from the lines as they
+    // are in the table, and warming nothing.
+    if ((window.document.body.textContent || '').includes('In the plan')) {
+        problems.push('warm dialog: drew the plan on the map without being asked');
+    }
+    clickByText('Show the plan on the bucket map', 'draw the plan on the map');
+    await waitFor('warm dialog: posts the plan to draw', () =>
+        posted.some(
+            (x) =>
+                x.url.endsWith('/targets/1/buckets/plan') &&
+                x.body &&
+                x.body.plan.length === 1 &&
+                x.body.plan[0].index === 'cultivar_web'
+        )
+    );
+    await check('warm dialog: the plan drawn on the map', 'In the plan');
+    if (warmPosts().length) {
+        problems.push('warm dialog: drawing the plan started a warm-up');
+    }
     clickByText('Warm', 'warm before confirming');
     await settle(300);
     if (warmPosts().length) {
@@ -1196,6 +1302,7 @@ const go = async (hash) => {
             )
         );
         await check('warm dialog: result', 'Plan, after');
+        await check('warm dialog: the map says it predates the warm-up', 'A warm-up has finished since this was drawn');
     }
     clickByText('Close', 'close the warm dialog');
     await settle(100);
@@ -1314,6 +1421,11 @@ const go = async (hash) => {
     await check('warm run: the run page says what the warm-up did', 'Warmed before the run from a confirmed plan');
     await check('warm run: the forecast at the start', 'Forecast at the start: this run reads 12 bucket(s)');
     await check('warm run: the forecast says what is on disk', '12 index files only');
+    await check('warm run: bucket map before and after', 'Bucket map, before and after');
+    await check('warm run: the before side', 'Before the run');
+    await check('warm run: the after side', 'After the run');
+    await check('warm run: what the run read on the map', 'Read by this run');
+    await check('warm run: local bytes change by index', '+953.7 MB');
     clickByText('Run again', 'open run again for the warm run');
     await check('warm run: run again shows the warm-up', 'You decide what gets warmed');
     await waitFor('warm run: the plan comes back as written', () =>
