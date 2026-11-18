@@ -11,8 +11,13 @@
  * 41% of its run time waiting for 212 bucket downloads", from the target's own
  * audit records split by step.
  *
- * Neither is split by search head cluster member: which member served a
- * request behind a load balancer is not something the run can tell yet.
+ * Both are also split by search head cluster member. Behind a load balancer
+ * the client never learns which member served a search, but the target's
+ * audit trail does: the member that dispatched a job writes its audit records
+ * under its own host name. The worker keeps the search ids of its searches
+ * with an issue and the correlation asks _audit for each one's member
+ * (sut.issues_by_member); the bucket figures come split by step and member
+ * from the probe our_searches_by_member.
  */
 import React from 'react';
 import PropTypes from 'prop-types';
@@ -32,6 +37,22 @@ const CLASS_LABELS = { timeout: 'Timeout', quota: 'Quota', auth: 'Auth', server:
 const UNATTRIBUTED = '(step not in the audited search)';
 // oneshot returns at most this many rows per probe.
 const PROBE_ROW_LIMIT = 50;
+// ...and this many for the split by step and member.
+const MEMBER_ROW_LIMIT = 500;
+// What sut.py calls a member it could not name: an audit record with no host,
+// and a search with an issue whose search id the audit trail did not hold yet.
+const UNKNOWN_MEMBER = '(member not recorded)';
+const NO_AUDIT_RECORD = '(no audit record yet)';
+const UNNAMED = [UNKNOWN_MEMBER, NO_AUDIT_RECORD];
+const ISSUE_LABELS = { failed: 'failures', partial: 'partial results', queued: 'queued searches' };
+
+const Subhead = styled.div`
+    padding: ${variables.spacingMedium} ${variables.spacingMedium} ${variables.spacingSmall};
+    font-weight: 600;
+`;
+
+const memberCell = (m) => (UNNAMED.includes(m) ? <Muted>{m}</Muted> : <Mono>{m}</Mono>);
+const namedMembers = (rows) => [...new Set(rows.map((r) => r.member))].filter((m) => !UNNAMED.includes(m));
 
 // A table sits flush in its panel; the words under it need the panel's inset.
 const Caption = styled.div`
@@ -144,6 +165,87 @@ function SchedulerLine({ probe }) {
 
 SchedulerLine.propTypes = { probe: PropTypes.object };
 
+function classText(byClass) {
+    const entries = Object.entries(byClass || {}).filter(([, n]) => n > 0);
+    return entries
+        .sort((a, b) => b[1] - a[1])
+        .map(([c, n]) => `${fmtInt(n)} ${CLASS_LABELS[c] ? CLASS_LABELS[c].toLowerCase() : c}`)
+        .join(', ');
+}
+
+function IssuesByMember({ split }) {
+    if (!split) {
+        return null;
+    }
+    if (!split.available) {
+        return (
+            <Caption>
+                <Muted $small>
+                    Not split by search head member{split.reason ? `: ${split.reason}` : '.'}
+                </Muted>
+            </Caption>
+        );
+    }
+    const rows = split.rows || [];
+    if (!rows.length) {
+        return null;
+    }
+    const members = namedMembers(rows);
+    const sampled = Object.entries(split.dropped || {}).filter(([, n]) => n > 0);
+    const noSid = Object.entries(split.no_sid || {}).filter(([, n]) => n > 0);
+    const unplaced = rows.some((r) => r.member === NO_AUDIT_RECORD);
+    return (
+        <>
+            <Subhead>By search head member</Subhead>
+            <Table horizontalOverflow="scroll">
+                <Table.Head>
+                    <Table.HeadCell>Step</Table.HeadCell>
+                    <Table.HeadCell>Member</Table.HeadCell>
+                    <Table.HeadCell align="right">Failed</Table.HeadCell>
+                    <Table.HeadCell>By class</Table.HeadCell>
+                    <Table.HeadCell align="right">Partial</Table.HeadCell>
+                    <Table.HeadCell align="right">Queued</Table.HeadCell>
+                </Table.Head>
+                <Table.Body>
+                    {rows.map((r) => (
+                        <Table.Row key={`${r.step}\u0000${r.member}`}>
+                            <Table.Cell>
+                                <Mono>{r.step}</Mono>
+                            </Table.Cell>
+                            <Table.Cell>{memberCell(r.member)}</Table.Cell>
+                            <Table.Cell align="right">{count(r.failed)}</Table.Cell>
+                            <Table.Cell>{classText(r.errors_by_class) || DASH}</Table.Cell>
+                            <Table.Cell align="right">{count(r.partial)}</Table.Cell>
+                            <Table.Cell align="right">{count(r.queued)}</Table.Cell>
+                        </Table.Row>
+                    ))}
+                </Table.Body>
+            </Table>
+            <Caption>
+                <Muted $small>
+                    The member is the host on the search&apos;s own audit records, which only
+                    the member that dispatched it writes.{' '}
+                    {members.length === 1 && `Every search placed ran on ${members[0]}. `}
+                    Unknown-sid responses are not split: a 404 comes from a member that did
+                    not dispatch the job.
+                    {unplaced &&
+                        ` ${NO_AUDIT_RECORD} is a search the audit trail did not hold when it was read; records keep arriving for a minute or two after a run.`}
+                    {sampled.length > 0 &&
+                        ` A sample, not every search: past ${fmtInt(split.limit_per_kind || 300)} of a kind the run counts and does not keep the search ids (${sampled
+                            .map(([k, n]) => `${fmtInt(n)} more ${ISSUE_LABELS[k] || k}`)
+                            .join(', ')}).`}
+                    {noSid.length > 0 &&
+                        ` Refused before they had a search id, so on no member: ${noSid
+                            .map(([k, n]) => `${fmtInt(n)} ${ISSUE_LABELS[k] || k}`)
+                            .join(', ')}.`}
+                </Muted>
+            </Caption>
+        </>
+    );
+}
+
+IssuesByMember.propTypes = { split: PropTypes.object };
+
 function IssuesPanel({ stats, sut }) {
     const steps = stats.steps || [];
     if (!steps.length) {
@@ -239,6 +341,7 @@ function IssuesPanel({ stats, sut }) {
                     </Muted>
                 </Caption>
             )}
+            {totalIssues > 0 && <IssuesByMember split={sut ? sut.issues_by_member : null} />}
             {scheduler && (
                 <Caption>
                     <SchedulerLine probe={scheduler} />
@@ -325,6 +428,7 @@ function AttributionPanel({ sut }) {
                                 ` Showing the ${PROBE_ROW_LIMIT} steps that waited longest.`}
                         </Muted>
                     </Caption>
+                    <AttributionByMember probe={sut.probes.our_searches_by_member} />
                 </>
             )}
         </Panel>
@@ -332,6 +436,74 @@ function AttributionPanel({ sut }) {
 }
 
 AttributionPanel.propTypes = { sut: PropTypes.object };
+
+function AttributionByMember({ probe }) {
+    if (!probe || !probe.available) {
+        return null;
+    }
+    const rows = probe.rows || [];
+    if (!rows.length) {
+        return null;
+    }
+    const members = namedMembers(rows);
+    if (members.length < 2) {
+        // A standalone search head, or a balancer that kept every search on
+        // one member: a table of one member says nothing the one above does not.
+        return (
+            <Caption>
+                <Muted $small>
+                    {members.length === 1
+                        ? `Every audited search ran on ${members[0]}.`
+                        : 'The audit records named no search head member.'}
+                </Muted>
+            </Caption>
+        );
+    }
+    return (
+        <>
+            <Subhead>By search head member</Subhead>
+            <Table horizontalOverflow="scroll">
+                <Table.Head>
+                    <Table.HeadCell>Step</Table.HeadCell>
+                    <Table.HeadCell>Member</Table.HeadCell>
+                    <Table.HeadCell align="right">Searches</Table.HeadCell>
+                    <Table.HeadCell align="right">Buckets searched</Table.HeadCell>
+                    <Table.HeadCell align="right">Cache hits</Table.HeadCell>
+                    <Table.HeadCell align="right">Cache misses</Table.HeadCell>
+                    <Table.HeadCell align="right">Waiting on misses</Table.HeadCell>
+                    <Table.HeadCell align="right">Run time</Table.HeadCell>
+                    <Table.HeadCell align="right">Share waiting</Table.HeadCell>
+                </Table.Head>
+                <Table.Body>
+                    {rows.map((r) => (
+                        <Table.Row key={`${r.step}\u0000${r.member}`}>
+                            <Table.Cell>
+                                {r.step === UNATTRIBUTED ? <Muted>{r.step}</Muted> : <Mono>{r.step}</Mono>}
+                            </Table.Cell>
+                            <Table.Cell>{memberCell(r.member)}</Table.Cell>
+                            <Table.Cell align="right">{fmtInt(num(r.searches))}</Table.Cell>
+                            <Table.Cell align="right">{fmtInt(num(r.searched_buckets))}</Table.Cell>
+                            <Table.Cell align="right">{fmtInt(num(r.cache_hits))}</Table.Cell>
+                            <Table.Cell align="right">{fmtInt(num(r.cache_misses))}</Table.Cell>
+                            <Table.Cell align="right">{fmtNum(num(r.cold_path_s), 1)} s</Table.Cell>
+                            <Table.Cell align="right">{fmtNum(num(r.run_time_s), 1)} s</Table.Cell>
+                            <Table.Cell align="right">{fmtPct(num(r.cold_path_pct), 0)}</Table.Cell>
+                        </Table.Row>
+                    ))}
+                </Table.Body>
+            </Table>
+            <Caption>
+                <Muted $small>
+                    The same audit records split by the host that wrote them, which is the
+                    member that ran the search. A step&apos;s rows add up to its row above.
+                    {rows.length >= MEMBER_ROW_LIMIT && ` Showing the ${MEMBER_ROW_LIMIT} that waited longest.`}
+                </Muted>
+            </Caption>
+        </>
+    );
+}
+
+AttributionByMember.propTypes = { probe: PropTypes.object };
 
 export default function SearchIssues({ stats, sut }) {
     return (

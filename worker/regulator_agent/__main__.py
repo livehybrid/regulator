@@ -512,6 +512,7 @@ async def _run(config: Config, args: argparse.Namespace) -> int:
                 marker_prefix_for(config.run_id),
                 settle_s=config.sut_settle_s,
                 sid_prefix=sid_prefix_for(config.run_id),
+                issue_sids=(summary.stats or {}).get("issue_sids"),
             )
             for finding in summary.sut.get("findings", []):
                 log.info("target: %s", finding)

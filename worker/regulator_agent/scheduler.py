@@ -1173,6 +1173,7 @@ class Scheduler:
         # Only in the final report: the ledger is for reading afterwards, and
         # a heartbeat every second has no business carrying it.
         snapshot["searches"] = self.stats.ledger.to_dict()
+        snapshot["issue_sids"] = self.stats.issue_sids.to_dict()
         snapshot["arrivals_missed"] = self._arrivals_shed + self._arrivals_skipped
         # What each requested target guard actually did. `unevaluated` is the
         # field that stops a declared ceiling being a lie: a guard named there

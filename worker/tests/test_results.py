@@ -275,3 +275,50 @@ def test_ledgers_from_a_fleet_merge_under_the_same_caps():
     assert len(merged["slowest"]) == LEDGER_SLOWEST
     assert all(e["sid"].startswith("w2-") for e in merged["slowest"])
     assert merged["dropped"] == {"failed:server": 3}
+
+
+# ------------------------------------------- issue sids, for the split by member (#18)
+
+
+def test_issue_sids_keep_each_kind_with_its_step_and_class():
+    from regulator_agent.results import RunStats
+
+    stats = RunStats("r")
+    stats.record(record("a", ok=False, error_class="timeout", sid="s1"))
+    stats.record(record("a", partial=True, sid="s2"))
+    stats.record(record("b", queued_ms=900.0, sid="s3"))
+    # Partial and queued at once: kept under both.
+    stats.record(record("b", partial=True, queued_ms=50.0, sid="s4"))
+    # Refused before it had a sid: counted, no member can be named for it.
+    stats.record(record("a", ok=False, error_class="quota"))
+    # Clean, unfinished and a 404 behind the balancer: none of these are kept.
+    stats.record(record("a", sid="s5"))
+    stats.record(record("a", ok=False, error_class="cancelled", sid="s6"))
+    stats.record(record("a", sid="s7", unknown_sid_count=3))
+
+    doc = stats.issue_sids.to_dict()
+    assert doc["failed"] == [["s1", "a", "timeout"]]
+    assert doc["partial"] == [["s2", "a"], ["s4", "b"]]
+    assert doc["queued"] == [["s3", "b"], ["s4", "b"]]
+    assert doc["no_sid"] == {"failed": 1}
+    assert doc["dropped"] == {}
+
+
+def test_issue_sids_are_bounded_and_count_what_they_drop():
+    from regulator_agent.results import ISSUE_SIDS_PER_KIND, IssueSids, merge_issue_sids
+
+    kept = IssueSids()
+    for n in range(ISSUE_SIDS_PER_KIND + 7):
+        kept.add(record("a", partial=True, sid=f"s{n}"))
+    doc = kept.to_dict()
+    assert len(doc["partial"]) == ISSUE_SIDS_PER_KIND
+    assert doc["dropped"] == {"partial": 7}
+
+    # A fleet: the same cap over the union, and every drop added up.
+    other = IssueSids()
+    other.add(record("b", partial=True, sid="x1"))
+    other.add(record("b", ok=False, error_class="server", sid="x2"))
+    merged = merge_issue_sids([doc, other.to_dict(), None, {"failed": [["bad"]]}])
+    assert len(merged["partial"]) == ISSUE_SIDS_PER_KIND
+    assert merged["dropped"] == {"partial": 8}
+    assert merged["failed"] == [["x2", "b", "server"]]

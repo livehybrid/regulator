@@ -401,6 +401,27 @@ const RUN = {
                         },
                     ],
                 },
+                our_searches_by_member: {
+                    available: true,
+                    description: 'The audit records split by step and member',
+                    rows: [
+                        { step: 'triage.overview', member: 'sh-2', searches: '300', run_time_s: '200', searched_buckets: '2100', cache_hits: '1800', cache_misses: '190', cold_path_s: '110', cold_path_pct: '55' },
+                        { step: 'triage.overview', member: 'sh-1', searches: '300', run_time_s: '100', searched_buckets: '2000', cache_hits: '2088', cache_misses: '22', cold_path_s: '13', cold_path_pct: '13' },
+                    ],
+                },
+            },
+            issues_by_member: {
+                available: true,
+                reason: '',
+                members: ['sh-1', 'sh-2'],
+                rows: [
+                    { step: 'triage.overview', member: 'sh-2', failed: 1, partial: 0, queued: 9, errors_by_class: { timeout: 1 } },
+                    { step: 'triage.overview', member: 'sh-1', failed: 0, partial: 0, queued: 3, errors_by_class: {} },
+                    { step: 'triage.overview', member: '(no audit record yet)', failed: 0, partial: 1, queued: 0, errors_by_class: {} },
+                ],
+                dropped: { queued: 4 },
+                no_sid: { failed: 1 },
+                limit_per_kind: 300,
             },
         },
     },
@@ -1007,6 +1028,24 @@ const go = async (hash) => {
     );
     await check('run: skipped scheduled searches', '340 skipped: maxconcurrent');
     await check('run: bucket attribution by step', 'Bucket attribution by step');
+    // Split by search head member (#18): issues, then the bucket figures.
+    await check('run: issues by search head member', 'By search head member');
+    await waitFor('run: an issue row names its member and class', () =>
+        Array.from(window.document.querySelectorAll('tr')).some((tr) => {
+            const cells = Array.from(tr.querySelectorAll('td')).map((td) => (td.textContent || '').trim());
+            return cells.length === 6 && cells[1] === 'sh-2' && cells[2] === '1' && cells[3] === '1 timeout' && cells[5] === '9';
+        })
+    );
+    await check('run: a search the audit trail did not hold is still counted', '(no audit record yet)');
+    await check('run: the member split says it is a sample', '4 more queued searches');
+    await check('run: a refused search is on no member', 'Refused before they had a search id, so on no member: 1 failures');
+    await check('run: unknown sids are not laid on a member', 'Unknown-sid responses are not split');
+    await waitFor('run: bucket attribution by member', () =>
+        Array.from(window.document.querySelectorAll('tr')).some((tr) => {
+            const cells = Array.from(tr.querySelectorAll('td')).map((td) => (td.textContent || '').trim());
+            return cells.length === 9 && cells[1] === 'sh-2' && cells[5] === '190' && cells[8] === '55%';
+        })
+    );
     // The reading of it all: which limit the run reached, and on what evidence.
     await check('run: the verdict', 'Where the limit was');
     await check('run: the verdict names the limit', 'CPU on the indexers, with disk on the indexers');
