@@ -11,7 +11,7 @@ import uuid
 
 import pytest
 
-from conftest import INDEX, MEMBER_URLS, SH_URL, client_for, oneshot, run
+from conftest import INDEX, MEMBER_URLS, SH_URL, client_for, oneshot, run, wait_for
 
 
 @pytest.mark.skipif(len(MEMBER_URLS) < 2, reason="needs two search head cluster members")
