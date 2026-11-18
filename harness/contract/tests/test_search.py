@@ -157,6 +157,9 @@ def test_the_audit_trail_names_the_member_that_served_each_search():
         raise
     print("by step and member:", [(r.get("step"), r.get("member"), r.get("searches")) for r in rows])
     placed = {(r["step"], r["member"]): int(float(r["searches"])) for r in rows}
+    # Only these searches: not the probe's own audit records from the waits
+    # above (a probe names the run marker in its own search string).
+    assert {step for step, _ in placed} == {f"member{n}" for n in range(len(MEMBER_URLS))}, placed
     for n, url in enumerate(MEMBER_URLS):
         step = f"member{n}"
         on_member = {member: c for (s, member), c in placed.items() if s == step}

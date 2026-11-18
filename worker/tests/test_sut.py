@@ -379,7 +379,7 @@ def test_the_per_step_probe_reads_the_step_from_the_run_marker():
 
     pattern = re.search(r'rex field=search "([^"]+)"', spl).group(1)
     assert "\\\\" not in pattern  # nothing SPL's own unescaping could change
-    extract = re.compile(pattern.replace("(?<step>", "(?P<step>"))
+    extract = re.compile(pattern.replace("(?<reg_step>", "(?P<step>"))
     audited = "search index=main error | stats count ```" + cache_bust_marker("r7-v1.2", 3, 12, "triage.overview") + "```"
     assert extract.search(audited).group("step") == "triage.overview"
     # A run whose label differs only where this one has a dot is not ours.
@@ -553,3 +553,23 @@ def test_findings_name_a_member_with_most_of_an_issue():
     # One member is a standalone search head, or a sticky balancer: nothing to compare.
     single = split([{"step": "a", "member": "sh1", "failed": 9, "partial": 0, "queued": 0}], ["sh1"])
     assert not any("cluster member" in f for f in _findings(single))
+
+
+def test_the_probes_leave_their_own_audit_records_out():
+    """Each probe names the run marker, so it matched the next probe's selection.
+
+    Seen on the contract cluster: a probe's own audit record turned up in the
+    split by member as a step called 'coalesce(step, ...)', which Splunk had
+    extracted as step=... from the logged search text.
+    """
+    from regulator_agent.sut import CORRELATION_TAG
+
+    for probe in build_probes(marker_prefix_for("r7"), "reg_r7_"):
+        if '"reg:r7:"' in probe.spl:
+            # The selection excludes the tag, and in doing so carries it, so
+            # each probe's own record is left out by every probe after it.
+            assert f'NOT "{CORRELATION_TAG}"' in probe.spl, probe.name
+    # The step comes from the marker only, never from a field Splunk extracted
+    # from the logged search text: that one is called step too.
+    by_step = next(p for p in build_probes(marker_prefix_for("r7"), "reg_r7_") if p.name == "our_searches_by_step")
+    assert "coalesce(reg_step, " in by_step.spl and "coalesce(step, " not in by_step.spl

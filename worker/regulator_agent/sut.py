@@ -122,6 +122,10 @@ class Probe:
 UNATTRIBUTED_STEP = "(step not in the audited search)"
 
 
+# Written into every correlation probe's search string, so the probes can
+# leave their own audit records out of the run's. See build_probes.
+CORRELATION_TAG = "regulator-correlation-probe"
+
 # The member an audit record lands under when it names no host.
 UNKNOWN_MEMBER = "(member not recorded)"
 # The member a search with an issue lands under when the audit trail held no
@@ -178,10 +182,17 @@ def build_probes(marker_prefix: str, sid_prefix: str = "") -> List[Probe]:
         ours = f'(search_id="*{sid_prefix}*" OR "{marker_prefix}")'
     else:
         ours = f'"{marker_prefix}"'
+    # Not the correlation's own searches. Each probe names the run marker in
+    # its own search string, so a probe's audit record matched the next
+    # probe's selection and counted as one of the run's searches (seen on the
+    # contract cluster). The exclusion term is written into every probe by
+    # this very clause, so a probe excludes itself and every other probe,
+    # and no search a scenario dispatches carries it.
+    ours = f'{ours} NOT "{CORRELATION_TAG}"'
     attribution_stats, attribution_evals = _ATTRIBUTION_STATS, _ATTRIBUTION_EVALS
     step_from_marker = (
-        f'| rex field=search "{_marker_regex(marker_prefix)}vu\\d+:i\\d+:(?<step>[A-Za-z0-9_.:-]+)" '
-        f'| eval step=coalesce(step, "{UNATTRIBUTED_STEP}")'
+        f'| rex field=search "{_marker_regex(marker_prefix)}vu\\d+:i\\d+:(?<reg_step>[A-Za-z0-9_.:-]+)" '
+        f'| eval step=coalesce(reg_step, "{UNATTRIBUTED_STEP}")'
     )
     return [
         Probe(
