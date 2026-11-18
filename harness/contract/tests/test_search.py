@@ -139,7 +139,22 @@ def test_the_audit_trail_names_the_member_that_served_each_search():
     assert len(set(members.values())) == len(MEMBER_URLS)
 
     probe = next(p for p in build_probes(marker_prefix_for(label), prefix) if p.name == "our_searches_by_member")
-    rows = run(oneshot(SH_URL, probe.spl, earliest=began, count=probe.max_rows))
+    # The lookup takes any audit record; the probe only the completed one,
+    # which Splunk writes later. Wait for all six.
+    def completed():
+        rows = run(oneshot(SH_URL, probe.spl, earliest=began, count=probe.max_rows))
+        return rows if sum(int(float(r.get("searches") or 0)) for r in rows) >= len(served) else None
+
+    try:
+        rows = wait_for(completed, timeout_s=180, every_s=10, what="a completed audit record for every search")
+    except AssertionError:
+        seen = run(oneshot(
+            SH_URL,
+            f'search index=_audit action=search search_id="*{prefix}*" | stats count by info, host',
+            earliest=began,
+        ))
+        print("audit records of these searches, by info and host:", seen)
+        raise
     print("by step and member:", [(r.get("step"), r.get("member"), r.get("searches")) for r in rows])
     placed = {(r["step"], r["member"]): int(float(r["searches"])) for r in rows}
     for n, url in enumerate(MEMBER_URLS):
