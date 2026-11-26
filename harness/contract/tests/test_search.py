@@ -174,49 +174,70 @@ def test_a_finished_job_given_a_lifetime_is_removed_by_splunkd_when_it_runs_out(
     on splunkd to remove the artefact once that has run out. Three things
     have to hold: splunkd accepts a lifetime for a job that has finished, the
     job is still there in the meantime, and splunkd then removes it without
-    being asked. A second job, left alone, shows the removal was the
-    lifetime's doing and not the job's ordinary expiry.
+    being asked. A job left alone shows the removal was the lifetime's doing
+    and not the job's ordinary expiry.
 
-    A third carries a short auto_cancel, as every job Regulator dispatches
+    Another carries a short auto_cancel, as every job Regulator dispatches
     carries one (a minute past the read timeout). auto_cancel is for a search
     nobody is waiting for; if it also removed a job that had finished, a keep
     time longer than it would be cut short.
+
+    Two jobs are given the lifetime. One is read every few seconds, which
+    says how soon splunkd removes it and whether reading a job's status keeps
+    it alive. The other is looked at rarely, with gaps several times the
+    lifetime, so that it goes even if every look starts its lifetime again:
+    that one is the assertion.
     """
+    import urllib.error
+
     from regulator_agent.timepolicy import TimeWindow
 
     # One member directly: only the member that dispatched a job knows it.
     url = MEMBER_URLS[0] if MEMBER_URLS else SH_URL
     tag = uuid.uuid4().hex[:10]
-    kept, untouched, idle = (f"reg_contract_{name}_{tag}" for name in ("keep", "left", "idle"))
-    lifetime_s = 15
+    watched, kept, untouched, idle = (
+        f"reg_contract_{name}_{tag}" for name in ("watched", "keep", "left", "idle")
+    )
+    everyone = (watched, kept, untouched, idle)
+    lifetime_s, rare_look_s, patience_s = 15, 75, 330
 
-    def listed():
-        # The listing, not the job itself: reading a job can count as using
-        # it, which starts its lifetime again and would keep it alive for as
-        # long as this test kept looking.
-        entries = rest(url, "/services/search/jobs?count=0").get("entry") or []
-        return {
-            str((e.get("content") or {}).get("sid") or e.get("name")): (e.get("content") or {}).get("ttl")
-            for e in entries
-        }
+    def content_of(sid):
+        """The job's own record, or None once splunkd no longer knows it."""
+        try:
+            entries = rest(url, f"/services/search/jobs/{sid}").get("entry") or [{}]
+        except urllib.error.HTTPError as exc:
+            if exc.code == 404:
+                return None
+            raise
+        return entries[0].get("content") or {}
+
+    def listing(path):
+        # Printed, never asserted on: the first version of this test looked for
+        # its jobs in the listing and did not find them there.
+        try:
+            entries = rest(url, path).get("entry") or []
+        except Exception as exc:  # noqa: BLE001
+            return f"failed: {exc}"
+        sids = [str((e.get("content") or {}).get("sid")) for e in entries]
+        return {"entries": len(entries), "ours": sorted(s for s in sids if tag in s), "last": sids[-3:]}
 
     async def dispatch():
         client = client_for(url)
         await client.start()
         try:
-            for sid in (kept, untouched, idle):
+            for sid in everyone:
                 await client.create_job(
                     "| makeresults count=1",
                     TimeWindow(earliest=time.time() - 60, latest=time.time()),
                     sid=sid,
                     auto_cancel_s=5 if sid == idle else None,
                 )
-            for sid in (kept, untouched, idle):
+            for sid in everyone:
                 began = time.perf_counter()
                 while not (await client.job_status(sid)).is_terminal:
                     assert time.perf_counter() - began < 120, f"{sid} never finished"
                     await asyncio.sleep(0.5)
-            return await client.set_job_ttl(kept, lifetime_s)
+            return [await client.set_job_ttl(sid, lifetime_s) for sid in (watched, kept)]
         finally:
             await client.close()
 
@@ -228,24 +249,37 @@ def test_a_finished_job_given_a_lifetime_is_removed_by_splunkd_when_it_runs_out(
         finally:
             await client.close()
 
-    assert run(dispatch()) is True
-    set_at = time.time()
     try:
-        before = listed()
-        print("lifetimes once set:", {sid: before.get(sid) for sid in (kept, untouched, idle)})
-        assert {kept, untouched, idle} <= set(before), sorted(before)
-        assert 0 < float(before[kept]) <= lifetime_s, before[kept]
-        assert float(before[untouched]) > lifetime_s, before[untouched]
+        assert run(dispatch()) == [True, True]
+        set_at = time.time()
+        first = {sid: content_of(sid) for sid in (watched, kept, untouched)}
+        print("lifetimes once set:", {sid: (c or {}).get("ttl") for sid, c in first.items()})
+        for path in ("/services/search/jobs?count=0", "/services/search/v2/jobs?count=0"):
+            print("listing", path, "->", listing(path))
+        assert all(c is not None for c in first.values()), first
+        assert 0 < float(first[kept]["ttl"]) <= lifetime_s, first[kept]["ttl"]
+        assert float(first[untouched]["ttl"]) > lifetime_s, first[untouched]["ttl"]
 
-        # Well inside the ten minutes an ad hoc job lives by default, and
-        # generous about how often splunkd looks for jobs to remove.
-        wait_for(lambda: kept not in listed(), timeout_s=300, every_s=5, what="splunkd to remove the job")
-        print(f"removed {time.time() - set_at:.0f}s after being given {lifetime_s}s to live")
-        assert time.time() - set_at >= lifetime_s - 6, "removed before its lifetime ran out"
-        after = listed()
-        assert untouched in after, "the job left alone went too: this was not the lifetime's doing"
-        assert idle in after, "auto_cancel removed a job that had finished"
+        gone_after = {}
+        next_rare_look = set_at + rare_look_s
+        while kept not in gone_after and time.time() - set_at < patience_s:
+            time.sleep(5)
+            if watched not in gone_after and content_of(watched) is None:
+                gone_after[watched] = time.time() - set_at
+            if time.time() >= next_rare_look:
+                next_rare_look = time.time() + rare_look_s
+                if content_of(kept) is None:
+                    gone_after[kept] = time.time() - set_at
+        print(f"given {lifetime_s}s to live; gone after:", {k: round(v) for k, v in gone_after.items()})
+        if watched in gone_after:
+            print("the job read every 5s went all the same: reading its status does not keep it alive")
+            assert gone_after[watched] >= lifetime_s - 6, "removed before its lifetime ran out"
+        else:
+            print("the job read every 5s was still there: reading its status keeps it alive")
+        assert kept in gone_after, f"splunkd had not removed the job {patience_s}s after its {lifetime_s}s lifetime was set"
+        # Both well inside the ten minutes an ad hoc job lives by default.
+        assert content_of(untouched) is not None, "the job left alone went too: this was not the lifetime's doing"
+        assert content_of(idle) is not None, "auto_cancel removed a job that had finished"
     finally:
-        for sid in (untouched, idle, kept):
+        for sid in everyone:
             run(remove(sid))
-
