@@ -255,7 +255,7 @@ What the first run, against Splunk 10.6, found:
 | Diagnose's indexer query | **Wrong anchor.** The line is "Streamed search connection closed", not "terminated". Fixed; every field it reads is confirmed |
 | Host resources and the freshness probe | Confirmed end to end |
 | The host on a search's `_audit` records is the member that dispatched it (issue 18) | **Confirmed.** Two searches dispatched on each of three members directly; the per-sid lookup and the per-member probe, read through the balanced address, named the right member for all six. The run marker survives into `_audit`'s `search` field. It also found that the correlation probes matched their own audit records (each names the run marker), so every `_audit` selection now leaves them out |
-| A finished job given a lifetime with `setttl` stays until it runs out and is then removed by splunkd, and `auto_cancel` leaves a finished job alone (`REG_KEEP_JOBS_S`) | **Not run yet.** Added after the first run; `test_search.py` checks it |
+| A finished job given a lifetime with `setttl` stays until it runs out and is then removed by splunkd, and `auto_cancel` leaves a finished job alone (`REG_KEEP_JOBS_S`) | **Confirmed**, in a later run. splunkd accepted a 15 s lifetime for a finished job, reported it as the job's `ttl` (600 for a job left alone), and had removed the job when it was next looked at, 75 s on. The job left alone, and one dispatched with `auto_cancel=5`, were both still there. A third job given the same 15 s but read every 5 s was also still there: **reading a job's status starts its lifetime again**, and the fake now does the same. Not explained: none of these jobs appeared in the member's `search/jobs` listing, though each answered when asked for by sid |
 | Host disk figures on every Linux host | **Not everywhere.** On GitHub's hosted runners splunkd's IOStats events name no mount point, and the disk queries grouped by it, so every one was dropped. A disk is now its mount point or its device |
 
 Also seen: on a replicated SmartStore bucket the copy that did not upload reports
@@ -301,9 +301,10 @@ What it does and does not cover:
   once whatever the keep time, because that delete is what stops the search.
 - **The time is a floor, not an exact figure.** splunkd counts a lifetime from
   the last time the job was touched, and reaps on its own schedule, so the
-  artefact goes some time after the keep time has passed. Splunk also starts
-  a job's lifetime again whenever the job is used (viewing its results is the
-  documented case), so collecting from a job over REST can extend it.
+  artefact goes some time after the keep time has passed. Reading a job over
+  REST starts its lifetime again: on the contract cluster a job given 15 s and
+  read every 5 s was still there at 75 s, when one left alone had gone. So a
+  collector that polls a job keeps it alive for as long as it polls.
 - **It applies to the API engine.** The browser engine's searches belong to
   Splunk Web, which Regulator never deleted and which keep Splunk's own
   lifetime (ten minutes by default).

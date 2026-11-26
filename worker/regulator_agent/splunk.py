@@ -858,8 +858,8 @@ class SplunkClient:
         lifetime from the last time the job was touched and removes the
         artefact itself once it has run out, so nothing has to come back later
         to delete it and a worker that exits first leaves nothing behind for
-        longer than was asked. Reading the job (its ``search.log`` included)
-        counts as a touch and starts the lifetime again.
+        longer than was asked. Reading the job over REST starts its lifetime
+        again (the contract suite saw a status read do so).
         """
         response = await self._request(
             "POST",

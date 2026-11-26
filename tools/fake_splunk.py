@@ -362,8 +362,8 @@ class FakeSplunk:
         self._active = still_active
 
         # The reaper. splunkd counts a lifetime from the last time the job was
-        # touched, which for a job nobody reads again is the later of its end
-        # and the setttl that set it.
+        # used: its end, the setttl that set the lifetime, or the last read of
+        # it (see _job_endpoint), whichever came last.
         for sid in [
             sid for sid, job in self._expiring.items()
             if job.done_at is not None
@@ -1140,6 +1140,12 @@ class FakeSplunk:
                     self.stats.unknown_sid_answers += 1
             if elsewhere:
                 return 404, _UNKNOWN_SID_BODY
+
+        if job.ttl_s is not None and method == "GET":
+            # Reading a job starts its lifetime again (seen on a real cluster:
+            # a job given 15 s and read every 5 s was still there at 75 s).
+            with self._lock:
+                job.ttl_from = time.monotonic()
 
         if tail == "" and method == "GET":
             return 200, self._job_entry(job, time.monotonic())

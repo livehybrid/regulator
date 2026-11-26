@@ -431,9 +431,15 @@ def test_control_setttl_keeps_a_finished_job_for_that_long_and_no_longer(make_se
     assert status == 200
     assert payload["entry"][0]["content"]["ttl"] == "1"
 
-    time.sleep(0.4)
+    # Reading it starts the lifetime again, as a real cluster does: a second
+    # past the setttl it is still there, because it was read in between.
+    time.sleep(0.6)
     assert call(server, "GET", f"/services/search/v2/jobs/{sid}")[0] == 200
-    time.sleep(0.9)
+    time.sleep(0.6)
+    assert call(server, "GET", f"/services/search/v2/jobs/{sid}")[0] == 200
+    # Left alone for the whole lifetime, it goes.
+    time.sleep(1.3)
+    assert stats(server)["jobs_expired"] == 1
     assert call(server, "GET", f"/services/search/v2/jobs/{sid}")[0] == 404
 
     counters = stats(server)
