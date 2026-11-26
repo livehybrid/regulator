@@ -413,6 +413,49 @@ def test_v1_path_works_and_is_counted(server):
     assert counters["requests_by_path"]["POST /services/search/v2/jobs"] == 1
 
 
+def test_control_setttl_keeps_a_finished_job_for_that_long_and_no_longer(make_server):
+    """What REG_KEEP_JOBS_S leans on: the job outlives its end by the lifetime
+    it was given, and then goes without anybody deleting it."""
+    server = make_server(base_latency_ms=10.0, jitter_ms=0.0)
+
+    sid = dispatch(server)
+    wait_for_done(server, sid)
+    status, _ = call(
+        server,
+        "POST",
+        f"/services/search/v2/jobs/{sid}/control",
+        body={"action": "setttl", "ttl": "1"},
+    )
+    assert status == 200
+    status, payload = call(server, "GET", f"/services/search/v2/jobs/{sid}")
+    assert status == 200
+    assert payload["entry"][0]["content"]["ttl"] == "1"
+
+    time.sleep(0.4)
+    assert call(server, "GET", f"/services/search/v2/jobs/{sid}")[0] == 200
+    time.sleep(0.9)
+    assert call(server, "GET", f"/services/search/v2/jobs/{sid}")[0] == 404
+
+    counters = stats(server)
+    assert counters["jobs_ttl_set"] == 1
+    assert counters["jobs_expired"] == 1
+    assert counters["jobs_deleted"] == 0
+
+
+def test_control_setttl_refuses_a_lifetime_that_is_not_one(make_server):
+    server = make_server(base_latency_ms=10.0, jitter_ms=0.0)
+    sid = dispatch(server)
+    for ttl in ("", "0", "soon"):
+        status, _ = call(
+            server,
+            "POST",
+            f"/services/search/v2/jobs/{sid}/control",
+            body={"action": "setttl", "ttl": ttl},
+        )
+        assert status == 400, ttl
+    assert stats(server)["jobs_ttl_set"] == 0
+
+
 def test_control_cancel_and_finalize(make_server):
     server = make_server(base_latency_ms=800.0, jitter_ms=0.0)
 
@@ -647,6 +690,8 @@ def test_stats_and_reset(server):
         "jobs_done",
         "jobs_deleted",
         "jobs_cancelled",
+        "jobs_ttl_set",
+        "jobs_expired",
         "peak_concurrent",
         "current_concurrent",
         "queued_total",

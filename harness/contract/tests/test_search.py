@@ -11,7 +11,7 @@ import uuid
 
 import pytest
 
-from conftest import INDEX, MEMBER_URLS, SH_URL, client_for, oneshot, run, wait_for
+from conftest import INDEX, MEMBER_URLS, SH_URL, client_for, oneshot, rest, run, wait_for
 
 
 @pytest.mark.skipif(len(MEMBER_URLS) < 2, reason="needs two search head cluster members")
@@ -164,3 +164,88 @@ def test_the_audit_trail_names_the_member_that_served_each_search():
         step = f"member{n}"
         on_member = {member: c for (s, member), c in placed.items() if s == step}
         assert set(on_member) <= names[url] and sum(on_member.values()) == 2, (step, on_member, names[url])
+
+
+def test_a_finished_job_given_a_lifetime_is_removed_by_splunkd_when_it_runs_out():
+    """The assumption behind REG_KEEP_JOBS_S.
+
+    To leave a finished search's log to be collected, Regulator does not
+    delete the job: it sets its lifetime (control, action=setttl) and relies
+    on splunkd to remove the artefact once that has run out. Three things
+    have to hold: splunkd accepts a lifetime for a job that has finished, the
+    job is still there in the meantime, and splunkd then removes it without
+    being asked. A second job, left alone, shows the removal was the
+    lifetime's doing and not the job's ordinary expiry.
+
+    A third carries a short auto_cancel, as every job Regulator dispatches
+    carries one (a minute past the read timeout). auto_cancel is for a search
+    nobody is waiting for; if it also removed a job that had finished, a keep
+    time longer than it would be cut short.
+    """
+    from regulator_agent.timepolicy import TimeWindow
+
+    # One member directly: only the member that dispatched a job knows it.
+    url = MEMBER_URLS[0] if MEMBER_URLS else SH_URL
+    tag = uuid.uuid4().hex[:10]
+    kept, untouched, idle = (f"reg_contract_{name}_{tag}" for name in ("keep", "left", "idle"))
+    lifetime_s = 15
+
+    def listed():
+        # The listing, not the job itself: reading a job can count as using
+        # it, which starts its lifetime again and would keep it alive for as
+        # long as this test kept looking.
+        entries = rest(url, "/services/search/jobs?count=0").get("entry") or []
+        return {
+            str((e.get("content") or {}).get("sid") or e.get("name")): (e.get("content") or {}).get("ttl")
+            for e in entries
+        }
+
+    async def dispatch():
+        client = client_for(url)
+        await client.start()
+        try:
+            for sid in (kept, untouched, idle):
+                await client.create_job(
+                    "| makeresults count=1",
+                    TimeWindow(earliest=time.time() - 60, latest=time.time()),
+                    sid=sid,
+                    auto_cancel_s=5 if sid == idle else None,
+                )
+            for sid in (kept, untouched, idle):
+                began = time.perf_counter()
+                while not (await client.job_status(sid)).is_terminal:
+                    assert time.perf_counter() - began < 120, f"{sid} never finished"
+                    await asyncio.sleep(0.5)
+            return await client.set_job_ttl(kept, lifetime_s)
+        finally:
+            await client.close()
+
+    async def remove(sid):
+        client = client_for(url)
+        await client.start()
+        try:
+            await client.delete_job(sid)
+        finally:
+            await client.close()
+
+    assert run(dispatch()) is True
+    set_at = time.time()
+    try:
+        before = listed()
+        print("lifetimes once set:", {sid: before.get(sid) for sid in (kept, untouched, idle)})
+        assert {kept, untouched, idle} <= set(before), sorted(before)
+        assert 0 < float(before[kept]) <= lifetime_s, before[kept]
+        assert float(before[untouched]) > lifetime_s, before[untouched]
+
+        # Well inside the ten minutes an ad hoc job lives by default, and
+        # generous about how often splunkd looks for jobs to remove.
+        wait_for(lambda: kept not in listed(), timeout_s=300, every_s=5, what="splunkd to remove the job")
+        print(f"removed {time.time() - set_at:.0f}s after being given {lifetime_s}s to live")
+        assert time.time() - set_at >= lifetime_s - 6, "removed before its lifetime ran out"
+        after = listed()
+        assert untouched in after, "the job left alone went too: this was not the lifetime's doing"
+        assert idle in after, "auto_cancel removed a job that had finished"
+    finally:
+        for sid in (untouched, idle, kept):
+            run(remove(sid))
+

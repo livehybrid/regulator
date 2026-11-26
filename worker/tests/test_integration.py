@@ -470,6 +470,147 @@ def test_jobs_are_deleted_unless_told_otherwise(splunkd, env):
     assert splunkd.stats.jobs_deleted == middle
 
 
+def test_a_finished_job_is_kept_for_as_long_as_asked_and_not_deleted(splunkd, env):
+    """REG_KEEP_JOBS_S: the search log has to be there to be collected.
+
+    Regulator used to delete every job the moment it had read it. With a keep
+    time the job is given that lifetime instead, and the target removes it.
+    """
+
+    async def scenario():
+        engine = ApiEngine(make_config(splunkd, env, REG_KEEP_JOBS_S="1"))
+        await engine.start()
+        try:
+            return await engine.execute(context_for(search_step()))
+        finally:
+            await engine.close()
+
+    record = run_async(scenario())
+    assert record.ok, record.error_detail
+    assert splunkd.stats.jobs_deleted == 0
+    assert splunkd.stats.jobs_ttl_set == 1
+    # Still there once the engine has gone: nothing waits around to delete it.
+    assert record.sid in splunkd._jobs
+    assert splunkd._jobs[record.sid].ttl_s == 1.0
+
+    time.sleep(1.3)
+    splunkd.pump()
+    assert record.sid not in splunkd._jobs
+    assert splunkd.stats.jobs_expired == 1
+    assert splunkd.stats.jobs_deleted == 0
+
+
+def test_a_failed_search_is_kept_too(env):
+    """Its search log is the one most worth reading."""
+
+    async def scenario():
+        server = FakeSplunk(port=0, base_latency_ms=10.0, fail_rate=1.0, seed=7)
+        engine = ApiEngine(make_config(server, env, REG_KEEP_JOBS_S="30"))
+        await engine.start()
+        try:
+            record = await engine.execute(context_for(search_step()))
+            return record, server.stats.jobs_deleted, server.stats.jobs_ttl_set
+        finally:
+            await engine.close()
+            server.close()
+
+    record, deleted, kept = run_async(scenario())
+    assert record.error_class == ERROR_SEARCH_FAILED
+    assert (deleted, kept) == (0, 1)
+
+
+def test_a_search_still_running_is_deleted_at_once_whatever_the_keep_time(env):
+    """Keeping it would keep it running: the delete is what stops the search.
+
+    This is the search a run abandons at its end. The load Regulator applies
+    must stop when Regulator stops, keep time or not.
+    """
+
+    async def scenario():
+        server = FakeSplunk(port=0, base_latency_ms=30_000.0, jitter_ms=0.0, seed=3)
+        engine = ApiEngine(
+            make_config(server, env, REG_KEEP_JOBS_S="30", REG_HARVEST_S="0")
+        )
+        await engine.start()
+        try:
+            task = asyncio.ensure_future(engine.execute(context_for(search_step())))
+            while server.stats.jobs_created == 0:
+                await asyncio.sleep(0.01)
+            await asyncio.sleep(0.1)
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+            return server.stats.jobs_deleted, server.stats.jobs_ttl_set, len(server._jobs)
+        finally:
+            await engine.close()
+            server.close()
+
+    deleted, kept, left = run_async(scenario())
+    assert (deleted, kept, left) == (1, 0, 0)
+
+
+def test_the_keep_time_does_nothing_when_jobs_are_not_deleted_at_all(splunkd, env):
+    """REG_DELETE_JOBS=0 already leaves every job to its own lifetime."""
+
+    async def scenario():
+        engine = ApiEngine(make_config(splunkd, env, REG_DELETE_JOBS="0", REG_KEEP_JOBS_S="30"))
+        await engine.start()
+        try:
+            await engine.execute(context_for(search_step()))
+        finally:
+            await engine.close()
+
+    run_async(scenario())
+    assert (splunkd.stats.jobs_deleted, splunkd.stats.jobs_ttl_set) == (0, 0)
+
+
+def test_a_keep_time_reaches_the_member_that_owns_the_job(env):
+    """Behind a balancer the lifetime change can meet a member that does not
+    know the job, exactly as the delete can. It is asked again until one does."""
+
+    async def scenario():
+        server = FakeSplunk(port=0, base_latency_ms=5.0, jitter_ms=0.0, shc_members=3, seed=3)
+        engine = ApiEngine(make_config(server, env, REG_KEEP_JOBS_S="30"))
+        await engine.start()
+        try:
+            record = await engine.execute(context_for(search_step()))
+        finally:
+            # close() waits for the requests still being asked again.
+            await engine.close()
+        try:
+            return record, server.stats.jobs_ttl_set, server.stats.jobs_deleted
+        finally:
+            server.close()
+
+    record, kept, deleted = run_async(scenario())
+    assert record.ok, record.error_detail
+    assert (kept, deleted) == (1, 0)
+
+
+def test_a_target_that_refuses_the_keep_time_fails_nothing(splunkd, env, caplog):
+    """The job then stays for the lifetime splunkd gave it, and the log says so once."""
+
+    class Refusing(SplunkClient):
+        async def set_job_ttl(self, sid, ttl_s):
+            raise SplunkHttpError(403, "insufficient permission", context="set lifetime")
+
+    async def scenario():
+        config = make_config(splunkd, env, REG_KEEP_JOBS_S="30")
+        engine = ApiEngine(config, client=Refusing(config.target))
+        await engine.start()
+        try:
+            return [await engine.execute(context_for(search_step())) for _ in range(3)]
+        finally:
+            await engine.close()
+
+    with caplog.at_level("WARNING"):
+        records = run_async(scenario())
+    assert all(record.ok for record in records)
+    assert splunkd.stats.jobs_deleted == 0
+    said = [r.getMessage() for r in caplog.records if "REG_KEEP_JOBS_S" in r.getMessage()]
+    assert len(said) == 1, said
+
+
 # ------------------------------------------------------------ a whole run
 
 

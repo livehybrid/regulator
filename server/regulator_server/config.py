@@ -268,6 +268,11 @@ class ServerConfig:
     # worker's Config.drain_budget_s and Config.harvest_s.
     drain_budget_s: float = 60.0
     harvest_s: float = 240.0
+    # How long a finished search's job stays on the target before splunkd
+    # removes it, so its search.log can be collected. 0 deletes it at once.
+    # Handed to every worker, in process or in a fleet. See the worker's
+    # Config.keep_jobs_s.
+    keep_jobs_s: float = 0.0
     # Bearer tokens for scripts and CI. Compared in constant time. A token is
     # as powerful as the password, so treat it as one.
     api_tokens: tuple[str, ...] = field(default=(), repr=False)
@@ -456,6 +461,7 @@ def load_server_config(env: Optional[Mapping[str, str]] = None) -> ServerConfig:
         max_pause_s=float(_integer(env, "REG_MAX_PAUSE_S", 1800, minimum=0)),
         drain_budget_s=float(_integer(env, "REG_DRAIN_BUDGET_S", 60, minimum=1)),
         harvest_s=float(_integer(env, "REG_HARVEST_S", 240, minimum=0)),
+        keep_jobs_s=float(_integer(env, "REG_KEEP_JOBS_S", 0, minimum=0)),
         api_tokens=tokens,
         allow_unauthenticated=_boolean(env, "REG_ALLOW_UNAUTHENTICATED", False),
         sample_interval_s=float(_integer(env, "REG_SAMPLE_INTERVAL_S", 5, minimum=1)),

@@ -255,6 +255,7 @@ What the first run, against Splunk 10.6, found:
 | Diagnose's indexer query | **Wrong anchor.** The line is "Streamed search connection closed", not "terminated". Fixed; every field it reads is confirmed |
 | Host resources and the freshness probe | Confirmed end to end |
 | The host on a search's `_audit` records is the member that dispatched it (issue 18) | **Confirmed.** Two searches dispatched on each of three members directly; the per-sid lookup and the per-member probe, read through the balanced address, named the right member for all six. The run marker survives into `_audit`'s `search` field. It also found that the correlation probes matched their own audit records (each names the run marker), so every `_audit` selection now leaves them out |
+| A finished job given a lifetime with `setttl` stays until it runs out and is then removed by splunkd, and `auto_cancel` leaves a finished job alone (`REG_KEEP_JOBS_S`) | **Not run yet.** Added after the first run; `test_search.py` checks it |
 | Host disk figures on every Linux host | **Not everywhere.** On GitHub's hosted runners splunkd's IOStats events name no mount point, and the disk queries grouped by it, so every one was dropped. A disk is now its mount point or its device |
 
 Also seen: on a replicated SmartStore bucket the copy that did not upload reports
@@ -279,6 +280,50 @@ off at 200 s. To let long searches finish, make the run comfortably longer than
 its slowest search, or raise `REG_DRAIN_BUDGET_S` (they are then measured in
 full) and `REG_HARVEST_S`. Set both on the control plane: it passes them to
 fleet workers and widens its own deadlines to match.
+
+### Keeping a finished search to read its search log
+
+Regulator deletes each job the moment it has read it, which takes the job's
+dispatch directory, and the `search.log` in it, with it. Set
+`REG_KEEP_JOBS_S` to leave a finished search on the search head for that many
+seconds instead. Regulator does not come back to delete it: it sets the job's
+lifetime (the `setttl` action of the job's `control` endpoint, the same thing
+Splunk Web's "Edit Job Settings" sends) and splunkd removes the artefact when
+the lifetime runs out. So a kept job needs no worker to outlive the run, and a
+worker that dies leaves nothing behind for longer than was asked. Set it on
+the control plane; it reaches in-process runs and fleet workers alike.
+
+What it does and does not cover:
+
+- **Finished means `DONE` or `FAILED`.** A failed search is kept: its log is
+  the one most worth reading. A search still running when Regulator lets go of
+  it (abandoned at the end of a run, or lost to a client timeout) is deleted at
+  once whatever the keep time, because that delete is what stops the search.
+- **The time is a floor, not an exact figure.** splunkd counts a lifetime from
+  the last time the job was touched, and reaps on its own schedule, so the
+  artefact goes some time after the keep time has passed. Splunk also starts
+  a job's lifetime again whenever the job is used (viewing its results is the
+  documented case), so collecting from a job over REST can extend it.
+- **It applies to the API engine.** The browser engine's searches belong to
+  Splunk Web, which Regulator never deleted and which keep Splunk's own
+  lifetime (ten minutes by default).
+- **Kept jobs are load.** At 20 searches a second, a keep time of 300 s holds
+  about 6,000 dispatch directories on the search head at any moment. They
+  count against the account's search disk quota (`srchDiskQuota`), and a
+  search head with thousands of them warns about its dispatch directory and
+  slows down listing jobs. A quota that fills queues new searches, which a run
+  would report as latency. Keep the time as short as the collection needs, give
+  the load-test account a quota to match, and do not compare a run that kept
+  its jobs against one that did not without saying so.
+- **Where to find the log.** `GET /services/search/jobs/<sid>/search.log` on
+  the member that dispatched the job, or
+  `$SPLUNK_HOME/var/run/splunk/dispatch/<sid>/` on its disk. Every step record
+  carries its `sid`, and on a search head cluster an ad hoc job exists only on
+  the member that dispatched it.
+
+`REG_DELETE_JOBS=0` is the blunter tool: nothing is deleted or given a
+lifetime, searches still running included, and it is read only by a standalone
+worker.
 
 Everything degrades. A load-test account frequently cannot read `_audit` or
 `_introspection`, and a benchmark that refused to report because it could not
@@ -654,6 +699,7 @@ the environment; everything downstream of the claim is the standalone code.
 | `REG_MAX_VIRTUAL_USERS` | `500` | The in-process ceiling described above. The open model is held to the same ceiling of in-flight searches |
 | `REG_MAX_CONCURRENT_RUNS` | `2` | Runs in flight at once, in-process and fleet together. More at once would mean measuring contention between your own tests; the shipped stack and Kubernetes manifest set it to `1` |
 | `REG_DRAIN_BUDGET_S`, `REG_HARVEST_S` | `60`, `240` | How long searches still in flight at the end of a run may finish and be measured, and how long the ones still running after that are followed before they are deleted. Used for console runs, passed to fleet workers, and added to the control plane's lost-worker deadlines. See "A search cancelled at the end of a run" |
+| `REG_KEEP_JOBS_S` | `0` | How long a finished search's job is left on the target, so its `search.log` can be collected, before splunkd removes it. `0` deletes it the moment Regulator has read it. Used for console runs and passed to fleet workers. See "Keeping a finished search to read its search log" |
 | `REG_MAX_PAUSE_S` | `1800` | The longest a run may spend paused in total. Past it the run is **stopped**, not resumed: whoever paused it may have done so to protect the cluster. `0` removes the limit. Also added to a Kubernetes fleet Job's deadline, which is fixed when the Job is created |
 | `REG_MAX_RUN_DURATION_S` | `14400` | The longest run accepted, so a mistyped duration cannot hold a slot for ever |
 | `REG_SESSION_TTL_S` | `43200` | Sessions are bound to the password as well as the key: changing the password signs everyone out |
@@ -1231,7 +1277,8 @@ set it high or leave it out.
 | Variable | Default | Notes |
 |---|---|---|
 | `REG_POLL_INITIAL_MS` / `REG_POLL_MAX_MS` | `250` / `1000` | Adaptive job polling. Polling hard is itself load on the target: a thousand users at 100 ms is ten thousand REST calls a second |
-| `REG_DELETE_JOBS` | `1` | Clean up artefacts on the search head. Leaving thousands behind is itself a load characteristic |
+| `REG_DELETE_JOBS` | `1` | Clean up artefacts on the search head. Leaving thousands behind is itself a load characteristic. `0` leaves every job, running or not, to its own lifetime. Standalone worker only: the control plane always deletes |
+| `REG_KEEP_JOBS_S` | `0` | Leave a finished search (`DONE` or `FAILED`) on the search head for this many seconds, so its `search.log` can be collected: the job is given that lifetime and splunkd removes it. `0` deletes it at once. A search still running when Regulator lets go of it is always deleted at once. See "Keeping a finished search to read its search log" |
 | `REG_UNKNOWN_SID_GRACE_MS` | `10000` | How long after any member last answered for a job a 404 for its sid means "this member does not know the job" rather than "the job is gone". A search head cluster member knows only the ad hoc jobs it dispatched, for their whole life (confirmed on a live 10.6 cluster: the other members answer 404 on every jobs path and never learn of it), so behind a load balancer without stickiness two polls in three land on a member that will never know the job. Inside the grace the request is asked again (status, results and delete) and counted on the record as `unknown_sid_count`; once no member has answered for the whole grace, the 404 fails the step. `0` fails on the first 404. Sticky sessions on the balancer avoid all of this |
 | `REG_CACHE_BUST` | `1` | The nonce comment. Only turn it off to demonstrate what the cache is worth |
 | `REG_HTTP2`, `REG_CONNECT_TIMEOUT_S`, `REG_READ_TIMEOUT_S` | `0`, `10`, `300` | Every dispatched job also carries `auto_cancel` a minute past the read timeout, so a search this worker gives up on is cancelled by splunkd rather than run to completion for nobody |

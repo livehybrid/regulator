@@ -32,6 +32,7 @@ import asyncio
 import hashlib
 import itertools
 import logging
+import math
 import secrets
 import time
 from typing import Any, Awaitable, Callable, Dict, List, Optional, Set, Tuple, TypeVar
@@ -131,6 +132,12 @@ def _int_or_none(value: Any) -> Optional[int]:
         return None
 
 
+# The dispatch states a job never leaves. Only a job in one of these is kept
+# for keep_jobs_s: in any other state it may still be running, and letting go
+# of it has to stop it.
+_ENDED_STATES = ("DONE", "FAILED")
+
+
 class ApiEngine:
     """Executes search steps against splunkd's REST API."""
 
@@ -166,11 +173,13 @@ class ApiEngine:
         # When each job was last answered for, by any member. The grace runs
         # from here rather than from the dispatch: see _grace_left_s.
         self._seen_at: Dict[str, float] = {}
-        # Deletes that met a member which had not heard of the job yet, retried
-        # in the background so the virtual user is not held up by housekeeping
-        # and the artefact is not left on the cluster for its whole TTL.
-        self._late_deletes: Set["asyncio.Task[None]"] = set()
+        # Deletes (or, with keep_jobs_s, lifetime changes) that met a member
+        # which had not heard of the job yet, retried in the background so the
+        # virtual user is not held up by housekeeping and the artefact is not
+        # left on the cluster for its whole TTL.
+        self._late_releases: Set["asyncio.Task[None]"] = set()
         self._unknown_sid_noted = False
+        self._keep_failure_noted = False
 
     # ------------------------------------------------------------------
     # Search ids a search head cluster member has not heard of yet
@@ -248,23 +257,40 @@ class ApiEngine:
                 await asyncio.sleep(min(delay_s, left_s))
                 delay_s = min(delay_s * 1.5, max_delay_s)
 
-    async def _late_delete(self, sid: str, dispatched_at: float) -> None:
+    async def _late_release(
+        self, sid: str, dispatched_at: float, release: Callable[[], Awaitable[bool]]
+    ) -> None:
         delay_s = max(0.001, self._config.poll_initial_ms / 1000.0)
         max_delay_s = max(delay_s, self._config.poll_max_ms / 1000.0)
         try:
             while True:
                 left_s = self._grace_left_s(dispatched_at)
                 if left_s <= 0:
-                    log.debug("delete of job %s: still unknown when the grace ran out", sid)
+                    log.debug("tidy-up of job %s: still unknown when the grace ran out", sid)
                     return
                 await asyncio.sleep(min(delay_s, left_s))
                 delay_s = min(delay_s * 1.5, max_delay_s)
-                if await self._client.delete_job(sid):
+                if await release():
                     return
         except asyncio.CancelledError:
             raise
         except Exception as exc:  # noqa: BLE001 - a leaked artefact never changes a result
-            log.debug("delete of job %s failed: %s", sid, exc)
+            log.debug("tidy-up of job %s failed: %s", sid, exc)
+
+    def _release(self, record: StepRecord) -> Callable[[], Awaitable[bool]]:
+        """What letting go of this job means: delete it, or leave it to expire.
+
+        A job that reached an end is kept for ``keep_jobs_s`` when that is
+        set, by giving it that lifetime and letting splunkd remove it. Anything
+        else is deleted, and for a search still running that is the point: the
+        delete is what stops it.
+        """
+        sid = record.sid or ""
+        keep_s = self._config.keep_jobs_s
+        if keep_s > 0 and (record.dispatch_state or "").upper() in _ENDED_STATES:
+            ttl_s = max(1, math.ceil(keep_s))
+            return lambda: self._client.set_job_ttl(sid, ttl_s)
+        return lambda: self._client.delete_job(sid)
 
     def _next_sid(self) -> Optional[str]:
         if self._custom_sid is False:
@@ -307,16 +333,23 @@ class ApiEngine:
     # ------------------------------------------------------------------
     async def start(self) -> None:
         await self._client.start()
+        if self._config.delete_jobs and self._config.keep_jobs_s > 0:
+            log.info(
+                "finished searches are left on the target for %.0fs (REG_KEEP_JOBS_S) and "
+                "then removed by splunkd; searches still running when Regulator gives up "
+                "on them are deleted at once",
+                self._config.keep_jobs_s,
+            )
 
     async def close(self) -> None:
         if self._closed:
             return
         self._closed = True
-        if self._late_deletes:
+        if self._late_releases:
             # Each is bounded by the grace, so this waits seconds at most, and
             # it is the difference between tidying up and leaving artefacts on
             # the cluster for their whole TTL.
-            await asyncio.gather(*list(self._late_deletes), return_exceptions=True)
+            await asyncio.gather(*list(self._late_releases), return_exceptions=True)
         await self._client.close()
 
     # ------------------------------------------------------------------
@@ -802,7 +835,7 @@ class ApiEngine:
             await self._tidy(record)
 
     async def _tidy(self, record: StepRecord) -> None:
-        """Delete the job artefact, whatever happened to the poll.
+        """Let go of the job artefact, whatever happened to the poll.
 
         Keyed on ``record.sid`` rather than a local variable, because the sid
         exists from the moment the dispatch returns and a poll that then times
@@ -812,6 +845,9 @@ class ApiEngine:
         exceeded the configured load at exactly the moment the target could
         least afford it. A failed delete leaks one artefact and never changes
         the outcome of the measurement.
+
+        With ``keep_jobs_s`` a job that reached an end is not deleted: it is
+        given that lifetime and splunkd removes it (see ``_release``).
         """
         if not record.sid:
             return
@@ -819,16 +855,38 @@ class ApiEngine:
         seen_at = self._seen_at.pop(record.sid, None)
         if not self._config.delete_jobs:
             return
+        release = self._release(record)
         try:
-            found = await asyncio.shield(self._client.delete_job(record.sid))
-        except Exception:  # noqa: BLE001
+            found = await asyncio.shield(release())
+        except Exception as exc:  # noqa: BLE001
+            self._note_keep_failure(record, exc)
             return
-        # The delete, too, can land on a member that does not know the job.
+        # The request, too, can land on a member that does not know the job.
         since = max(dispatched_at, seen_at or 0.0) if dispatched_at is not None else None
         if not found and since is not None and self._grace_left_s(since) > 0:
-            task = asyncio.ensure_future(self._late_delete(record.sid, since))
-            self._late_deletes.add(task)
-            task.add_done_callback(self._late_deletes.discard)
+            task = asyncio.ensure_future(self._late_release(record.sid, since, release))
+            self._late_releases.add(task)
+            task.add_done_callback(self._late_releases.discard)
+
+    def _note_keep_failure(self, record: StepRecord, exc: Exception) -> None:
+        """Say once that a job's lifetime could not be set.
+
+        Such a job is not deleted either, so it stays for whatever lifetime
+        splunkd gave it (ten minutes for an ad hoc search by default) rather
+        than for ``keep_jobs_s``. Worth one line: an operator who asked for
+        thirty seconds and is getting ten minutes should be able to find out.
+        """
+        if self._keep_failure_noted or self._config.keep_jobs_s <= 0:
+            return
+        if (record.dispatch_state or "").upper() not in _ENDED_STATES:
+            return
+        self._keep_failure_noted = True
+        log.warning(
+            "could not set the lifetime of finished job %s to %.0fs (REG_KEEP_JOBS_S): %s. "
+            "It, and any other this happens to, stays on the target for the lifetime "
+            "splunkd gave it instead",
+            record.sid, self._config.keep_jobs_s, str(exc)[:200],
+        )
 
     async def _execute_oneshot(self, ctx: StepContext, record: StepRecord) -> None:
         """The cheap path: one blocking call, no job artefact, no server half.

@@ -125,9 +125,17 @@ def test_defaults_are_sensible(env):
     config = load_config(env())
     assert config.target.verify_tls is True
     assert config.delete_jobs is True
+    # Off unless asked for: kept artefacts are themselves load on the target.
+    assert config.keep_jobs_s == 0.0
     assert config.cache_bust is True
     assert config.poll_initial_ms == 250
     assert config.poll_max_ms == 1000
     assert config.total_workers == 1
     assert config.slot == 0
     assert isinstance(config, Config)
+
+
+def test_the_keep_time_is_read_and_cannot_be_negative(env):
+    assert load_config(env(REG_KEEP_JOBS_S="90")).keep_jobs_s == 90.0
+    with pytest.raises(ConfigError):
+        load_config(env(REG_KEEP_JOBS_S="-1"))

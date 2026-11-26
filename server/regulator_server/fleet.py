@@ -410,6 +410,7 @@ def _claim_env(run: Run, target: Target, settings: ServerConfig, share: Dict[str
     env["REG_MAX_PAUSE_S"] = str(settings.max_pause_s)
     env["REG_DRAIN_BUDGET_S"] = str(settings.drain_budget_s)
     env["REG_HARVEST_S"] = str(settings.harvest_s)
+    env["REG_KEEP_JOBS_S"] = str(settings.keep_jobs_s)
     return env
 
 
