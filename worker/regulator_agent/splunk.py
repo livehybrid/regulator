@@ -850,6 +850,31 @@ class SplunkClient:
             )
         return True
 
+    async def set_job_ttl(self, sid: str, ttl_s: int) -> bool:
+        """Set how long a job's artefact lives. Returns False on a 404.
+
+        The ``setttl`` action of the job's ``control`` endpoint, which is what
+        Splunk Web's "Edit Job Settings > Lifetime" sends. splunkd counts the
+        lifetime from the last time the job was touched and removes the
+        artefact itself once it has run out, so nothing has to come back later
+        to delete it and a worker that exits first leaves nothing behind for
+        longer than was asked. Reading the job over REST starts its lifetime
+        again (the contract suite saw a status read do so).
+        """
+        response = await self._request(
+            "POST",
+            f"{self._jobs_path}/{quote(sid, safe='')}/control",
+            data={"action": "setttl", "ttl": str(max(1, int(ttl_s)))},
+            context=f"set lifetime of job {sid}",
+        )
+        if response.status_code == 404:
+            return False
+        if response.status_code >= 400:
+            raise SplunkHttpError(
+                response.status_code, response.text, context=f"set lifetime of job {sid}"
+            )
+        return True
+
     async def oneshot(
         self, spl: str, window: TimeWindow, count: int = 100
     ) -> Tuple[List[Dict[str, Any]], int]:

@@ -187,6 +187,10 @@ class _Stats:
     jobs_done: int = 0
     jobs_deleted: int = 0
     jobs_cancelled: int = 0
+    # Lifetimes set with the control endpoint's setttl, and the jobs the
+    # reaper then removed because theirs had run out.
+    jobs_ttl_set: int = 0
+    jobs_expired: int = 0
     peak_concurrent: int = 0
     current_concurrent: int = 0
     queued_total: int = 0
@@ -230,6 +234,12 @@ class _Job:
     # Requests about this job since its dispatch, for shc_members.
     requests: int = 0
     retired: bool = False
+    # When the job reached its end, and the lifetime setttl gave it with the
+    # moment it was given. A job nobody gave a lifetime is never reaped here:
+    # the fake has always kept those until they are deleted.
+    done_at: Optional[float] = None
+    ttl_s: Optional[float] = None
+    ttl_from: Optional[float] = None
 
 
 class FakeSplunk:
@@ -250,6 +260,8 @@ class FakeSplunk:
         self._lock = threading.RLock()
         self._rng = random.Random(self.config.seed)
         self._jobs: Dict[str, _Job] = {}
+        # Jobs given a lifetime with setttl, for the reaper in _pump_locked.
+        self._expiring: Dict[str, _Job] = {}
         # Events received over HEC: (the event, its index time, when it
         # becomes searchable), in arrival order.
         self._hec_events: List[Tuple[Dict[str, Any], float, float]] = []
@@ -342,11 +354,24 @@ class FakeSplunk:
             if self._is_complete(job, now):
                 if not job.retired:
                     job.retired = True
+                    job.done_at = now
                     if not job.internal and not job.will_fail:
                         self.stats.jobs_done += 1
             else:
                 still_active.append(job)
         self._active = still_active
+
+        # The reaper. splunkd counts a lifetime from the last time the job was
+        # used: its end, the setttl that set the lifetime, or the last read of
+        # it (see _job_endpoint), whichever came last.
+        for sid in [
+            sid for sid, job in self._expiring.items()
+            if job.done_at is not None
+            and now >= max(job.done_at, job.ttl_from or 0.0) + (job.ttl_s or 0.0)
+        ]:
+            self._expiring.pop(sid, None)
+            if self._jobs.pop(sid, None) is not None:
+                self.stats.jobs_expired += 1
 
         limit = self.config.max_concurrent
         while self._pending and (limit <= 0 or len(self._active) < limit):
@@ -473,6 +498,7 @@ class FakeSplunk:
     def _remove_job(self, job: _Job) -> None:
         with self._lock:
             self._jobs.pop(job.sid, None)
+            self._expiring.pop(job.sid, None)
             self._active = [other for other in self._active if other.sid != job.sid]
             self._pending = [other for other in self._pending if other.sid != job.sid]
             self._pump_locked(time.monotonic())
@@ -481,6 +507,7 @@ class FakeSplunk:
         """Drop every job and zero every counter."""
         with self._lock:
             self._jobs.clear()
+            self._expiring.clear()
             self._hec_events.clear()
             self._active.clear()
             self._pending.clear()
@@ -525,7 +552,7 @@ class FakeSplunk:
             "eventSearch": _event_search(job.spl),
             "searchProviders": ["fake-splunk"],
             "performance": _performance(run_duration, job.scan_count, job.event_count),
-            "ttl": job.timeout or "86400",
+            "ttl": str(int(job.ttl_s)) if job.ttl_s is not None else (job.timeout or "86400"),
             "messages": messages,
             "request": {
                 "search": job.spl,
@@ -597,6 +624,8 @@ class FakeSplunk:
                 "jobs_done": stats.jobs_done,
                 "jobs_deleted": stats.jobs_deleted,
                 "jobs_cancelled": stats.jobs_cancelled,
+                "jobs_ttl_set": stats.jobs_ttl_set,
+                "jobs_expired": stats.jobs_expired,
                 "peak_concurrent": stats.peak_concurrent,
                 "current_concurrent": stats.current_concurrent,
                 "queued_total": stats.queued_total,
@@ -1112,6 +1141,12 @@ class FakeSplunk:
             if elsewhere:
                 return 404, _UNKNOWN_SID_BODY
 
+        if job.ttl_s is not None and method == "GET":
+            # Reading a job starts its lifetime again (seen on a real cluster:
+            # a job given 15 s and read every 5 s was still there at 75 s).
+            with self._lock:
+                job.ttl_from = time.monotonic()
+
         if tail == "" and method == "GET":
             return 200, self._job_entry(job, time.monotonic())
 
@@ -1125,7 +1160,7 @@ class FakeSplunk:
             return self._results(job, tail == "results_preview", query)
 
         if tail == "control" and method == "POST":
-            return self._control(job, _first(form, "action", ""))
+            return self._control(job, _first(form, "action", ""), form)
 
         return 404, {
             "messages": [{"type": "ERROR", "text": f"Unknown job endpoint: {tail}"}]
@@ -1154,8 +1189,26 @@ class FakeSplunk:
         available = 0 if job.will_fail else job.result_count
         return 200, self._results_payload(job, count, offset, False, available)
 
-    def _control(self, job: _Job, action: str) -> Tuple[int, Any]:
+    def _control(
+        self, job: _Job, action: str, form: Optional[Dict[str, List[str]]] = None
+    ) -> Tuple[int, Any]:
         now = time.monotonic()
+        if action == "setttl":
+            raw = _first(form or {}, "ttl", "")
+            try:
+                ttl_s = float(raw)
+            except ValueError:
+                ttl_s = -1.0
+            if ttl_s <= 0:
+                return 400, {
+                    "messages": [{"type": "ERROR", "text": f"Invalid ttl: {raw!r}"}]
+                }
+            with self._lock:
+                job.ttl_s = ttl_s
+                job.ttl_from = now
+                self._expiring[job.sid] = job
+                self.stats.jobs_ttl_set += 1
+            return 200, {"messages": []}
         if action == "cancel":
             self._remove_job(job)
             with self._lock:

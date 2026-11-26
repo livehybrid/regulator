@@ -314,5 +314,6 @@ def worker_config(
         max_pause_s=float(get_settings().max_pause_s),
         drain_budget_s=float(get_settings().drain_budget_s),
         harvest_s=float(get_settings().harvest_s),
+        keep_jobs_s=float(get_settings().keep_jobs_s),
         **indexer_settings(target),
     )

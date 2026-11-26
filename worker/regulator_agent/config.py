@@ -322,6 +322,14 @@ class Config:
     # floor. Their jobs are left running on the target for that long (never
     # past read_timeout_s). 0 cancels them at the end of the drain, as before.
     harvest_s: float = 240.0
+    # How long a search that reached an end (DONE or FAILED) is left on the
+    # search head once Regulator has finished with it, so its dispatch
+    # directory (search.log, info.csv) can be collected. 0 deletes it at once.
+    # Regulator sets the job's lifetime to this and splunkd removes it, so no
+    # worker has to outlive the run to tidy up. A search still running when
+    # Regulator gives up on it is deleted at once whatever this says: keeping
+    # it would keep it running. Ignored when delete_jobs is off.
+    keep_jobs_s: float = 0.0
     # SmartStore warm-up before the measured run, from a plan the operator
     # confirmed (indexes with earliest and latest times): a path to a JSON
     # file, or the JSON itself. Never derived and warmed unseen: the forecast
@@ -549,6 +557,7 @@ def load_config(env: Optional[Mapping[str, str]] = None) -> Config:
         lint_strict=_boolean(env, "REG_LINT_STRICT", True),
         drain_budget_s=_number(env, "REG_DRAIN_BUDGET_S", 60.0, minimum=1.0),
         harvest_s=_number(env, "REG_HARVEST_S", 240.0, minimum=0.0),
+        keep_jobs_s=_number(env, "REG_KEEP_JOBS_S", 0.0, minimum=0.0),
         max_pause_s=_number(env, "REG_MAX_PAUSE_S", 1800.0, minimum=0.0),
         sut_settle_s=_number(env, "REG_SUT_SETTLE_S", 8.0, minimum=0.0),
         indexer_urls=tuple(

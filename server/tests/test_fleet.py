@@ -666,6 +666,30 @@ def test_pause_and_load_reach_fleet_workers_in_every_reply(client, splunkd, fake
     assert client.post(f"/api/runs/{run_id}/stop").status_code == 200
 
 
+def test_the_keep_time_for_finished_jobs_reaches_every_kind_of_worker(client, splunkd, fake_driver):
+    """REG_KEEP_JOBS_S is set once, on the control plane. A fleet worker gets
+    it in its claim and an in-process run in its Config; a run where one kind
+    kept its search logs and the other did not would be a trap."""
+    import dataclasses
+
+    from regulator_server import adapters
+    from regulator_server.config import get_settings
+    from regulator_server.db import session_scope
+    from regulator_server.models import Target
+
+    set_settings(dataclasses.replace(get_settings(), keep_jobs_s=45.0))
+    run_id = _launch(client, splunkd, fake_driver)
+    headers = _bearer(run_id)
+    claim = client.post(f"/api/agent/runs/{run_id}/claim", json={"holder": "w-a"}, headers=headers).json()
+    assert float(claim["env"]["REG_KEEP_JOBS_S"]) == 45.0
+
+    with session_scope() as session:
+        target = session.query(Target).first()
+        config = adapters.worker_config(target, scenario_path="smoke")
+    assert config.keep_jobs_s == 45.0
+    assert client.post(f"/api/runs/{run_id}/stop").status_code == 200
+
+
 def test_a_pause_moves_the_fleet_deadline(tmp_path):
     run = Run(scenario="smoke", paused_s=40.0, paused_at=time.time() - 20.0)
     assert 59.0 < fleet.paused_seconds(run) < 61.0
