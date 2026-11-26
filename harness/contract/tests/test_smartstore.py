@@ -24,13 +24,29 @@ def cacheman_rows(index):
     return rows
 
 
-def dbinspect(index, cached):
-    rows = run(oneshot(
+def dbinspect_rows(index, cached):
+    return [r for r in run(oneshot(
         SH_URL,
         f"| dbinspect index={index} cached={'true' if cached else 'false'} timeformat=%s "
         "| eval bytes=sizeOnDiskMB*1048576 | fields splunk_server, bucketId, state, bytes",
-    ))
-    return {(r["splunk_server"], f"bid|{r['bucketId']}|"): float(r["bytes"]) for r in rows if r.get("bucketId")}
+    )) if r.get("bucketId")]
+
+
+def dbinspect(index, cached):
+    """Bytes on disk per copy, by (server, bid), of the buckets SmartStore holds.
+
+    Hot buckets are left out. Remote storage holds warm buckets only: a hot
+    one is neither uploaded nor evicted, so it is all on local disk whatever
+    these tests do. The corpus is rolled to warm once, when the session's
+    first test asks for it, and a test that writes to the index after that
+    (the freshness probe does) opens a new hot bucket. Counted here, that
+    bucket made "every copy is evicted" fail on every run that had one.
+    """
+    return {
+        (r["splunk_server"], f"bid|{r['bucketId']}|"): float(r["bytes"])
+        for r in dbinspect_rows(index, cached)
+        if str(r.get("state") or "").lower() != "hot"
+    }
 
 
 def uploaded(index):
@@ -94,9 +110,16 @@ def evict_contract():
 def test_dbinspect_cached_false_is_local_and_cached_true_is_the_whole_bucket(corpus):
     results = evict_contract()
     assert sum(r.confirmed for r in results) > 0, [r.to_dict() for r in results]
+    # Every copy with its state, the hot ones included, so a run says what
+    # was in the index and which of it the checks below looked at.
+    print("buckets:", sorted(
+        (r["splunk_server"], r["bucketId"], r.get("state"), float(r["bytes"]))
+        for r in dbinspect_rows(INDEX, cached=False)
+    ))
     local, full = dbinspect(INDEX, cached=False), dbinspect(INDEX, cached=True)
     evicted = [k for k in local if k in full and full[k] > 0 and local[k] < 0.5 * full[k]]
-    # Every copy is evicted, and cached=true still reports the whole bucket.
+    # Every copy remote storage holds is evicted, and cached=true still
+    # reports the whole bucket.
     assert evicted and len(evicted) == len(local), {"local": local, "full": full}
     from regulator_agent.cachewarm import classify
 
